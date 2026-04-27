@@ -128,6 +128,7 @@ def build_signal_audit_command(
         str(experiment.years),
         "--cache-dir",
         str(cache_dir),
+        "--allow-data-gaps",
         "--candidate-mode",
         experiment.candidate_mode,
         "--side-mode",

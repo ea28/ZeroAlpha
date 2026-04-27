@@ -1,11 +1,17 @@
 from argparse import Namespace
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from zeroalpha.cli import _validate_paper_order_test_config, _validate_research_short_backtest_args
+from zeroalpha.cli import (
+    _quality_or_raise,
+    _validate_paper_order_test_config,
+    _validate_research_short_backtest_args,
+)
 from zeroalpha.config import AppConfig, BrokerConfig, RuntimeConfig
-from zeroalpha.domain import RuntimeMode
+from zeroalpha.data.quality import validate_bars
+from zeroalpha.domain import Bar, RuntimeMode
 
 
 def test_paper_order_test_requires_explicit_confirmation() -> None:
@@ -45,3 +51,81 @@ def test_research_short_backtest_requires_research_gate() -> None:
     _validate_research_short_backtest_args(
         Namespace(allow_research_short_backtest=True, research_gate=True)
     )
+
+
+def test_allow_data_gaps_accepts_only_gap_issues() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = [
+        Bar(
+            timestamp_utc=start,
+            symbol="BTCUSDT",
+            bar_size="1h",
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            source="BINANCE",
+        ),
+        Bar(
+            timestamp_utc=start + timedelta(hours=2),
+            symbol="BTCUSDT",
+            bar_size="1h",
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            source="BINANCE",
+        ),
+    ]
+    report = validate_bars(
+        bars,
+        expected_interval="1h",
+        start=start,
+        end=start + timedelta(hours=2),
+        minimum_coverage_ratio=0.0,
+    )
+
+    accepted = _quality_or_raise(report, label="primary BTCUSDT", allow_data_gaps=True)
+
+    assert accepted["accepted_with_issues"] is True
+    assert accepted["accepted_issue_codes"] == ["bar_gap"]
+
+
+def test_allow_data_gaps_still_rejects_insufficient_coverage() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = [
+        Bar(
+            timestamp_utc=start,
+            symbol="BTCUSDT",
+            bar_size="1h",
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            source="BINANCE",
+        ),
+        Bar(
+            timestamp_utc=start + timedelta(hours=3),
+            symbol="BTCUSDT",
+            bar_size="1h",
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            source="BINANCE",
+        ),
+    ]
+    report = validate_bars(
+        bars,
+        expected_interval="1h",
+        start=start,
+        end=start + timedelta(hours=6),
+        minimum_coverage_ratio=0.75,
+    )
+
+    with pytest.raises(ValueError, match="data quality gate failed"):
+        _quality_or_raise(report, label="primary BTCUSDT", allow_data_gaps=True)

@@ -44,6 +44,7 @@ def test_build_signal_audit_command_includes_research_safety_flags(tmp_path: Pat
     assert "--empirical-payoff-ev" in command
     assert "--candidate-types" in command
     assert "active_pullback_reclaim" in command
+    assert "--allow-data-gaps" in command
     assert "--assumed-spread-bps" in command
     assert "ETHUSDT,SOLUSDT,ETHBTC,BNBUSDT,XRPUSDT" in command
 

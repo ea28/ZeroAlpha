@@ -80,9 +80,14 @@ def _coinbase_reference_products(raw: str, interval: str) -> list[str]:
     return [item.strip().upper() for item in value.split(",") if item.strip()]
 
 
-def _quality_or_raise(report, *, label: str) -> dict[str, object]:
+def _quality_or_raise(report, *, label: str, allow_data_gaps: bool = False) -> dict[str, object]:
     payload = report.as_dict()
     if not report.ok:
+        issue_codes = {issue.code for issue in report.issues}
+        if allow_data_gaps and issue_codes <= {"bar_gap"}:
+            payload["accepted_with_issues"] = True
+            payload["accepted_issue_codes"] = sorted(issue_codes)
+            return payload
         issue_preview = "; ".join(
             f"{issue.code}@{issue.timestamp_utc.isoformat() if issue.timestamp_utc else 'n/a'}"
             for issue in report.issues[:5]
@@ -122,7 +127,12 @@ def _load_research_bars(args: argparse.Namespace, start: datetime, end: datetime
         minimum_coverage_ratio=getattr(args, "minimum_data_coverage", 0.0),
         max_return_bps=getattr(args, "max_bar_return_bps", 0.0) or None,
     )
-    coverage["primary"]["quality"] = _quality_or_raise(primary_quality, label=f"primary {args.symbol}")
+    allow_data_gaps = bool(getattr(args, "allow_data_gaps", False))
+    coverage["primary"]["quality"] = _quality_or_raise(
+        primary_quality,
+        label=f"primary {args.symbol}",
+        allow_data_gaps=allow_data_gaps,
+    )
     context_interval = getattr(args, "context_interval", "") or args.interval
     for context_symbol in [value.strip() for value in args.context_symbols.split(",") if value.strip()]:
         bars = fetch_klines_archive_range(
@@ -146,7 +156,11 @@ def _load_research_bars(args: argparse.Namespace, start: datetime, end: datetime
             "source": "BINANCE",
             "interval": context_interval,
             "bars": len(bars),
-            "quality": _quality_or_raise(context_quality, label=f"context {key}"),
+            "quality": _quality_or_raise(
+                context_quality,
+                label=f"context {key}",
+                allow_data_gaps=allow_data_gaps,
+            ),
         }
     coinbase_products = _coinbase_reference_products(args.coinbase_reference_products, context_interval)
     if coinbase_products:
@@ -876,6 +890,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--notional", type=float, default=10_000.0)
     ml_backtest.add_argument("--assumed-spread-bps", type=float, default=10.0)
     ml_backtest.add_argument("--minimum-data-coverage", type=float, default=0.95)
+    ml_backtest.add_argument("--allow-data-gaps", action="store_true")
     ml_backtest.add_argument("--max-source-divergence-bps", type=float, default=500.0)
     ml_backtest.add_argument("--max-bar-return-bps", type=float, default=0.0)
     ml_backtest.add_argument("--entry-limit-offset-bps", type=float, default=0.0)
@@ -974,6 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--notional", type=float, default=10_000.0)
     train_meta.add_argument("--assumed-spread-bps", type=float, default=10.0)
     train_meta.add_argument("--minimum-data-coverage", type=float, default=0.95)
+    train_meta.add_argument("--allow-data-gaps", action="store_true")
     train_meta.add_argument("--max-source-divergence-bps", type=float, default=500.0)
     train_meta.add_argument("--max-bar-return-bps", type=float, default=0.0)
     train_meta.add_argument("--cache-dir", default="data/raw/binance")
@@ -1072,6 +1088,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--notional", type=float, default=10_000.0)
     signal_audit.add_argument("--assumed-spread-bps", type=float, default=4.0)
     signal_audit.add_argument("--minimum-data-coverage", type=float, default=0.95)
+    signal_audit.add_argument("--allow-data-gaps", action="store_true")
     signal_audit.add_argument("--max-source-divergence-bps", type=float, default=500.0)
     signal_audit.add_argument("--max-bar-return-bps", type=float, default=0.0)
     signal_audit.add_argument("--entry-limit-offset-bps", type=float, default=0.0)

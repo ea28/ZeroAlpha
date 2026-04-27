@@ -329,6 +329,32 @@ def _logistic_classifier() -> Any:
     )
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(parsed, 1)
+
+
+def _model_n_jobs() -> int:
+    return _env_int("ZEROALPHA_MODEL_N_JOBS", default=1)
+
+
+def _gpu_enabled() -> bool:
+    return _env_flag("ZEROALPHA_USE_GPU", default=False)
+
+
 def _lightgbm_classifier(params: dict[str, Any] | None = None) -> Any:
     try:
         import lightgbm as lgb
@@ -345,7 +371,7 @@ def _lightgbm_classifier(params: dict[str, Any] | None = None) -> Any:
         "colsample_bytree": 0.85,
         "reg_lambda": 2.0,
         "random_state": 42,
-        "n_jobs": 1,
+        "n_jobs": _model_n_jobs(),
         "verbosity": -1,
     }
     return lgb.LGBMClassifier(**{**defaults, **(params or {})})
@@ -367,6 +393,8 @@ def _catboost_classifier(params: dict[str, Any] | None = None) -> Any:
         "verbose": False,
         "allow_writing_files": False,
     }
+    if _gpu_enabled():
+        defaults.update({"task_type": "GPU", "devices": os.environ.get("ZEROALPHA_GPU_DEVICES", "0")})
     return cb.CatBoostClassifier(**{**defaults, **(params or {})})
 
 
@@ -387,9 +415,12 @@ def _xgboost_classifier(params: dict[str, Any] | None = None) -> Any:
         "colsample_bytree": 0.85,
         "reg_lambda": 2.0,
         "random_state": 42,
-        "n_jobs": 1,
+        "n_jobs": _model_n_jobs(),
+        "tree_method": "hist",
         "verbosity": 0,
     }
+    if _gpu_enabled():
+        defaults["device"] = os.environ.get("ZEROALPHA_XGBOOST_DEVICE", "cuda")
     return xgb.XGBClassifier(**{**defaults, **(params or {})})
 
 
@@ -417,7 +448,7 @@ def _random_forest_classifier(params: dict[str, Any] | None = None) -> Any:
         "max_features": "sqrt",
         "class_weight": "balanced_subsample",
         "random_state": 42,
-        "n_jobs": 1,
+        "n_jobs": _model_n_jobs(),
     }
     return RandomForestClassifier(**{**defaults, **(params or {})})
 
@@ -433,7 +464,7 @@ def _extra_trees_classifier(params: dict[str, Any] | None = None) -> Any:
         "class_weight": "balanced",
         "bootstrap": False,
         "random_state": 42,
-        "n_jobs": 1,
+        "n_jobs": _model_n_jobs(),
     }
     return ExtraTreesClassifier(**{**defaults, **(params or {})})
 

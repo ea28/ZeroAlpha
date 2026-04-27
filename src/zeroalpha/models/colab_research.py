@@ -12,13 +12,15 @@ from pathlib import Path
 from typing import Iterable
 import csv
 import json
+import os
 import subprocess
 import sys
 import time
 
 
-DEFAULT_MODELS = "logistic,histgb,randomforest,extratrees,lightgbm,catboost,xgboost"
+DEFAULT_MODELS = "logistic,histgb,extratrees,lightgbm,xgboost,catboost"
 FAST_MODELS = "logistic,histgb,extratrees,lightgbm,xgboost"
+H100_MODELS = DEFAULT_MODELS
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +76,7 @@ class ExperimentResult:
     hit_rate: float = 0.0
     samples: int = 0
     error: str = ""
+    log_path: str = ""
 
     @property
     def champion_score(self) -> tuple[float, float, float, int]:
@@ -258,20 +261,23 @@ def build_experiment_matrix(
     include_5m: bool = True,
     include_1m: bool = True,
     models: str = FAST_MODELS,
+    years_15m: int = 6,
+    years_5m: int = 4,
+    years_1m: int = 2,
 ) -> list[ResearchExperiment]:
     experiments: list[ResearchExperiment] = []
     if include_15m:
-        experiments.extend(_active_experiments("15m", 6, models=models))
+        experiments.extend(_active_experiments("15m", years_15m, models=models))
     if include_5m:
-        experiments.extend(_active_experiments("5m", 4, models=models))
+        experiments.extend(_active_experiments("5m", years_5m, models=models))
     if include_1m:
-        experiments.extend(_active_experiments("1m", 2, models=models))
+        experiments.extend(_active_experiments("1m", years_1m, models=models))
     experiments.extend(
         [
             ResearchExperiment(
-                name="15m_6y_long_short_research_g35_30",
+                name=f"15m_{years_15m}y_long_short_research_g35_30",
                 interval="15m",
-                years=6,
+                years=years_15m,
                 context_interval="1h",
                 candidate_mode="active",
                 candidate_types="",
@@ -289,9 +295,9 @@ def build_experiment_matrix(
                 allow_research_short_backtest=True,
             ),
             ResearchExperiment(
-                name="15m_6y_forced_frequency_probe",
+                name=f"15m_{years_15m}y_forced_frequency_probe",
                 interval="15m",
-                years=6,
+                years=years_15m,
                 context_interval="1h",
                 candidate_mode="active",
                 candidate_types="",
@@ -348,6 +354,49 @@ def write_summary_csv(results: Iterable[ExperimentResult], output_path: Path) ->
         writer.writerows(rows)
 
 
+def write_experiment_manifest(experiments: Iterable[ResearchExperiment], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [asdict(experiment) for experiment in experiments]
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_research_report(results: Iterable[ExperimentResult], output_path: Path) -> None:
+    rows = list(results)
+    ok = [row for row in rows if row.status == "ok"]
+    failures = [row for row in rows if row.status != "ok"]
+
+    def top(filtered: list[ExperimentResult], *, limit: int = 25) -> list[dict[str, object]]:
+        ranked = sorted(filtered, key=lambda row: row.champion_score, reverse=True)[:limit]
+        return [asdict(row) for row in ranked]
+
+    positive = [row for row in ok if row.sharpe > 0 and row.net_pnl > 0]
+    payload = {
+        "total_results": len(rows),
+        "ok_results": len(ok),
+        "failed_results": len(failures),
+        "failures": [asdict(row) for row in failures[:50]],
+        "top_overall": top(ok),
+        "top_positive": top(positive),
+        "top_trade_frequency_positive": {
+            "tpd_ge_0_5": top([row for row in positive if row.trades_per_day >= 0.5]),
+            "tpd_ge_1": top([row for row in positive if row.trades_per_day >= 1.0]),
+            "tpd_ge_2": top([row for row in positive if row.trades_per_day >= 2.0]),
+            "tpd_ge_4": top([row for row in positive if row.trades_per_day >= 4.0]),
+        },
+        "environment": {
+            key: os.environ.get(key, "")
+            for key in (
+                "ZEROALPHA_USE_GPU",
+                "ZEROALPHA_MODEL_N_JOBS",
+                "ZEROALPHA_XGBOOST_DEVICE",
+                "ZEROALPHA_GPU_DEVICES",
+            )
+        },
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def run_experiments(
     experiments: Iterable[ResearchExperiment],
     *,
@@ -357,15 +406,20 @@ def run_experiments(
     resume: bool = True,
     timeout_seconds: int | None = None,
     stop_after: int | None = None,
+    stream_output: bool = False,
 ) -> list[ExperimentResult]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = artifact_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     results: list[ExperimentResult] = []
     for index, experiment in enumerate(experiments, start=1):
         if stop_after is not None and index > stop_after:
             break
         artifact = experiment_artifact_path(artifact_dir, experiment)
+        log_path = log_dir / f"{experiment.name}.log"
         if resume and artifact.exists():
-            results.append(parse_signal_audit_artifact(artifact))
+            result = parse_signal_audit_artifact(artifact)
+            results.append(ExperimentResult(**{**asdict(result), "log_path": str(log_path)}))
             continue
         command = build_signal_audit_command(
             experiment,
@@ -375,9 +429,33 @@ def run_experiments(
         )
         started = time.time()
         print(f"\n[{index}] running {experiment.name}")
-        print(" ".join(command))
+        print(f"artifact={artifact}")
+        print(f"log={log_path}")
         try:
-            completed = subprocess.run(command, check=False, timeout=timeout_seconds)
+            if stream_output:
+                with log_path.open("w", encoding="utf-8") as handle:
+                    handle.write(" ".join(command) + "\n\n")
+                    handle.flush()
+                    completed = subprocess.run(
+                        command,
+                        check=False,
+                        timeout=timeout_seconds,
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+            else:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    timeout=timeout_seconds,
+                    capture_output=True,
+                    text=True,
+                )
+                log_path.write_text(
+                    " ".join(command) + "\n\n" + completed.stdout + completed.stderr,
+                    encoding="utf-8",
+                )
         except subprocess.TimeoutExpired as exc:
             results.append(
                 ExperimentResult(
@@ -385,24 +463,33 @@ def run_experiments(
                     artifact=str(artifact),
                     status="timeout",
                     error=str(exc),
+                    log_path=str(log_path),
                 )
             )
             continue
         elapsed = time.time() - started
         if completed.returncode != 0:
+            tail = ""
+            if log_path.exists():
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            if tail:
+                print(tail)
             results.append(
                 ExperimentResult(
                     name=experiment.name,
                     artifact=str(artifact),
                     status=f"failed:{completed.returncode}",
                     error=f"elapsed_seconds={elapsed:.1f}",
+                    log_path=str(log_path),
                 )
             )
             continue
         result = parse_signal_audit_artifact(artifact)
+        result = ExperimentResult(**{**asdict(result), "log_path": str(log_path)})
         results.append(result)
         print(
             f"{experiment.name}: trades={result.trades} tpd={result.trades_per_day:.3f} "
-            f"pnl={result.net_pnl:.2f} sharpe={result.sharpe:.3f} pf={result.profit_factor:.3f}"
+            f"pnl={result.net_pnl:.2f} sharpe={result.sharpe:.3f} "
+            f"pf={result.profit_factor:.3f} elapsed={elapsed:.1f}s"
         )
     return sorted(results, key=lambda row: row.champion_score, reverse=True)

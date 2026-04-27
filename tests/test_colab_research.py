@@ -247,3 +247,30 @@ def test_colab_notebook_dependency_cell_does_not_reinstall_core_stack() -> None:
     assert "pandas==" not in dependency_cell
     assert "scipy==" not in dependency_cell
     assert "os.kill" not in dependency_cell
+
+
+def test_colab_notebook_bootstrap_refreshes_existing_checkout() -> None:
+    notebook = json.loads(Path("src/zeroalpha/models/train.ipynb").read_text(encoding="utf-8"))
+    bootstrap_cell = "".join(notebook["cells"][1]["source"])
+
+    assert "/Users/ethan/" not in bootstrap_cell
+    assert "IN_COLAB_CONTENT" in bootstrap_cell
+    assert 'BOOTSTRAP_MODE == "git" and IN_COLAB_CONTENT' in bootstrap_cell
+    assert "refresh_existing_git_repo" in bootstrap_cell
+    assert '"fetch", "--depth", str(GIT_DEPTH), "origin", GIT_BRANCH' in bootstrap_cell
+    assert '"reset", "--hard", "FETCH_HEAD"' in bootstrap_cell
+    assert "PROJECT_COMMIT" in bootstrap_cell
+
+
+def test_colab_notebook_pilot_is_clean_and_gap_safe() -> None:
+    notebook = json.loads(Path("src/zeroalpha/models/train.ipynb").read_text(encoding="utf-8"))
+    import_cell = "".join(notebook["cells"][5]["source"])
+    pilot_cell = "".join(notebook["cells"][6]["source"])
+
+    assert "build_signal_audit_command" in import_cell
+    assert "experiment_artifact_path" in import_cell
+    assert "PILOT_RESUME = False" in pilot_cell
+    assert '"--allow-data-gaps" in pilot_command' in pilot_cell
+    assert "artifact_path.unlink(missing_ok=True)" in pilot_cell
+    assert "log_path.unlink(missing_ok=True)" in pilot_cell
+    assert "resume=PILOT_RESUME" in pilot_cell

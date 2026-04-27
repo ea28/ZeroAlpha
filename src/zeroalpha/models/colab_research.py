@@ -7,15 +7,16 @@ experiments while still exercising the same code paths as local research.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Iterable
+from collections import Counter, defaultdict
 import csv
+from dataclasses import asdict, dataclass, replace
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Iterable
 
 
 DEFAULT_MODELS = "logistic,histgb,extratrees,lightgbm,xgboost,catboost"
@@ -58,6 +59,10 @@ class ResearchExperiment:
     kronos_mode: str = "proxy"
     kronos_lookback_bars: int = 0
     kronos_embedding_dims: int = 0
+    assumed_spread_bps: float = 4.0
+    tier_rate: float = 0.0004
+    base_slippage_bps: float = 1.0
+    safety_margin_bps: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +105,7 @@ def build_signal_audit_command(
     python_executable: str = sys.executable,
     config: str = "configs/paper.example.toml",
     symbol: str = "BTCUSDT",
-    context_symbols: str = "ETHUSDT,SOLUSDT,ETHBTC",
+    context_symbols: str = "ETHUSDT,SOLUSDT,ETHBTC,BNBUSDT,XRPUSDT",
 ) -> list[str]:
     output = experiment_artifact_path(artifact_dir, experiment)
     args = [
@@ -144,13 +149,13 @@ def build_signal_audit_command(
         "--minimum-gross-stop-bps",
         str(experiment.minimum_gross_stop_bps),
         "--assumed-spread-bps",
-        "4",
+        str(experiment.assumed_spread_bps),
         "--tier-rate",
-        "0.0004",
+        str(experiment.tier_rate),
         "--base-slippage-bps",
-        "1",
+        str(experiment.base_slippage_bps),
         "--safety-margin-bps",
-        "2",
+        str(experiment.safety_margin_bps),
         "--minimum-probability",
         "0",
         "--minimum-expected-value",
@@ -322,6 +327,8 @@ def parse_signal_audit_artifact(path: Path) -> ExperimentResult:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return ExperimentResult(name=path.stem, artifact=str(path), status="invalid_json", error=str(exc))
+    if not isinstance(payload, dict) or "backtest_summary" not in payload:
+        return ExperimentResult(name=path.stem, artifact=str(path), status="non_result")
     summary = payload.get("backtest_summary") or {}
     return ExperimentResult(
         name=path.stem,
@@ -342,6 +349,7 @@ def parse_signal_audit_artifact(path: Path) -> ExperimentResult:
 
 def summarize_artifacts(artifact_dir: Path) -> list[ExperimentResult]:
     results = [parse_signal_audit_artifact(path) for path in sorted(artifact_dir.glob("*.json"))]
+    results = [result for result in results if result.status != "non_result"]
     return sorted(results, key=lambda row: row.champion_score, reverse=True)
 
 
@@ -360,6 +368,146 @@ def write_experiment_manifest(experiments: Iterable[ResearchExperiment], output_
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_key(value: object) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _top_counter(counter: Counter[str], *, limit: int = 25) -> list[dict[str, object]]:
+    return [{"value": key, "count": count} for key, count in counter.most_common(limit)]
+
+
+def _artifact_diagnostics(result: ExperimentResult) -> dict[str, object]:
+    path = Path(result.artifact)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"name": result.name, "artifact": result.artifact, "error": f"{type(exc).__name__}: {exc}"}
+
+    folds = payload.get("folds") or []
+    trades = payload.get("trades") or []
+    selected_params: Counter[str] = Counter()
+    skipped_models: Counter[str] = Counter()
+    fitted_models: Counter[str] = Counter()
+    model_weights: dict[str, list[float]] = defaultdict(list)
+    model_utilities: dict[str, list[float]] = defaultdict(list)
+    model_briers: dict[str, list[float]] = defaultdict(list)
+    fold_rows: list[dict[str, object]] = []
+
+    for fold in folds:
+        for model in fold.get("fitted_models") or []:
+            fitted_models[str(model)] += 1
+        for model, reason in (fold.get("skipped_models") or {}).items():
+            skipped_models[f"{model}: {reason}"] += 1
+        for model, params in (fold.get("selected_model_params") or {}).items():
+            selected_params[f"{model}:{_json_key(params)}"] += 1
+        for model, diagnostics in (fold.get("model_diagnostics") or {}).items():
+            if not isinstance(diagnostics, dict):
+                continue
+            model_weights[model].append(_safe_float(diagnostics.get("validation_weight")))
+            model_utilities[model].append(_safe_float(diagnostics.get("validation_utility")))
+            model_briers[model].append(_safe_float(diagnostics.get("validation_brier")))
+        fold_rows.append(
+            {
+                "fold_id": fold.get("fold_id"),
+                "train_samples": fold.get("train_samples"),
+                "calibration_samples": fold.get("calibration_samples"),
+                "test_samples": fold.get("test_samples"),
+                "traded_signals": fold.get("traded_signals"),
+                "net_pnl": fold.get("net_pnl"),
+                "trade_hit_rate": fold.get("trade_hit_rate"),
+                "average_trade_return": fold.get("average_trade_return"),
+                "brier_score": fold.get("brier_score"),
+                "log_loss": fold.get("log_loss"),
+                "selected_threshold": fold.get("selected_threshold"),
+                "selected_threshold_source": fold.get("selected_threshold_source"),
+            }
+        )
+
+    trade_by_candidate: dict[str, dict[str, float]] = defaultdict(lambda: {"trades": 0.0, "pnl": 0.0})
+    trade_by_side: dict[str, dict[str, float]] = defaultdict(lambda: {"trades": 0.0, "pnl": 0.0})
+    trade_by_outcome: dict[str, dict[str, float]] = defaultdict(lambda: {"trades": 0.0, "pnl": 0.0})
+    fold_pnl = [_safe_float(fold.get("net_pnl")) for fold in folds]
+    fold_trades = [_safe_int(fold.get("traded_signals")) for fold in folds]
+    for trade in trades:
+        pnl = _safe_float(trade.get("pnl"))
+        for key, grouped in (
+            (str(trade.get("candidate_type") or "unknown"), trade_by_candidate),
+            (str(trade.get("side") or "unknown"), trade_by_side),
+            (str(trade.get("outcome_type") or "unknown"), trade_by_outcome),
+        ):
+            grouped[key]["trades"] += 1.0
+            grouped[key]["pnl"] += pnl
+
+    def summarize_metric(values: list[float]) -> dict[str, float]:
+        if not values:
+            return {"count": 0.0, "mean": 0.0, "min": 0.0, "max": 0.0}
+        return {
+            "count": float(len(values)),
+            "mean": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+        }
+
+    model_summary = {
+        model: {
+            "folds": float(len(model_weights[model])),
+            "validation_weight": summarize_metric(model_weights[model]),
+            "validation_utility": summarize_metric(model_utilities[model]),
+            "validation_brier": summarize_metric(model_briers[model]),
+        }
+        for model in sorted(model_weights)
+    }
+    total_pnl = abs(_safe_float((payload.get("backtest_summary") or {}).get("net_pnl")))
+    largest_candidate_pnl = max((abs(row["pnl"]) for row in trade_by_candidate.values()), default=0.0)
+    return {
+        "name": result.name,
+        "artifact": result.artifact,
+        "summary": asdict(result),
+        "data_coverage": payload.get("data_coverage") or {},
+        "candidate_type_summary": payload.get("candidate_type_summary") or {},
+        "regime_summary": payload.get("regime_summary") or {},
+        "rejection_reasons": payload.get("rejection_reasons") or {},
+        "probability_distribution": payload.get("probability_distribution") or {},
+        "expected_value_distribution": payload.get("expected_value_distribution") or {},
+        "selection_score_distribution": payload.get("selection_score_distribution") or {},
+        "fold_stability": {
+            "folds": len(folds),
+            "positive_pnl_folds": sum(1 for value in fold_pnl if value > 0),
+            "negative_pnl_folds": sum(1 for value in fold_pnl if value < 0),
+            "folds_with_trades": sum(1 for value in fold_trades if value > 0),
+            "min_fold_pnl": min(fold_pnl, default=0.0),
+            "max_fold_pnl": max(fold_pnl, default=0.0),
+            "min_fold_trades": min(fold_trades, default=0),
+            "max_fold_trades": max(fold_trades, default=0),
+        },
+        "folds": fold_rows,
+        "fitted_model_counts": dict(fitted_models),
+        "skipped_model_counts": dict(skipped_models),
+        "selected_param_counts": _top_counter(selected_params, limit=50),
+        "model_validation_summary": model_summary,
+        "trade_by_candidate_type": dict(sorted(trade_by_candidate.items())),
+        "trade_by_side": dict(sorted(trade_by_side.items())),
+        "trade_by_outcome": dict(sorted(trade_by_outcome.items())),
+        "concentration": {
+            "largest_abs_candidate_type_pnl_share": largest_candidate_pnl / max(total_pnl, 1e-9),
+        },
+    }
+
+
 def write_research_report(results: Iterable[ExperimentResult], output_path: Path) -> None:
     rows = list(results)
     ok = [row for row in rows if row.status == "ok"]
@@ -370,6 +518,8 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
         return [asdict(row) for row in ranked]
 
     positive = [row for row in ok if row.sharpe > 0 and row.net_pnl > 0]
+    diagnostic_rows = sorted(ok, key=lambda row: row.champion_score, reverse=True)[:10]
+    top_diagnostics = [_artifact_diagnostics(row) for row in diagnostic_rows]
     payload = {
         "total_results": len(rows),
         "ok_results": len(ok),
@@ -383,6 +533,22 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
             "tpd_ge_2": top([row for row in positive if row.trades_per_day >= 2.0]),
             "tpd_ge_4": top([row for row in positive if row.trades_per_day >= 4.0]),
         },
+        "top_diagnostics": top_diagnostics,
+        "selection_guidance": {
+            "minimum_research_bar": {
+                "net_pnl": "> 0",
+                "sharpe": "> 0",
+                "profit_factor": "> 1",
+                "max_drawdown": "inspect relative to return and baseline",
+            },
+            "strong_research_bar": {
+                "trades_per_day": ">= 2 preferred, >= 4 target",
+                "sharpe": ">= 0.75",
+                "profit_factor": ">= 1.15",
+                "fold_stability": "no single fold/month/candidate type should explain most profit",
+                "cost_stress": "must remain positive under stress experiments before production consideration",
+            },
+        },
         "environment": {
             key: os.environ.get(key, "")
             for key in (
@@ -395,6 +561,49 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _experiment_lookup(experiments: Iterable[ResearchExperiment]) -> dict[str, ResearchExperiment]:
+    return {experiment.name: experiment for experiment in experiments}
+
+
+def make_cost_stress_experiments(
+    results: Iterable[ExperimentResult],
+    experiments: Iterable[ResearchExperiment],
+    *,
+    top_n: int = 12,
+) -> list[ResearchExperiment]:
+    by_name = _experiment_lookup(experiments)
+    candidates = [
+        row
+        for row in sorted(results, key=lambda item: item.champion_score, reverse=True)
+        if row.status == "ok" and row.net_pnl > 0 and row.sharpe > 0
+    ][:top_n]
+    stressed: list[ResearchExperiment] = []
+    for row in candidates:
+        source = by_name.get(row.name)
+        if source is None:
+            continue
+        stressed.append(
+            replace(
+                source,
+                name=f"{source.name}_stress_cost",
+                assumed_spread_bps=max(source.assumed_spread_bps, 8.0),
+                base_slippage_bps=max(source.base_slippage_bps, 3.0),
+                safety_margin_bps=max(source.safety_margin_bps, 4.0),
+            )
+        )
+        stressed.append(
+            replace(
+                source,
+                name=f"{source.name}_high_fee_stress",
+                tier_rate=max(source.tier_rate, 0.0006),
+                assumed_spread_bps=max(source.assumed_spread_bps, 6.0),
+                base_slippage_bps=max(source.base_slippage_bps, 2.0),
+                safety_margin_bps=max(source.safety_margin_bps, 3.0),
+            )
+        )
+    return stressed
 
 
 def run_experiments(

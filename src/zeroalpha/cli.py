@@ -96,6 +96,18 @@ def _quality_or_raise(report, *, label: str, allow_data_gaps: bool = False) -> d
     return payload
 
 
+def _context_quality_or_raise(report, *, label: str, allow_data_gaps: bool = False) -> dict[str, object]:
+    payload = report.as_dict()
+    if not report.ok:
+        issue_codes = {issue.code for issue in report.issues}
+        if allow_data_gaps and issue_codes <= {"bar_gap", "insufficient_coverage"}:
+            payload["accepted_with_issues"] = True
+            payload["accepted_issue_codes"] = sorted(issue_codes)
+            return payload
+        return _quality_or_raise(report, label=label, allow_data_gaps=allow_data_gaps)
+    return payload
+
+
 def _quality_payload(report) -> dict[str, object]:
     return report.as_dict()
 
@@ -156,7 +168,7 @@ def _load_research_bars(args: argparse.Namespace, start: datetime, end: datetime
             "source": "BINANCE",
             "interval": context_interval,
             "bars": len(bars),
-            "quality": _quality_or_raise(
+            "quality": _context_quality_or_raise(
                 context_quality,
                 label=f"context {key}",
                 allow_data_gaps=allow_data_gaps,

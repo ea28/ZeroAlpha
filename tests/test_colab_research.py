@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from zeroalpha.models.colab_research import (
     ResearchExperiment,
@@ -233,3 +234,15 @@ def test_make_cost_stress_experiments_uses_positive_champions(tmp_path: Path) ->
     assert stressed[0].name.endswith("_stress_cost")
     assert stressed[0].assumed_spread_bps >= source.assumed_spread_bps
     assert stressed[1].tier_rate >= source.tier_rate
+
+
+def test_colab_notebook_dependency_cell_does_not_reinstall_core_stack() -> None:
+    notebook = json.loads(Path("src/zeroalpha/models/train.ipynb").read_text(encoding="utf-8"))
+    dependency_cell = "".join(notebook["cells"][2]["source"])
+
+    assert "--no-deps" in dependency_cell
+    assert "OPTIONAL_MODEL_PACKAGES" in dependency_cell
+    assert "numpy==" not in dependency_cell
+    assert "pandas==" not in dependency_cell
+    assert "scipy==" not in dependency_cell
+    assert "os.kill" not in dependency_cell

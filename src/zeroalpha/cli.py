@@ -397,6 +397,8 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         stacker_mode=args.stacker,
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
+        hpo_profile=args.hpo_profile,
+        foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day,
         allow_negative_ev_target_frequency=args.allow_negative_ev_frequency_probe,
@@ -464,6 +466,8 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         stacker_mode=args.stacker,
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
+        hpo_profile=args.hpo_profile,
+        foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day,
         candidate_type_thresholds=args.candidate_type_thresholds,
@@ -546,6 +550,8 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         stacker_mode=args.stacker,
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
+        hpo_profile=args.hpo_profile,
+        foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day or None,
         allow_negative_ev_target_frequency=args.allow_negative_ev_frequency_probe,
@@ -978,6 +984,8 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     ml_backtest.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="average")
     ml_backtest.add_argument("--hpo", action="store_true")
+    ml_backtest.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    ml_backtest.add_argument("--foundation-max-samples", type=int, default=0)
     ml_backtest.add_argument("--kronos-features", action="store_true")
     ml_backtest.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
     ml_backtest.add_argument("--kronos-lookback-bars", type=int, default=0)
@@ -1066,6 +1074,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     train_meta.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="average")
     train_meta.add_argument("--hpo", action="store_true")
+    train_meta.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    train_meta.add_argument("--foundation-max-samples", type=int, default=0)
     train_meta.add_argument("--kronos-features", action="store_true")
     train_meta.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
     train_meta.add_argument("--kronos-lookback-bars", type=int, default=0)
@@ -1156,6 +1166,8 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     signal_audit.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="weighted")
     signal_audit.add_argument("--hpo", action="store_true")
+    signal_audit.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    signal_audit.add_argument("--foundation-max-samples", type=int, default=0)
     signal_audit.add_argument("--selection-score", choices=["probability", "expected_value", "predicted_return", "expected_utility"], default="expected_utility")
     signal_audit.add_argument("--specialist-models", action="store_true")
     signal_audit.add_argument("--require-calibrated-selection", action="store_true")

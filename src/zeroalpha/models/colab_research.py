@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import csv
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -18,10 +19,16 @@ import sys
 import time
 from typing import Iterable
 
+from zeroalpha.data.external.binance import fetch_klines_archive_range
+
 
 DEFAULT_MODELS = "logistic,histgb,extratrees,lightgbm,xgboost,catboost"
 FAST_MODELS = "logistic,histgb,extratrees,lightgbm,xgboost"
 H100_MODELS = DEFAULT_MODELS
+FOUNDATION_MODELS = "lightgbm,xgboost,catboost,tabicl,tabpfn"
+DEFAULT_CONTEXT_SYMBOLS = "ETHUSDT,SOLUSDT,ETHBTC,BNBUSDT,XRPUSDT"
+DEFAULT_KRONOS_SWEEP = ((64, 8), (128, 16), (256, 16))
+DEFAULT_FOUNDATION_SAMPLE_WINDOWS = (512, 1024, 2048)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +66,21 @@ class ResearchExperiment:
     kronos_mode: str = "proxy"
     kronos_lookback_bars: int = 0
     kronos_embedding_dims: int = 0
+    foundation_max_samples: int = 0
+    hpo_profile: str = "standard"
     assumed_spread_bps: float = 4.0
     tier_rate: float = 0.0004
     base_slippage_bps: float = 1.0
     safety_margin_bps: float = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class PrefetchRequest:
+    symbol: str
+    interval: str
+    years: int
+    role: str
+    required: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +98,7 @@ class ExperimentResult:
     max_drawdown: float = 0.0
     hit_rate: float = 0.0
     samples: int = 0
+    elapsed_seconds: float = 0.0
     error: str = ""
     log_path: str = ""
 
@@ -105,7 +124,7 @@ def build_signal_audit_command(
     python_executable: str = sys.executable,
     config: str = "configs/paper.example.toml",
     symbol: str = "BTCUSDT",
-    context_symbols: str = "ETHUSDT,SOLUSDT,ETHBTC,BNBUSDT,XRPUSDT",
+    context_symbols: str = DEFAULT_CONTEXT_SYMBOLS,
 ) -> list[str]:
     output = experiment_artifact_path(artifact_dir, experiment)
     args = [
@@ -198,6 +217,10 @@ def build_signal_audit_command(
             args.extend(["--kronos-lookback-bars", str(experiment.kronos_lookback_bars)])
         if experiment.kronos_embedding_dims:
             args.extend(["--kronos-embedding-dims", str(experiment.kronos_embedding_dims)])
+    if experiment.foundation_max_samples:
+        args.extend(["--foundation-max-samples", str(experiment.foundation_max_samples)])
+    if experiment.hpo_profile != "standard":
+        args.extend(["--hpo-profile", experiment.hpo_profile])
     return args
 
 
@@ -321,6 +344,186 @@ def build_experiment_matrix(
         ]
     )
     return experiments
+
+
+def prefetch_requests_for_experiments(
+    experiments: Iterable[ResearchExperiment],
+    *,
+    primary_symbol: str = "BTCUSDT",
+    context_symbols: str = DEFAULT_CONTEXT_SYMBOLS,
+) -> list[PrefetchRequest]:
+    by_key: dict[tuple[str, str, str, bool], PrefetchRequest] = {}
+    for experiment in experiments:
+        primary_key = (primary_symbol.upper(), experiment.interval, "primary", True)
+        current = by_key.get(primary_key)
+        if current is None or experiment.years > current.years:
+            by_key[primary_key] = PrefetchRequest(
+                symbol=primary_symbol.upper(),
+                interval=experiment.interval,
+                years=experiment.years,
+                role="primary",
+                required=True,
+            )
+        for raw_symbol in context_symbols.split(","):
+            symbol = raw_symbol.strip().upper()
+            if not symbol:
+                continue
+            context_key = (symbol, experiment.context_interval, "context", False)
+            current = by_key.get(context_key)
+            if current is None or experiment.years > current.years:
+                by_key[context_key] = PrefetchRequest(
+                    symbol=symbol,
+                    interval=experiment.context_interval,
+                    years=experiment.years,
+                    role="context",
+                    required=False,
+                )
+    return sorted(by_key.values(), key=lambda item: (item.role, item.symbol, item.interval))
+
+
+def prefetch_binance_cache(
+    experiments: Iterable[ResearchExperiment],
+    *,
+    cache_dir: Path,
+    manifest_path: Path,
+    primary_symbol: str = "BTCUSDT",
+    context_symbols: str = DEFAULT_CONTEXT_SYMBOLS,
+    end: datetime | None = None,
+) -> dict[str, object]:
+    end = end or datetime.now(tz=UTC)
+    requests = prefetch_requests_for_experiments(
+        experiments,
+        primary_symbol=primary_symbol,
+        context_symbols=context_symbols,
+    )
+    rows: list[dict[str, object]] = []
+    started = time.time()
+    for request in requests:
+        request_start = time.time()
+        start = end - timedelta(days=365 * request.years)
+        try:
+            bars = fetch_klines_archive_range(
+                symbol=request.symbol,
+                interval=request.interval,
+                start=start,
+                end=end,
+                cache_dir=cache_dir / request.symbol,
+            )
+            if request.required and not bars:
+                raise RuntimeError(
+                    f"required {request.symbol} {request.interval} prefetch returned no bars"
+                )
+            rows.append(
+                {
+                    **asdict(request),
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "bars": len(bars),
+                    "status": "ok" if bars else "missing_optional",
+                    "elapsed_seconds": round(time.time() - request_start, 3),
+                    "cache_path": str(cache_dir / request.symbol),
+                }
+            )
+        except Exception as exc:
+            if request.required:
+                raise
+            rows.append(
+                {
+                    **asdict(request),
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "bars": 0,
+                    "status": "failed_optional",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_seconds": round(time.time() - request_start, 3),
+                    "cache_path": str(cache_dir / request.symbol),
+                }
+            )
+    payload = {
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "elapsed_seconds": round(time.time() - started, 3),
+        "cache_dir": str(cache_dir),
+        "requests": rows,
+        "summary": {
+            "total": len(rows),
+            "ok": sum(1 for row in rows if row["status"] == "ok"),
+            "missing_optional": sum(1 for row in rows if row["status"] == "missing_optional"),
+            "failed_optional": sum(1 for row in rows if row["status"] == "failed_optional"),
+        },
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
+
+
+def foundation_model_stack_from_smoke(
+    smoke_stdout: str,
+    *,
+    include_catboost: bool = True,
+) -> str:
+    models = ["lightgbm", "xgboost"]
+    if include_catboost:
+        models.append("catboost")
+    try:
+        payload = json.loads(smoke_stdout)
+    except json.JSONDecodeError:
+        payload = []
+    if isinstance(payload, list):
+        for row in payload:
+            if not isinstance(row, dict) or not row.get("ok"):
+                continue
+            model_name = str(row.get("model_name") or "").lower()
+            if model_name in {"tabicl", "tabiclv2", "tabpfn"} and model_name not in models:
+                models.append(model_name)
+    return ",".join(models)
+
+
+def make_foundation_kronos_experiments(
+    results: Iterable[ExperimentResult],
+    experiments: Iterable[ResearchExperiment],
+    *,
+    top_n: int = 12,
+    models: str = FOUNDATION_MODELS,
+    sample_windows: tuple[int, ...] = DEFAULT_FOUNDATION_SAMPLE_WINDOWS,
+    kronos_configs: tuple[tuple[int, int], ...] = DEFAULT_KRONOS_SWEEP,
+    kronos_mode: str = "proxy",
+) -> list[ResearchExperiment]:
+    by_name = _experiment_lookup(experiments)
+    candidates = [
+        row
+        for row in sorted(results, key=lambda item: item.champion_score, reverse=True)
+        if row.status == "ok"
+        and row.net_pnl > 0
+        and row.sharpe > 0
+        and row.profit_factor >= 1.0
+        and row.trades > 0
+    ][:top_n]
+    foundation: list[ResearchExperiment] = []
+    seen: set[str] = set()
+    for row in candidates:
+        source = by_name.get(row.name)
+        if source is None:
+            continue
+        for lookback, dims in kronos_configs:
+            for window in sample_windows:
+                name = f"{source.name}_foundation_kronos_l{lookback}_d{dims}_w{window}"
+                if name in seen:
+                    continue
+                seen.add(name)
+                foundation.append(
+                    replace(
+                        source,
+                        name=name,
+                        models=models,
+                        kronos_features=True,
+                        kronos_mode=kronos_mode,
+                        kronos_lookback_bars=lookback,
+                        kronos_embedding_dims=dims,
+                        foundation_max_samples=window,
+                        hpo_profile="deep",
+                    )
+                )
+    return foundation
 
 
 def parse_signal_audit_artifact(path: Path) -> ExperimentResult:
@@ -519,6 +722,8 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
         return [asdict(row) for row in ranked]
 
     positive = [row for row in ok if row.sharpe > 0 and row.net_pnl > 0]
+    foundation = [row for row in ok if "foundation_kronos" in row.name]
+    foundation_positive = [row for row in foundation if row.sharpe > 0 and row.net_pnl > 0]
     diagnostic_rows = sorted(ok, key=lambda row: row.champion_score, reverse=True)[:10]
     top_diagnostics = [_artifact_diagnostics(row) for row in diagnostic_rows]
     payload = {
@@ -528,6 +733,8 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
         "failures": [asdict(row) for row in failures[:50]],
         "top_overall": top(ok),
         "top_positive": top(positive),
+        "top_foundation_kronos": top(foundation),
+        "top_foundation_kronos_positive": top(foundation_positive),
         "top_trade_frequency_positive": {
             "tpd_ge_0_5": top([row for row in positive if row.trades_per_day >= 0.5]),
             "tpd_ge_1": top([row for row in positive if row.trades_per_day >= 1.0]),
@@ -548,6 +755,11 @@ def write_research_report(results: Iterable[ExperimentResult], output_path: Path
                 "profit_factor": ">= 1.15",
                 "fold_stability": "no single fold/month/candidate type should explain most profit",
                 "cost_stress": "must remain positive under stress experiments before production consideration",
+            },
+            "final_model_bar": {
+                "foundation_kronos": "preferred only when it beats the tree-only champion after costs",
+                "profit_factor": ">= 1.15",
+                "drawdown": "must be no worse than the tree-only champion",
             },
         },
         "environment": {
@@ -672,6 +884,7 @@ def run_experiments(
                     name=experiment.name,
                     artifact=str(artifact),
                     status="timeout",
+                    elapsed_seconds=round(time.time() - started, 3),
                     error=str(exc),
                     log_path=str(log_path),
                 )
@@ -689,13 +902,16 @@ def run_experiments(
                     name=experiment.name,
                     artifact=str(artifact),
                     status=f"failed:{completed.returncode}",
+                    elapsed_seconds=round(elapsed, 3),
                     error=f"elapsed_seconds={elapsed:.1f}",
                     log_path=str(log_path),
                 )
             )
             continue
         result = parse_signal_audit_artifact(artifact)
-        result = ExperimentResult(**{**asdict(result), "log_path": str(log_path)})
+        result = ExperimentResult(
+            **{**asdict(result), "elapsed_seconds": round(elapsed, 3), "log_path": str(log_path)}
+        )
         results.append(result)
         print(
             f"{experiment.name}: trades={result.trades} tpd={result.trades_per_day:.3f} "

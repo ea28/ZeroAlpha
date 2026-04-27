@@ -693,9 +693,9 @@ def _class_balance_params(name: str, labels: Any) -> dict[str, Any]:
     return {}
 
 
-def _hpo_grid(name: str) -> list[dict[str, Any]]:
+def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
     if name == "lightgbm":
-        return [
+        grid = [
             {},
             {"learning_rate": 0.02, "n_estimators": 250, "num_leaves": 15, "min_child_samples": 30},
             {"learning_rate": 0.05, "n_estimators": 120, "num_leaves": 31, "min_child_samples": 20},
@@ -705,8 +705,17 @@ def _hpo_grid(name: str) -> list[dict[str, Any]]:
             {"learning_rate": 0.03, "n_estimators": 150, "num_leaves": 7, "colsample_bytree": 0.70},
             {"learning_rate": 0.06, "n_estimators": 90, "num_leaves": 15, "reg_lambda": 8.0},
         ]
+        if profile == "deep":
+            grid.extend(
+                [
+                    {"learning_rate": 0.015, "n_estimators": 360, "num_leaves": 31, "min_child_samples": 50, "reg_lambda": 10.0},
+                    {"learning_rate": 0.025, "n_estimators": 260, "num_leaves": 63, "feature_fraction": 0.75, "bagging_fraction": 0.75},
+                    {"learning_rate": 0.04, "n_estimators": 220, "num_leaves": 127, "min_child_samples": 80, "reg_alpha": 0.25},
+                ]
+            )
+        return grid
     if name == "catboost":
-        return [
+        grid = [
             {},
             {"iterations": 220, "learning_rate": 0.02, "depth": 4, "l2_leaf_reg": 8.0},
             {"iterations": 120, "learning_rate": 0.05, "depth": 5, "l2_leaf_reg": 5.0},
@@ -716,8 +725,17 @@ def _hpo_grid(name: str) -> list[dict[str, Any]]:
             {"iterations": 160, "learning_rate": 0.03, "depth": 5, "l2_leaf_reg": 12.0},
             {"iterations": 90, "learning_rate": 0.04, "depth": 6, "l2_leaf_reg": 15.0},
         ]
+        if profile == "deep":
+            grid.extend(
+                [
+                    {"iterations": 320, "learning_rate": 0.018, "depth": 4, "l2_leaf_reg": 16.0, "random_strength": 0.5},
+                    {"iterations": 240, "learning_rate": 0.03, "depth": 7, "l2_leaf_reg": 10.0, "random_strength": 1.0},
+                    {"iterations": 180, "learning_rate": 0.045, "depth": 5, "l2_leaf_reg": 20.0, "random_strength": 2.0},
+                ]
+            )
+        return grid
     if name == "xgboost":
-        return [
+        grid = [
             {},
             {"learning_rate": 0.02, "n_estimators": 250, "max_depth": 3, "min_child_weight": 8},
             {"learning_rate": 0.05, "n_estimators": 120, "max_depth": 4, "min_child_weight": 5},
@@ -727,6 +745,15 @@ def _hpo_grid(name: str) -> list[dict[str, Any]]:
             {"learning_rate": 0.03, "n_estimators": 140, "max_depth": 2, "colsample_bytree": 0.70},
             {"learning_rate": 0.06, "n_estimators": 90, "max_depth": 3, "reg_lambda": 8.0},
         ]
+        if profile == "deep":
+            grid.extend(
+                [
+                    {"learning_rate": 0.015, "n_estimators": 360, "max_depth": 4, "min_child_weight": 12, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 10.0},
+                    {"learning_rate": 0.025, "n_estimators": 260, "max_depth": 6, "min_child_weight": 8, "subsample": 0.7, "colsample_bytree": 0.65, "reg_alpha": 0.25},
+                    {"learning_rate": 0.05, "n_estimators": 180, "max_depth": 3, "min_child_weight": 16, "subsample": 0.9, "colsample_bytree": 0.9, "reg_lambda": 15.0},
+                ]
+            )
+        return grid
     if name == "histgb":
         return [
             {},
@@ -761,6 +788,7 @@ def _select_hyperparameters(
     x_train: Any,
     y_train: Any,
     training_samples: list[MetaLabelSample],
+    hpo_profile: str = "standard",
 ) -> dict[str, Any]:
     if name not in {"lightgbm", "catboost", "xgboost", "histgb", "randomforest", "extratrees"}:
         return {}
@@ -783,7 +811,7 @@ def _select_hyperparameters(
 
     best_params: dict[str, Any] = {}
     best_score: tuple[float, float, float] | None = None
-    for params in _hpo_grid(name):
+    for params in _hpo_grid(name, profile=hpo_profile):
         balanced_params = {**_class_balance_params(name, inner_y_train), **params}
         estimator = _build_model(name, balanced_params)
         _fit_estimator(estimator, inner_x_train, inner_y_train, sample_weight=inner_weights)
@@ -1040,6 +1068,8 @@ def _fit_base_prediction_sets(
     model_names: list[str],
     calibration_method: str,
     tune_hyperparameters: bool,
+    hpo_profile: str = "standard",
+    foundation_max_samples: int = 1024,
 ) -> tuple[list[BaseFoldPredictionSet], dict[str, str]]:
     prediction_sets: list[BaseFoldPredictionSet] = []
     skipped: dict[str, str] = {}
@@ -1055,7 +1085,11 @@ def _fit_base_prediction_sets(
             model_x_train = x_train
             model_y_train = y_train
             if _is_foundation_model(name):
-                model_x_train, model_y_train = _tail_training_window_with_two_classes(x_train, y_train)
+                model_x_train, model_y_train = _tail_training_window_with_two_classes(
+                    x_train,
+                    y_train,
+                    max_samples=foundation_max_samples,
+                )
                 if len(set(model_y_train.tolist())) < 2:
                     skipped[name] = "bounded foundation training window has one class"
                     continue
@@ -1090,6 +1124,7 @@ def _fit_base_prediction_sets(
                         x_train=model_x_train,
                         y_train=model_y_train,
                         training_samples=train_samples[-len(model_y_train) :],
+                        hpo_profile=hpo_profile,
                     )
                 if name in {"lightgbm", "catboost", "xgboost", "randomforest", "extratrees"}:
                     selected_params = {**_class_balance_params(name, model_y_train), **selected_params}
@@ -1754,6 +1789,8 @@ def _score_fold(
     stacker_mode: str,
     adaptive_minimum_threshold: float,
     tune_hyperparameters: bool,
+    hpo_profile: str,
+    foundation_max_samples: int,
     target_trades_per_day: float | None,
     allow_negative_ev_target_frequency: bool,
     candidate_type_thresholds: bool,
@@ -1794,6 +1831,8 @@ def _score_fold(
         model_names=model_names,
         calibration_method=calibration_method,
         tune_hyperparameters=tune_hyperparameters,
+        hpo_profile=hpo_profile,
+        foundation_max_samples=foundation_max_samples,
     )
     if not prediction_sets:
         constant = float(y_train.mean()) if len(y_train) else 0.0
@@ -2129,6 +2168,8 @@ def run_meta_label_walk_forward(
     stacker_mode: str = "average",
     adaptive_minimum_threshold: float = 0.0,
     tune_hyperparameters: bool = False,
+    hpo_profile: str = "standard",
+    foundation_max_samples: int = 1024,
     data_coverage: dict[str, Any] | None = None,
     target_trades_per_day: float | None = None,
     allow_negative_ev_target_frequency: bool = False,
@@ -2187,6 +2228,8 @@ def run_meta_label_walk_forward(
             stacker_mode=stacker_mode,
             adaptive_minimum_threshold=adaptive_minimum_threshold,
             tune_hyperparameters=tune_hyperparameters,
+            hpo_profile=hpo_profile,
+            foundation_max_samples=foundation_max_samples,
             target_trades_per_day=target_trades_per_day,
             allow_negative_ev_target_frequency=allow_negative_ev_target_frequency,
             candidate_type_thresholds=candidate_type_thresholds,

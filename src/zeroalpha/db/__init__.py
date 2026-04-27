@@ -1,0 +1,1 @@
+"""SQLite runtime metadata store."""

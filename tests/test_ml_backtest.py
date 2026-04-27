@@ -1,0 +1,712 @@
+from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+
+from zeroalpha.backtest.ml import _confidence_notional_scale, run_ml_backtest
+from zeroalpha.config import AppConfig, LabelConfig, ModelConfig, RiskConfig
+from zeroalpha.domain import Bar, TripleBarrierLabel
+from zeroalpha.models.dataset import MetaLabelSample
+from zeroalpha.models.ensemble import FoldPrediction, MetaLabelWalkForwardReport
+
+
+def _bar(ts: datetime, *, high: float = 103.0, low: float = 99.0, close: float = 101.0) -> Bar:
+    return Bar(
+        timestamp_utc=ts,
+        symbol="BTCUSDT",
+        bar_size="1h",
+        open=100.0,
+        high=high,
+        low=low,
+        close=close,
+        volume=1.0,
+        source="TEST",
+    )
+
+
+def _sample(event_id: str, ts: datetime, *, exit_hours: int = 6) -> MetaLabelSample:
+    detail = TripleBarrierLabel(
+        event_id=event_id,
+        entry_timestamp_utc=ts + timedelta(hours=1),
+        entry_price=100.0,
+        upper_barrier_price=103.0,
+        lower_barrier_price=98.0,
+        vertical_barrier_timestamp_utc=ts + timedelta(hours=72),
+        exit_timestamp_utc=ts + timedelta(hours=exit_hours),
+        exit_price=103.0,
+        outcome_type="upper",
+        gross_return=0.03,
+        net_return=0.02,
+        label=1,
+        t1=ts + timedelta(hours=exit_hours),
+    )
+    return MetaLabelSample(
+        event_id=event_id,
+        timestamp_utc=ts,
+        t1=detail.t1,
+        candidate_type="volatility_breakout",
+        side="BUY",
+        net_profit_target=0.02,
+        net_stop_loss=0.02,
+        features={"candidate_type": "volatility_breakout", "signal_strength": 1.0},
+        label=1,
+        net_return=detail.net_return,
+        notional=10_000,
+        round_trip_cost_bps=86.0,
+        outcome_type=detail.outcome_type,
+        label_detail=detail,
+    )
+
+
+def _prediction(event_id: str, ts: datetime) -> FoldPrediction:
+    return FoldPrediction(
+        fold_id=0,
+        event_id=event_id,
+        timestamp_utc=ts.isoformat(),
+        candidate_type="volatility_breakout",
+        label=1,
+        probability=0.90,
+        expected_value=0.016,
+        should_trade=True,
+        decision_reason="approved",
+        net_return=0.02,
+        pnl=200.0,
+    )
+
+
+def test_ml_backtest_rejects_overlapping_model_signals() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start), _sample("b", start + timedelta(hours=2))]
+    report = MetaLabelWalkForwardReport(
+        samples=2,
+        folds=[],
+        predictions=[_prediction("a", start), _prediction("b", start + timedelta(hours=2))],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={"primary": {"source": "TEST", "bars": 10}},
+    )
+    bars = [
+        _bar(start + timedelta(hours=i), high=101.0, low=99.0)
+        for i in range(1, 12)
+    ]
+    bars[5] = _bar(start + timedelta(hours=6), high=103.0, low=99.0)
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert summary.trades == 1
+    assert summary.sharpe == 0.0
+    assert trades[0].event_id == "a"
+    assert summary.reject_reasons["position_overlap"] == 1
+    assert any(rejection.event_id == "b" for rejection in rejections)
+
+
+def test_ml_backtest_allows_configured_multiple_open_positions() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start), _sample("b", start + timedelta(hours=2))]
+    report = MetaLabelWalkForwardReport(
+        samples=2,
+        folds=[],
+        predictions=[_prediction("a", start), _prediction("b", start + timedelta(hours=2))],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={"primary": {"source": "TEST", "bars": 10}},
+    )
+    bars = [
+        _bar(start + timedelta(hours=i), high=101.0, low=99.0)
+        for i in range(1, 12)
+    ]
+    bars[5] = _bar(start + timedelta(hours=6), high=103.0, low=99.0)
+    bars[7] = _bar(start + timedelta(hours=8), high=103.0, low=99.0)
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(minimum_fee_efficient_notional=100.0, max_open_positions=2),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert summary.trades == 2
+    assert [trade.event_id for trade in trades] == ["a", "b"]
+    assert "position_overlap" not in summary.reject_reasons
+    assert all(rejection.reason != "position_overlap" for rejection in rejections)
+
+
+def test_ml_backtest_sizes_overlapping_entries_before_unrealized_exit_pnl() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start, exit_hours=6), _sample("b", start + timedelta(hours=2), exit_hours=8)]
+    report = MetaLabelWalkForwardReport(
+        samples=2,
+        folds=[],
+        predictions=[_prediction("a", start), _prediction("b", start + timedelta(hours=2))],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={"primary": {"source": "TEST", "bars": 12}},
+    )
+    bars = [_bar(start + timedelta(hours=i), high=101.0, low=99.0) for i in range(1, 14)]
+    bars[5] = _bar(start + timedelta(hours=6), high=103.0, low=99.0)
+    bars[10] = _bar(start + timedelta(hours=11), high=103.0, low=99.0)
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(max_open_positions=2, minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert summary.trades == 2
+    assert [trade.notional for trade in trades] == [1750.0, 1750.0]
+    assert trades[0].equity_after == 10035.0
+    assert trades[1].equity_after == 10070.0
+
+
+def test_ml_backtest_rejects_overlapping_spot_entries_without_cash_capacity() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start, exit_hours=6), _sample("b", start + timedelta(hours=2), exit_hours=8)]
+    report = MetaLabelWalkForwardReport(
+        samples=2,
+        folds=[],
+        predictions=[_prediction("a", start), _prediction("b", start + timedelta(hours=2))],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={"primary": {"source": "TEST", "bars": 12}},
+    )
+    bars = [_bar(start + timedelta(hours=i), high=101.0, low=99.0) for i in range(1, 14)]
+    bars[5] = _bar(start + timedelta(hours=6), high=103.0, low=99.0)
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(risk_per_trade=1.0, max_open_positions=2, minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert summary.trades == 1
+    assert trades[0].notional == 10_000
+    assert any(rejection.event_id == "b" and rejection.reason == "insufficient_cash" for rejection in rejections)
+
+
+def test_ml_backtest_replays_exit_from_actual_fill_instead_of_label_exit() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[_prediction("a", start)],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [
+        _bar(start + timedelta(hours=1), high=100.5, low=99.0, close=100.0),
+        _bar(start + timedelta(hours=2), high=100.5, low=98.0, close=98.5),
+        _bar(start + timedelta(hours=3), high=103.0, low=98.5, close=102.0),
+    ]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert summary.trades == 1
+    assert trades[0].outcome_type == "lower_replay"
+    assert trades[0].pnl < 0
+
+
+def test_ml_backtest_reports_missed_entry_fills() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[_prediction("a", start)],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 4)]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        entry_limit_offset_bps=200.0,
+    )
+
+    assert trades == []
+    assert summary.missed_fills == 1
+
+
+def test_ml_backtest_rejects_wide_spread_before_sizing() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[_prediction("a", start)],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=100.0,
+    )
+
+    assert trades == []
+    assert summary.trades == 0
+    assert summary.reject_reasons["spread_too_wide"] == 1
+    assert rejections[0].reason == "spread_too_wide"
+
+
+def test_ml_backtest_rejects_spot_crypto_short_samples() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [replace(_sample("a", start), side="SELL")]
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[_prediction("a", start)],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+
+    assert trades == []
+    assert summary.trades == 0
+    assert summary.reject_reasons["spot_short_not_executable"] == 1
+    assert rejections[0].reason == "spot_short_not_executable"
+
+
+def test_ml_backtest_allows_spot_short_only_for_research_backtest() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [replace(_sample("a", start), side="SELL")]
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[replace(_prediction("a", start), side="SELL")],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    blocked_summary, blocked_trades, blocked_rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+    )
+    research_summary, research_trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+        allow_research_short_backtest=True,
+    )
+
+    assert blocked_summary.trades == 0
+    assert blocked_trades == []
+    assert blocked_rejections[0].reason == "spot_short_not_executable"
+    assert research_summary.trades == 1
+    assert research_trades[0].side == "SELL"
+
+
+def test_ml_backtest_research_gate_rejects_negative_ev_by_default() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = _prediction("a", start)
+    prediction = replace(prediction, probability=0.20, expected_value=-0.01)
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    production_summary, _, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+    )
+    research_summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+    )
+
+    assert production_summary.trades == 0
+    assert research_summary.trades == 0
+    assert trades == []
+    assert rejections[0].reason == "negative_ev_research_gate"
+
+
+def test_ml_backtest_trusts_candidate_type_calibrated_research_signal() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(
+        _prediction("a", start),
+        expected_value=-0.01,
+        decision_reason="candidate_type_calibration",
+    )
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+    )
+
+    assert summary.trades == 1
+    assert trades[0].event_id == "a"
+
+
+def test_ml_backtest_rejects_negative_utility_target_frequency_by_default() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(
+        _prediction("a", start),
+        expected_value=-0.01,
+        decision_reason="target_frequency_rank",
+        selection_score=-0.001,
+    )
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, rejections = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+    )
+
+    assert summary.trades == 0
+    assert trades == []
+    assert rejections[0].reason == "negative_ev_research_gate"
+
+
+def test_ml_backtest_accepts_positive_utility_target_frequency_research_signal() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(
+        _prediction("a", start),
+        expected_value=0.001,
+        decision_reason="target_frequency_rank",
+        selection_score=0.001,
+    )
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+    )
+
+    assert summary.trades == 1
+    assert trades[0].event_id == "a"
+
+
+def test_ml_backtest_can_run_explicit_negative_ev_frequency_probe() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(_prediction("a", start), probability=0.20, expected_value=-0.01)
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    research_summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        enforce_production_gate=False,
+        allow_negative_ev_research=True,
+    )
+
+    assert research_summary.trades == 1
+    assert trades[0].event_id == "a"
+
+
+def test_confidence_scaled_sizing_reduces_notional_without_exceeding_caps() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(_prediction("a", start), probability=0.61, expected_value=0.001)
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+            risk=RiskConfig(minimum_fee_efficient_notional=100.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        confidence_scaled_sizing=True,
+    )
+
+    assert summary.trades == 1
+    assert 0 < trades[0].notional < 10_000
+
+
+def test_confidence_scaled_sizing_keeps_valid_signal_fee_efficient() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    samples = [_sample("a", start)]
+    prediction = replace(_prediction("a", start), probability=0.61, expected_value=0.001)
+    report = MetaLabelWalkForwardReport(
+        samples=1,
+        folds=[],
+        predictions=[prediction],
+        feature_names=[],
+        requested_models=["logistic"],
+        calibration_method="sigmoid",
+        stacker_mode="average",
+        data_coverage={},
+    )
+    bars = [_bar(start + timedelta(hours=i)) for i in range(1, 8)]
+
+    summary, trades, _ = run_ml_backtest(
+        report=report,
+        samples=samples,
+        bars=bars,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        starting_equity=10_000,
+        requested_notional=10_000,
+        assumed_spread_bps=10.0,
+        confidence_scaled_sizing=True,
+    )
+
+    assert summary.trades == 1
+    assert trades[0].notional >= 1_000
+    assert trades[0].notional < 10_000
+
+
+def test_confidence_sizing_trusts_strong_candidate_type_calibration() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    prediction = replace(
+        _prediction("a", start),
+        probability=0.16,
+        expected_value=-0.001,
+        decision_reason="target_frequency_rank",
+    )
+
+    scale = _confidence_notional_scale(
+        prediction,
+        AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        type_threshold={
+            "source": "candidate_type_calibration",
+            "average_trade_return": 0.004,
+            "utility_floor": 0.003,
+            "hit_rate": 0.60,
+            "traded_signals": 5,
+        },
+    )
+
+    assert scale == 1.0

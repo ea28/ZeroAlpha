@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from zeroalpha.backtest.ml import MLBacktestSummary, run_ml_backtest
 from zeroalpha.candidates.events import CandidateGenerationConfig
 from zeroalpha.config import AppConfig
+from zeroalpha.data.external.prediction_markets import PredictionMarketSnapshot
 from zeroalpha.domain import Bar
 from zeroalpha.models.dataset import build_meta_label_samples
 from zeroalpha.models.ensemble import (
@@ -103,6 +104,7 @@ def run_label_geometry_sweep(
     assumed_spread_bps: float,
     research_notional: float,
     context_bars: Mapping[str, list[Bar]] | None,
+    prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None,
     net_profit_targets: list[float],
     net_stop_losses: list[float],
     max_holding_hours_values: list[int],
@@ -123,6 +125,8 @@ def run_label_geometry_sweep(
     allow_short_research: bool = False,
     candidate_mode: str = "rules",
     selection_score_mode: str = "expected_value",
+    target_frequency_mode: str = "strict",
+    selection_score_floor: float | None = None,
     specialist_models: bool = False,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
@@ -148,6 +152,7 @@ def run_label_geometry_sweep(
                     assumed_spread_bps=assumed_spread_bps,
                     research_notional=research_notional,
                     context_bars=context_bars,
+                    prediction_market_snapshots=prediction_market_snapshots,
                     candidate_config=CandidateGenerationConfig(
                         max_holding_hours=max_holding_hours,
                         side_mode=candidate_side_mode,
@@ -170,6 +175,8 @@ def run_label_geometry_sweep(
                     candidate_type_thresholds=candidate_type_thresholds,
                     empirical_payoff_ev=empirical_payoff_ev,
                     selection_score_mode=selection_score_mode,
+                    target_frequency_mode=target_frequency_mode,
+                    selection_score_floor=selection_score_floor,
                     specialist_models=specialist_models,
                     require_calibrated_selection=require_calibrated_selection,
                     min_signal_spacing_hours=min_signal_spacing_hours,

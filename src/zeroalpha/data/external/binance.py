@@ -30,10 +30,24 @@ class BinancePublicDataClient:
             f"{symbol}-{interval}-{month}.zip"
         )
 
+    def monthly_futures_klines_url(self, symbol: str, interval: str, month: str, *, market_type: str = "um") -> str:
+        symbol = symbol.upper()
+        return (
+            f"{self.base_url}/futures/{market_type}/monthly/klines/{symbol}/{interval}/"
+            f"{symbol}-{interval}-{month}.zip"
+        )
+
     def daily_klines_url(self, symbol: str, interval: str, day: date) -> str:
         symbol = symbol.upper()
         return (
             f"{self.base_url}/spot/daily/klines/{symbol}/{interval}/"
+            f"{symbol}-{interval}-{day.isoformat()}.zip"
+        )
+
+    def daily_futures_klines_url(self, symbol: str, interval: str, day: date, *, market_type: str = "um") -> str:
+        symbol = symbol.upper()
+        return (
+            f"{self.base_url}/futures/{market_type}/daily/klines/{symbol}/{interval}/"
             f"{symbol}-{interval}-{day.isoformat()}.zip"
         )
 
@@ -79,6 +93,10 @@ def parse_kline_zip(payload: bytes, *, symbol: str, interval: str, source: str =
                         quote_volume=float(fields[7]),
                         trade_count=int(fields[8]),
                         source=source,
+                        extra={
+                            "taker_buy_base_volume": float(fields[9]) if len(fields) > 9 and fields[9] else 0.0,
+                            "taker_buy_quote_volume": float(fields[10]) if len(fields) > 10 and fields[10] else 0.0,
+                        },
                     )
                 )
     return rows
@@ -180,6 +198,61 @@ def fetch_klines_archive_range(
             payload = download_zip_with_checksum(client, url, cache_dir / "daily")
             if payload is not None:
                 bars.extend(parse_kline_zip(payload, symbol=symbol, interval=interval))
+            day += timedelta(days=1)
+
+    deduped = {bar.timestamp_utc: bar for bar in bars}
+    return [
+        bar
+        for bar in sorted(deduped.values(), key=lambda item: item.timestamp_utc)
+        if start <= bar.timestamp_utc < end
+    ]
+
+
+def fetch_futures_klines_archive_range(
+    *,
+    symbol: str,
+    interval: str,
+    start: datetime,
+    end: datetime,
+    cache_dir: Path,
+    market_type: str = "um",
+    client: BinancePublicDataClient | None = None,
+) -> list[Bar]:
+    """Fetch Binance USD-M/COIN-M futures archive klines for a UTC range."""
+
+    if market_type not in {"um", "cm"}:
+        raise ValueError("market_type must be um or cm")
+    client = client or BinancePublicDataClient()
+    start = ensure_utc(start)
+    end = ensure_utc(end)
+    if end <= start:
+        raise ValueError("end must be after start")
+
+    start_date = start.date()
+    end_date = end.date()
+    bars: list[Bar] = []
+    source = f"BINANCE_{market_type.upper()}_FUTURES"
+    for month_start in month_starts(start_date, end_date):
+        month_end = first_day_next_month(month_start) - timedelta(days=1)
+        if start_date <= month_start and month_end <= end_date and month_end < date.today().replace(day=1):
+            url = client.monthly_futures_klines_url(
+                symbol,
+                interval,
+                month_start.strftime("%Y-%m"),
+                market_type=market_type,
+            )
+            payload = download_zip_with_checksum(client, url, cache_dir / market_type / "monthly")
+            if payload is not None:
+                bars.extend(parse_kline_zip(payload, symbol=symbol, interval=interval, source=source))
+            continue
+
+        day = max(start_date, month_start)
+        last = min(end_date, month_end)
+        while day <= last:
+            url = client.daily_futures_klines_url(symbol, interval, day, market_type=market_type)
+            payload = download_zip_with_checksum(client, url, cache_dir / market_type / "daily")
+            if payload is not None:
+                bars.extend(parse_kline_zip(payload, symbol=symbol, interval=interval, source=source))
             day += timedelta(days=1)
 
     deduped = {bar.timestamp_utc: bar for bar in bars}

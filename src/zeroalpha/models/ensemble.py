@@ -1639,6 +1639,8 @@ def _select_target_frequency_event_ids(
     config: AppConfig,
     allow_negative_ev: bool,
     selection_score_mode: str = "expected_value",
+    target_frequency_mode: str = "strict",
+    selection_score_floor: float | None = None,
     candidate_type_thresholds: dict[str, dict[str, Any]] | None = None,
     empirical_payoff_ev: bool = False,
     payoff_estimates: dict[str, dict[str, Any]] | None = None,
@@ -1651,6 +1653,8 @@ def _select_target_frequency_event_ids(
 ) -> set[str]:
     if target_trades_per_day <= 0:
         return set()
+    if target_frequency_mode not in {"strict", "quota"}:
+        raise ValueError("target_frequency_mode must be strict or quota")
     if predicted_returns is None:
         predicted_returns = [0.0 for _ in test_samples]
     if predicted_downsides is None:
@@ -1693,15 +1697,18 @@ def _select_target_frequency_event_ids(
             if type_threshold and type_threshold.get("threshold") is not None:
                 threshold = max(threshold, float(type_threshold["threshold"]))
                 type_utility = float(type_threshold.get("average_trade_return", 0.0))
-        if probability < threshold:
-            continue
-        if not allow_negative_ev and not _passes_selection_and_ev_gate(
-            selection_score_mode=selection_score_mode,
-            selection_score=score,
-            expected_value=expected_value,
-            minimum_expected_value=config.model.minimum_expected_value,
-            type_threshold=type_threshold,
-        ):
+        if target_frequency_mode == "strict":
+            if probability < threshold:
+                continue
+            if not allow_negative_ev and not _passes_selection_and_ev_gate(
+                selection_score_mode=selection_score_mode,
+                selection_score=score,
+                expected_value=expected_value,
+                minimum_expected_value=config.model.minimum_expected_value,
+                type_threshold=type_threshold,
+            ):
+                continue
+        elif selection_score_floor is not None and score < selection_score_floor:
             continue
         grouped.setdefault(sample.timestamp_utc.date(), []).append(
             (sample, probability, expected_value, type_utility, score, _threshold_group_key(sample))
@@ -1796,6 +1803,8 @@ def _score_fold(
     candidate_type_thresholds: bool,
     empirical_payoff_ev: bool,
     selection_score_mode: str,
+    target_frequency_mode: str,
+    selection_score_floor: float | None,
     specialist_models: bool,
     require_calibrated_selection: bool,
     min_signal_spacing_hours: float,
@@ -1927,7 +1936,7 @@ def _score_fold(
             minimum_threshold=adaptive_minimum_threshold,
             utility_samples=calibration_samples,
         )
-    if target_trades_per_day and target_trades_per_day > 0:
+    if target_trades_per_day and target_trades_per_day > 0 and target_frequency_mode == "strict":
         selected_threshold_row = _select_threshold_for_target_frequency(
             calibration_samples=threshold_samples,
             probabilities=threshold_probabilities,
@@ -1935,6 +1944,8 @@ def _score_fold(
             target_trades_per_day=target_trades_per_day,
         )
         selected_threshold_source = "target_frequency_rank"
+    elif target_trades_per_day and target_trades_per_day > 0:
+        selected_threshold_source = "target_frequency_quota"
     elif adaptive_threshold:
         selected_threshold_row = _select_threshold_from_calibration(
             calibration_samples=threshold_samples,
@@ -1959,6 +1970,8 @@ def _score_fold(
             config=config,
             allow_negative_ev=allow_negative_ev_target_frequency,
             selection_score_mode=selection_score_mode,
+            target_frequency_mode=target_frequency_mode,
+            selection_score_floor=selection_score_floor,
             candidate_type_thresholds=type_thresholds if candidate_type_thresholds else None,
             empirical_payoff_ev=empirical_payoff_ev,
             payoff_estimates=payoff_estimates,
@@ -1969,6 +1982,11 @@ def _score_fold(
         )
         if target_trades_per_day and target_trades_per_day > 0
         else None
+    )
+    target_frequency_approval_reason = (
+        "target_frequency_quota"
+        if target_trades_per_day and target_trades_per_day > 0 and target_frequency_mode == "quota"
+        else "target_frequency_rank"
     )
 
     predictions: list[FoldPrediction] = []
@@ -2000,7 +2018,7 @@ def _score_fold(
         )
         if target_frequency_event_ids is not None:
             should_trade = sample.event_id in target_frequency_event_ids
-            reason = "target_frequency_rank" if should_trade else "target_frequency_rank_not_selected"
+            reason = target_frequency_approval_reason if should_trade else f"{target_frequency_approval_reason}_not_selected"
         elif candidate_type_thresholds and _threshold_lookup(type_thresholds, sample):
             type_threshold = _threshold_lookup(type_thresholds, sample)
             assert type_threshold is not None
@@ -2176,6 +2194,8 @@ def run_meta_label_walk_forward(
     candidate_type_thresholds: bool = False,
     empirical_payoff_ev: bool = False,
     selection_score_mode: str = "expected_value",
+    target_frequency_mode: str = "strict",
+    selection_score_floor: float | None = None,
     specialist_models: bool = False,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
@@ -2211,6 +2231,7 @@ def run_meta_label_walk_forward(
     reports: list[FoldReport] = []
     predictions: list[FoldPrediction] = []
     feature_names: list[str] = []
+    feature_name_seen: set[str] = set()
     for fold_id, fold in enumerate(folds):
         train_samples = [ordered[idx] for idx in fold.train_indices]
         calibration_samples = [ordered[idx] for idx in fold.calibration_indices]
@@ -2235,6 +2256,8 @@ def run_meta_label_walk_forward(
             candidate_type_thresholds=candidate_type_thresholds,
             empirical_payoff_ev=empirical_payoff_ev,
             selection_score_mode=selection_score_mode,
+            target_frequency_mode=target_frequency_mode,
+            selection_score_floor=selection_score_floor,
             specialist_models=specialist_models,
             require_calibrated_selection=require_calibrated_selection,
             min_signal_spacing_hours=min_signal_spacing_hours,
@@ -2243,8 +2266,10 @@ def run_meta_label_walk_forward(
         )
         reports.append(fold_report)
         predictions.extend(fold_predictions)
-        if not feature_names:
-            feature_names = encoder.feature_names
+        for feature_name in encoder.feature_names:
+            if feature_name not in feature_name_seen:
+                feature_name_seen.add(feature_name)
+                feature_names.append(feature_name)
 
     return MetaLabelWalkForwardReport(
         samples=len(ordered),

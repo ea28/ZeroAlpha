@@ -2,7 +2,7 @@ from datetime import datetime, UTC
 from io import BytesIO
 import zipfile
 
-from zeroalpha.data.external.binance import BinancePublicDataClient, verify_sha256
+from zeroalpha.data.external.binance import BinancePublicDataClient, parse_kline_zip, verify_sha256
 from zeroalpha.data.external.coinbase import CoinbaseExchangeClient, candle_windows
 from zeroalpha.data.external.kraken import missing_ohlcvt_intervals, parse_ohlcvt_zip
 
@@ -13,6 +13,24 @@ def test_binance_monthly_url() -> None:
         client.monthly_klines_url("btcusdt", "1h", "2026-04")
         == "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1h/BTCUSDT-1h-2026-04.zip"
     )
+    assert (
+        client.daily_futures_klines_url("btcusdt", "15m", datetime(2026, 4, 27, tzinfo=UTC).date())
+        == "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/15m/BTCUSDT-15m-2026-04-27.zip"
+    )
+
+
+def test_binance_kline_parser_exposes_taker_flow() -> None:
+    payload = BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "BTCUSDT-15m.csv",
+            "1767225600000,100,101,99,100.5,10,1767226499999,1005,4,6,603,0\n",
+        )
+
+    bars = parse_kline_zip(payload.getvalue(), symbol="BTCUSDT", interval="15m")
+
+    assert bars[0].extra["taker_buy_base_volume"] == 6
+    assert bars[0].extra["taker_buy_quote_volume"] == 603
 
 
 def test_verify_sha256() -> None:

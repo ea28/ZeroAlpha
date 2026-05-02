@@ -39,6 +39,82 @@ class CandidateGenerationConfig:
     allow_short_research: bool = False
 
 
+def _bar_returns(bars: list[Bar]) -> list[float]:
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
+    return [
+        ordered[idx].close / ordered[idx - 1].close - 1
+        for idx in range(1, len(ordered))
+        if ordered[idx - 1].close > 0
+    ]
+
+
+def _safe_average(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _dense_setup_metadata(bars: list[Bar]) -> dict[str, float | str | bool]:
+    """Describe every dense bar as a tradable setup family for specialist models."""
+
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
+    latest = ordered[-1]
+    previous = ordered[:-1]
+    recent_24 = ordered[-25:]
+    previous_24 = recent_24[:-1] or previous[-24:]
+    returns = _bar_returns(ordered)
+    return_4 = sum(returns[-4:]) if len(returns) >= 4 else sum(returns)
+    return_16 = sum(returns[-16:]) if len(returns) >= 16 else sum(returns)
+    prior_return = returns[-1] if returns else 0.0
+    previous_high = max((bar.high for bar in previous_24), default=latest.high)
+    previous_low = min((bar.low for bar in previous_24), default=latest.low)
+    range_width = previous_high - previous_low
+    range_position = (latest.close - previous_low) / range_width if range_width > 0 else 0.5
+    previous_volume = _safe_average([bar.volume for bar in previous_24])
+    volume_ratio = latest.volume / previous_volume if previous_volume > 0 else 0.0
+    current_range = (latest.high - latest.low) / latest.close if latest.close > 0 else 0.0
+    previous_ranges = [
+        (bar.high - bar.low) / bar.close
+        for bar in previous_24
+        if bar.close > 0
+    ]
+    average_range = _safe_average(previous_ranges)
+    range_expansion = current_range / average_range if average_range > 0 else 0.0
+    compression_window = previous_ranges[-8:] if len(previous_ranges) >= 8 else previous_ranges
+    range_compression = _safe_average(compression_window) / average_range if average_range > 0 else 0.0
+    lower_wick = min(latest.open, latest.close) - latest.low
+    upper_wick = latest.high - max(latest.open, latest.close)
+    candle_range = latest.high - latest.low
+    lower_wick_share = lower_wick / candle_range if candle_range > 0 else 0.0
+    upper_wick_share = upper_wick / candle_range if candle_range > 0 else 0.0
+
+    if latest.close > previous_high and volume_ratio >= 1.05:
+        family = "dense_breakout_momentum"
+    elif return_4 > 0 and return_16 > 0 and range_position >= 0.55:
+        family = "dense_trend_continuation"
+    elif range_position <= 0.25 and lower_wick_share > upper_wick_share:
+        family = "dense_support_reclaim"
+    elif range_position >= 0.75 and prior_return < 0:
+        family = "dense_pullback_reclaim"
+    elif range_compression <= 0.75 and range_expansion >= 1.15:
+        family = "dense_volatility_expansion"
+    else:
+        family = "dense_baseline"
+
+    return {
+        "dense_research": True,
+        "setup_family": family,
+        "dense_setup_family": family,
+        "prior_bar_return": prior_return,
+        "dense_return_4": return_4,
+        "dense_return_16": return_16,
+        "dense_range_position_24": range_position,
+        "dense_volume_ratio_24": volume_ratio,
+        "dense_range_expansion_24": range_expansion,
+        "dense_range_compression_24": range_compression,
+        "dense_lower_wick_share": lower_wick_share,
+        "dense_upper_wick_share": upper_wick_share,
+    }
+
+
 def dense_research_candidate(
     bars: list[Bar],
     *,
@@ -49,6 +125,7 @@ def dense_research_candidate(
     latest = sorted(bars, key=lambda bar: bar.timestamp_utc)[-1]
     previous = sorted(bars, key=lambda bar: bar.timestamp_utc)[-2]
     signal_strength = latest.close / previous.close - 1
+    metadata = _dense_setup_metadata(bars)
     event_id = str(
         uuid5(
             NAMESPACE_URL,
@@ -65,7 +142,7 @@ def dense_research_candidate(
         signal_strength=signal_strength,
         reference_price=latest.close,
         max_holding_hours=max_holding_hours,
-        metadata={"dense_research": True, "prior_bar_return": signal_strength},
+        metadata=metadata,
     )
 
 

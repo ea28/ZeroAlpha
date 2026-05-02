@@ -88,6 +88,10 @@ ZeroAlpha keeps public no-key feeds in the default repo:
   default in training/backtest commands and can be enabled explicitly.
 - Kraken public OHLC endpoint/parser: independent source health and validation
   support.
+- Polymarket/Kalshi BTC prediction-market signals: optional research features
+  from Polymarket Gamma discovery plus production CLOB v2 market-data endpoints,
+  and Kalshi Trade API v2 public market data. These are off by default and can
+  be enabled for recent retraining windows with `--prediction-market-signals`.
 
 API-key feeds such as CoinGlass, paid institutional feeds, and macro/on-chain
 providers are intentionally not part of the default working path. They can be
@@ -259,6 +263,41 @@ Enable Coinbase reference candles explicitly when the interval is supported:
 ```bash
 --coinbase-reference-products BTC-USD
 ```
+
+Enable Binance USD-M futures reference candles for spot/perp basis and futures
+flow context:
+
+```bash
+--binance-um-futures-reference-symbols BTCUSDT,ETHUSDT,SOLUSDT
+```
+
+Enable BTC prediction-market signals from Polymarket and Kalshi:
+
+```bash
+--prediction-market-signals \
+--prediction-market-durations 5m,15m,30m,1h,2h,4h,24h \
+--prediction-market-lookback-days 14
+```
+
+For dense intraday research where the model must take a few trades per day, use
+quota ranking instead of the strict probability/EV gate:
+
+```bash
+--candidate-mode dense \
+--interval 15m \
+--max-holding-hours 2 \
+--target-trades-per-day 3 \
+--target-frequency-mode quota \
+--selection-score probability \
+--research-gate \
+--allow-negative-ev-frequency-probe \
+--max-open-positions 4
+```
+
+Polymarket discovery attempts every requested duration but currently active BTC
+short-form markets are mainly 5m, 15m, 1h, and 4h. Kalshi contributes the exact
+15-minute BTC up/down series and hourly BTC ladder signals when available. The
+model report records per-venue coverage and skipped durations.
 
 Enable Kronos proxy features:
 

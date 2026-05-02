@@ -40,6 +40,8 @@ def test_dense_research_candidates_can_emit_every_bar_after_warmup() -> None:
     assert len(events) == 16
     assert {event.candidate_type for event in events} == {"dense_research_bar"}
     assert events[0].timestamp_utc == bars[4].timestamp_utc
+    assert all(isinstance(event.metadata.get("setup_family"), str) for event in events)
+    assert all("dense_range_position_24" in event.metadata for event in events)
 
 
 def test_spot_short_research_requires_explicit_override() -> None:

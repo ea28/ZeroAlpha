@@ -14,8 +14,16 @@ from zeroalpha.backtest.ml import run_ml_backtest, write_ml_backtest_artifact
 from zeroalpha.backtest.simple import run_candidate_backtest, write_backtest_artifact
 from zeroalpha.candidates.events import CandidateGenerationConfig
 from zeroalpha.config import load_config
-from zeroalpha.data.external.binance import BinancePublicDataClient, fetch_klines_archive_range
+from zeroalpha.data.external.binance import (
+    BinancePublicDataClient,
+    fetch_futures_klines_archive_range,
+    fetch_klines_archive_range,
+)
 from zeroalpha.data.external.coinbase import CoinbaseExchangeClient
+from zeroalpha.data.external.prediction_markets import (
+    BTC_PREDICTION_MARKET_DURATIONS,
+    load_prediction_market_snapshots,
+)
 from zeroalpha.data.health import health_checks_as_dict, run_external_data_health_checks
 from zeroalpha.data.quality import validate_bars, validate_source_divergence
 from zeroalpha.db.schema import initialize_sqlite
@@ -78,6 +86,13 @@ def _coinbase_reference_products(raw: str, interval: str) -> list[str]:
             return []
         return ["BTC-USD"]
     return [item.strip().upper() for item in value.split(",") if item.strip()]
+
+
+def _csv_values(raw: str) -> list[str]:
+    value = raw.strip()
+    if value.lower() in {"", "none", "off", "false"}:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _quality_or_raise(report, *, label: str, allow_data_gaps: bool = False) -> dict[str, object]:
@@ -174,6 +189,36 @@ def _load_research_bars(args: argparse.Namespace, start: datetime, end: datetime
                 allow_data_gaps=allow_data_gaps,
             ),
         }
+    for futures_symbol in _csv_values(getattr(args, "binance_um_futures_reference_symbols", "")):
+        bars = fetch_futures_klines_archive_range(
+            symbol=futures_symbol,
+            interval=context_interval,
+            start=start,
+            end=end,
+            cache_dir=cache_dir / "futures" / "um" / futures_symbol.upper(),
+            market_type="um",
+        )
+        key = f"BINANCE_UM_{futures_symbol.upper()}"
+        if bars:
+            context_bars[key] = bars
+        context_quality = validate_bars(
+            bars,
+            expected_interval=context_interval,
+            start=start,
+            end=end,
+            minimum_coverage_ratio=getattr(args, "minimum_data_coverage", 0.0),
+            max_return_bps=getattr(args, "max_bar_return_bps", 0.0) or None,
+        )
+        coverage["context"][key] = {
+            "source": "BINANCE_UM_FUTURES",
+            "interval": context_interval,
+            "bars": len(bars),
+            "quality": _context_quality_or_raise(
+                context_quality,
+                label=f"context {key}",
+                allow_data_gaps=allow_data_gaps,
+            ),
+        }
     coinbase_products = _coinbase_reference_products(args.coinbase_reference_products, context_interval)
     if coinbase_products:
         coinbase = CoinbaseExchangeClient()
@@ -208,6 +253,34 @@ def _load_research_bars(args: argparse.Namespace, start: datetime, end: datetime
                 "divergence": _quality_payload(divergence),
             }
     return primary_bars, context_bars, coverage
+
+
+def _prediction_market_durations_from_args(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "prediction_market_durations", "") or ",".join(BTC_PREDICTION_MARKET_DURATIONS)
+    return [value.strip().lower() for value in raw.split(",") if value.strip()]
+
+
+def _load_prediction_market_signals(args: argparse.Namespace, start: datetime, end: datetime):
+    if not getattr(args, "prediction_market_signals", False):
+        return [], {"enabled": False}
+    lookback_days = getattr(args, "prediction_market_lookback_days", 0)
+    fetch_start = max(start, end - timedelta(days=lookback_days)) if lookback_days else start
+    result = load_prediction_market_snapshots(
+        start=fetch_start,
+        end=end,
+        durations=_prediction_market_durations_from_args(args),
+        cache_dir=Path(getattr(args, "prediction_market_cache_dir", "data/raw/prediction_markets")),
+        max_markets=getattr(args, "prediction_market_max_markets", 500),
+        fidelity_minutes=getattr(args, "prediction_market_fidelity_minutes", 1),
+        refresh=getattr(args, "refresh_prediction_market_cache", False),
+    )
+    return result.snapshots, {
+        **result.coverage,
+        "enabled": True,
+        "requested_start": start.isoformat(),
+        "fetch_start": fetch_start.isoformat(),
+        "end": end.isoformat(),
+    }
 
 
 def _override_config_from_args(cfg, args: argparse.Namespace):
@@ -366,6 +439,7 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
     _validate_research_short_backtest_args(args)
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
+    prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -374,12 +448,14 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         )
     )
     data_coverage["kronos"] = asdict(cfg.kronos)
+    data_coverage["prediction_markets"] = prediction_market_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
     samples = _filter_samples_from_args(samples, args)
@@ -405,6 +481,8 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         candidate_type_thresholds=args.candidate_type_thresholds,
         empirical_payoff_ev=args.empirical_payoff_ev,
         selection_score_mode=args.selection_score,
+        target_frequency_mode=args.target_frequency_mode,
+        selection_score_floor=args.selection_score_floor,
         specialist_models=args.specialist_models,
         require_calibrated_selection=args.require_calibrated_selection,
         min_signal_spacing_hours=args.min_signal_spacing_hours,
@@ -435,6 +513,7 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
     cfg = _override_config_from_args(load_config(args.config), args)
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
+    prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -443,12 +522,14 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         )
     )
     data_coverage["kronos"] = asdict(cfg.kronos)
+    data_coverage["prediction_markets"] = prediction_market_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
     samples = _filter_samples_from_args(samples, args)
@@ -473,6 +554,8 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         candidate_type_thresholds=args.candidate_type_thresholds,
         empirical_payoff_ev=args.empirical_payoff_ev,
         selection_score_mode=args.selection_score,
+        target_frequency_mode=args.target_frequency_mode,
+        selection_score_floor=args.selection_score_floor,
         specialist_models=args.specialist_models,
         require_calibrated_selection=args.require_calibrated_selection,
         min_signal_spacing_hours=args.min_signal_spacing_hours,
@@ -526,6 +609,8 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
     _validate_research_short_backtest_args(args)
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
+    prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
+    data_coverage["prediction_markets"] = prediction_market_coverage
     candidate_config = _candidate_config_from_args(args, cfg)
     samples = build_meta_label_samples(
         primary_bars,
@@ -533,6 +618,7 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=candidate_config,
     )
     samples = _filter_samples_from_args(samples, args)
@@ -558,6 +644,8 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         candidate_type_thresholds=args.candidate_type_thresholds,
         empirical_payoff_ev=args.empirical_payoff_ev,
         selection_score_mode=args.selection_score,
+        target_frequency_mode=args.target_frequency_mode,
+        selection_score_floor=args.selection_score_floor,
         specialist_models=args.specialist_models,
         require_calibrated_selection=args.require_calibrated_selection,
         min_signal_spacing_hours=args.min_signal_spacing_hours,
@@ -678,7 +766,9 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
     _validate_research_short_backtest_args(args)
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
+    prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     data_coverage["kronos"] = asdict(cfg.kronos)
+    data_coverage["prediction_markets"] = prediction_market_coverage
     model_names = [value.strip().lower() for value in args.models.split(",") if value.strip()]
     results = run_label_geometry_sweep(
         primary_bars,
@@ -687,6 +777,7 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
         research_notional=args.notional,
         starting_equity=args.starting_equity,
         context_bars=context_bars,
+        prediction_market_snapshots=prediction_market_snapshots,
         net_profit_targets=_parse_float_list(args.net_profit_targets),
         net_stop_losses=_parse_float_list(args.net_stop_losses),
         max_holding_hours_values=_parse_int_list(args.max_holding_hours_values),
@@ -712,6 +803,8 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
             "active": "active_research",
         }.get(args.candidate_mode, "rules"),
         selection_score_mode=args.selection_score,
+        target_frequency_mode=args.target_frequency_mode,
+        selection_score_floor=args.selection_score_floor,
         specialist_models=args.specialist_models,
         require_calibrated_selection=args.require_calibrated_selection,
         min_signal_spacing_hours=args.min_signal_spacing_hours,
@@ -858,6 +951,42 @@ def _cmd_db_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_prediction_market_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--prediction-market-signals",
+        action="store_true",
+        help="Fetch Polymarket CLOB v2 and Kalshi BTC prediction-market signals for model features.",
+    )
+    parser.add_argument(
+        "--prediction-market-durations",
+        default=",".join(BTC_PREDICTION_MARKET_DURATIONS),
+        help="Comma-separated BTC Up/Down durations to attempt, e.g. 5m,15m,30m,1h,2h,4h,24h.",
+    )
+    parser.add_argument("--prediction-market-lookback-days", type=int, default=14)
+    parser.add_argument("--prediction-market-max-markets", type=int, default=500)
+    parser.add_argument("--prediction-market-fidelity-minutes", type=int, default=1)
+    parser.add_argument("--prediction-market-cache-dir", default="data/raw/prediction_markets")
+    parser.add_argument("--refresh-prediction-market-cache", action="store_true")
+
+
+def _add_target_frequency_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--target-frequency-mode",
+        choices=["strict", "quota"],
+        default="strict",
+        help=(
+            "strict keeps the old probability/EV pre-gates before ranking; quota ranks "
+            "all non-vetoed candidates to deliberately hit the requested daily turnover."
+        ),
+    )
+    parser.add_argument(
+        "--selection-score-floor",
+        type=float,
+        default=None,
+        help="Optional minimum selection score for quota mode. Omit to always choose the daily best-ranked setups.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zeroalpha")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -900,6 +1029,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--context-symbols", default="ETHUSDT,SOLUSDT,ETHBTC")
     ml_backtest.add_argument("--context-interval", default="")
     ml_backtest.add_argument("--coinbase-reference-products", default="none")
+    ml_backtest.add_argument("--binance-um-futures-reference-symbols", default="none")
     ml_backtest.add_argument("--interval", default="1h")
     ml_backtest.add_argument("--years", type=int, default=3)
     ml_backtest.add_argument("--start", default="")
@@ -935,6 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--minimum-expected-value", type=float, default=None)
     ml_backtest.add_argument("--calibration-method", choices=["sigmoid", "isotonic"], default="")
     ml_backtest.add_argument("--target-trades-per-day", type=float, default=0.0)
+    _add_target_frequency_args(ml_backtest)
     ml_backtest.add_argument("--research-gate", action="store_true")
     ml_backtest.add_argument("--allow-negative-ev-frequency-probe", action="store_true")
     ml_backtest.add_argument("--allow-research-short-backtest", action="store_true")
@@ -991,6 +1122,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--kronos-lookback-bars", type=int, default=0)
     ml_backtest.add_argument("--kronos-embedding-dims", type=int, default=0)
     ml_backtest.add_argument("--kronos-device", default="")
+    _add_prediction_market_args(ml_backtest)
     ml_backtest.add_argument("--output", default="artifacts/backtests/ml_btcusdt_1h.json")
     ml_backtest.set_defaults(func=_cmd_backtest_ml)
 
@@ -1002,6 +1134,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--context-symbols", default="ETHUSDT,SOLUSDT,ETHBTC")
     train_meta.add_argument("--context-interval", default="")
     train_meta.add_argument("--coinbase-reference-products", default="none")
+    train_meta.add_argument("--binance-um-futures-reference-symbols", default="none")
     train_meta.add_argument("--interval", default="1h")
     train_meta.add_argument("--years", type=int, default=3)
     train_meta.add_argument("--start", default="")
@@ -1035,6 +1168,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--minimum-expected-value", type=float, default=None)
     train_meta.add_argument("--calibration-method", choices=["sigmoid", "isotonic"], default="")
     train_meta.add_argument("--target-trades-per-day", type=float, default=0.0)
+    _add_target_frequency_args(train_meta)
     train_meta.add_argument("--allow-research-short-backtest", action="store_true")
     train_meta.add_argument(
         "--optimize-metric",
@@ -1081,6 +1215,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--kronos-lookback-bars", type=int, default=0)
     train_meta.add_argument("--kronos-embedding-dims", type=int, default=0)
     train_meta.add_argument("--kronos-device", default="")
+    _add_prediction_market_args(train_meta)
     train_meta.add_argument(
         "--output",
         default="artifacts/models/meta_label_walk_forward_btcusdt_1h.json",
@@ -1102,6 +1237,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--context-symbols", default="ETHUSDT,SOLUSDT,ETHBTC")
     signal_audit.add_argument("--context-interval", default="")
     signal_audit.add_argument("--coinbase-reference-products", default="none")
+    signal_audit.add_argument("--binance-um-futures-reference-symbols", default="none")
     signal_audit.add_argument("--interval", default="15m")
     signal_audit.add_argument("--years", type=int, default=1)
     signal_audit.add_argument("--start", default="")
@@ -1133,6 +1269,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--minimum-expected-value", type=float, default=None)
     signal_audit.add_argument("--calibration-method", choices=["sigmoid", "isotonic"], default="")
     signal_audit.add_argument("--target-trades-per-day", type=float, default=4.0)
+    _add_target_frequency_args(signal_audit)
     signal_audit.add_argument("--research-gate", action="store_true")
     signal_audit.add_argument("--allow-negative-ev-frequency-probe", action="store_true")
     signal_audit.add_argument("--allow-research-short-backtest", action="store_true")
@@ -1179,6 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--kronos-lookback-bars", type=int, default=0)
     signal_audit.add_argument("--kronos-embedding-dims", type=int, default=0)
     signal_audit.add_argument("--kronos-device", default="")
+    _add_prediction_market_args(signal_audit)
     signal_audit.add_argument("--output", default="artifacts/models/signal_audit_btcusdt_15m.json")
     signal_audit.set_defaults(func=_cmd_model_signal_audit)
     sweep_labels = model_sub.add_parser("sweep-labels")
@@ -1186,6 +1324,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_labels.add_argument("--symbol", default="BTCUSDT")
     sweep_labels.add_argument("--context-symbols", default="ETHUSDT,SOLUSDT,ETHBTC")
     sweep_labels.add_argument("--coinbase-reference-products", default="none")
+    sweep_labels.add_argument("--binance-um-futures-reference-symbols", default="none")
     sweep_labels.add_argument("--interval", default="1h")
     sweep_labels.add_argument("--years", type=int, default=3)
     sweep_labels.add_argument("--start", default="")
@@ -1204,6 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_labels.add_argument("--side-mode", choices=["long", "short", "long_short"], default="long")
     sweep_labels.add_argument("--allow-spot-short-research", action="store_true")
     sweep_labels.add_argument("--target-trades-per-day", type=float, default=0.0)
+    _add_target_frequency_args(sweep_labels)
     sweep_labels.add_argument("--research-gate", action="store_true")
     sweep_labels.add_argument("--allow-negative-ev-frequency-probe", action="store_true")
     sweep_labels.add_argument("--allow-research-short-backtest", action="store_true")
@@ -1231,6 +1371,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_labels.add_argument("--kronos-lookback-bars", type=int, default=0)
     sweep_labels.add_argument("--kronos-embedding-dims", type=int, default=0)
     sweep_labels.add_argument("--kronos-device", default="")
+    _add_prediction_market_args(sweep_labels)
     sweep_labels.add_argument("--top", type=int, default=5)
     sweep_labels.add_argument("--output", default="artifacts/models/label_geometry_sweep.json")
     sweep_labels.set_defaults(func=_cmd_model_sweep_labels)

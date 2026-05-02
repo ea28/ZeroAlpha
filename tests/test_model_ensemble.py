@@ -422,6 +422,48 @@ def test_expected_utility_rank_still_requires_positive_probability_ev() -> None:
     assert selected == set()
 
 
+def test_quota_target_frequency_can_rank_below_static_probability_and_ev_gates() -> None:
+    strong_rank = replace(_sample(0), event_id="strong-rank")
+    weak_rank = replace(_sample(1), event_id="weak-rank")
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[strong_rank, weak_rank],
+        probabilities=[0.10, 0.09],
+        predicted_returns=[0.02, -0.01],
+        target_trades_per_day=1,
+        selected_threshold=0.90,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.03),
+        ),
+        allow_negative_ev=False,
+        selection_score_mode="predicted_return",
+        target_frequency_mode="quota",
+        selection_score_floor=0.0,
+    )
+
+    assert selected == {"strong-rank"}
+
+
+def test_quota_target_frequency_respects_selection_score_floor() -> None:
+    sample = replace(_sample(0), event_id="negative-rank")
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[sample],
+        probabilities=[0.80],
+        predicted_returns=[-0.001],
+        target_trades_per_day=1,
+        selected_threshold=0.10,
+        config=AppConfig(labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02)),
+        allow_negative_ev=True,
+        selection_score_mode="predicted_return",
+        target_frequency_mode="quota",
+        selection_score_floor=0.0,
+    )
+
+    assert selected == set()
+
+
 def test_target_frequency_can_require_calibrated_candidate_bucket() -> None:
     sample = _sample(0)
 

@@ -25,6 +25,7 @@ class Side(StrEnum):
 class OrderType(StrEnum):
     LMT = "LMT"
     MKT = "MKT"
+    STP = "STP"
 
 
 class TimeInForce(StrEnum):
@@ -192,17 +193,24 @@ class OrderIntent:
     quantity: float | None = None
     cash_qty: float | None = None
     limit_price: float | None = None
+    aux_price: float | None = None
+    parent_internal_order_id: str | None = None
+    transmit: bool = True
     reason: str = ""
 
     def __post_init__(self) -> None:
         if self.order_type == OrderType.LMT and self.limit_price is None:
             raise ValueError("limit orders require limit_price")
+        if self.order_type == OrderType.STP and self.aux_price is None:
+            raise ValueError("stop orders require aux_price")
         if self.quantity is None and self.cash_qty is None:
             raise ValueError("order intent requires quantity or cash_qty")
         if self.quantity is not None and self.quantity <= 0:
             raise ValueError("quantity must be positive")
         if self.cash_qty is not None and self.cash_qty <= 0:
             raise ValueError("cash_qty must be positive")
+        if self.aux_price is not None and self.aux_price <= 0:
+            raise ValueError("aux_price must be positive")
 
 
 @dataclass(frozen=True, slots=True)

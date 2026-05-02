@@ -538,17 +538,20 @@ def _return_regressor() -> Any:
 def _sample_group(sample: MetaLabelSample) -> str:
     family = sample.features.get("event_setup_family")
     if isinstance(family, str) and family:
-        return family
-    candidate_type = sample.candidate_type
-    if "breakout" in candidate_type or "breakdown" in candidate_type:
-        return "breakout"
-    if "reversion" in candidate_type or "sweep" in candidate_type or "reversal" in candidate_type:
-        return "mean_reversion"
-    if "pullback" in candidate_type or "reclaim" in candidate_type:
-        return "pullback_reclaim"
-    if "momentum" in candidate_type or "continuation" in candidate_type:
-        return "momentum"
-    return "global"
+        group = family
+    else:
+        candidate_type = sample.candidate_type
+        if "breakout" in candidate_type or "breakdown" in candidate_type:
+            group = "breakout"
+        elif "reversion" in candidate_type or "sweep" in candidate_type or "reversal" in candidate_type:
+            group = "mean_reversion"
+        elif "pullback" in candidate_type or "reclaim" in candidate_type:
+            group = "pullback_reclaim"
+        elif "momentum" in candidate_type or "continuation" in candidate_type:
+            group = "momentum"
+        else:
+            group = "global"
+    return f"short_{group}" if sample.side == "SELL" else group
 
 
 def _sample_regime(sample: MetaLabelSample) -> str:
@@ -558,9 +561,10 @@ def _sample_regime(sample: MetaLabelSample) -> str:
 
 def _threshold_group_key(sample: MetaLabelSample) -> str:
     regime = _sample_regime(sample)
+    side_suffix = "|SELL" if sample.side == "SELL" else ""
     if regime == "unknown":
-        return sample.candidate_type
-    return f"{sample.candidate_type}|{regime}"
+        return f"{sample.candidate_type}{side_suffix}"
+    return f"{sample.candidate_type}{side_suffix}|{regime}"
 
 
 def _threshold_lookup(
@@ -568,10 +572,12 @@ def _threshold_lookup(
     sample: MetaLabelSample,
 ) -> dict[str, Any] | None:
     local = thresholds.get(_threshold_group_key(sample))
+    side_family = thresholds.get(f"{sample.candidate_type}|SELL") if sample.side == "SELL" else None
     family = thresholds.get(sample.candidate_type)
-    if local and local.get("source") == "insufficient_calibration" and family and family.get("abstain"):
-        return family
-    return local or family
+    fallback = side_family or family
+    if local and local.get("source") == "insufficient_calibration" and fallback and fallback.get("abstain"):
+        return fallback
+    return local or fallback
 
 
 def _fit_return_regression_predictions(

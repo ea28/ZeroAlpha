@@ -240,6 +240,45 @@ def test_target_frequency_abstains_thin_local_bucket_when_family_prior_is_negati
     assert selected == set()
 
 
+def test_target_frequency_uses_side_specific_short_calibration_bucket() -> None:
+    sample = replace(
+        _sample(0),
+        side="SELL",
+        candidate_type="dense_research_bar",
+        features={
+            **_sample(0).features,
+            "candidate_type": "dense_research_bar",
+            "market_regime": "range_day",
+        },
+    )
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[sample],
+        probabilities=[0.90],
+        predicted_returns=[0.02],
+        target_trades_per_day=1,
+        selected_threshold=0.10,
+        config=AppConfig(labels=LabelConfig(net_profit_target=0.0045, net_stop_loss=0.003)),
+        allow_negative_ev=False,
+        selection_score_mode="predicted_return",
+        candidate_type_thresholds={
+            "dense_research_bar|SELL|range_day": {
+                "threshold": None,
+                "source": "negative_calibration_utility",
+                "abstain": True,
+            },
+            "dense_research_bar": {
+                "threshold": 0.10,
+                "source": "candidate_type_calibration",
+                "abstain": False,
+                "average_trade_return": 0.02,
+            },
+        },
+    )
+
+    assert selected == set()
+
+
 def test_candidate_type_thresholds_reject_thin_positive_utility() -> None:
     samples = [
         replace(_sample(i), candidate_type="thin_type", label=1, net_return=0.0005)

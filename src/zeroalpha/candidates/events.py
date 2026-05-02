@@ -119,17 +119,24 @@ def dense_research_candidate(
     bars: list[Bar],
     *,
     max_holding_hours: int,
+    side: Side = Side.BUY,
 ) -> CandidateEvent | None:
     if len(bars) < 2:
         return None
     latest = sorted(bars, key=lambda bar: bar.timestamp_utc)[-1]
     previous = sorted(bars, key=lambda bar: bar.timestamp_utc)[-2]
-    signal_strength = latest.close / previous.close - 1
-    metadata = _dense_setup_metadata(bars)
+    raw_signal = latest.close / previous.close - 1
+    signal_strength = raw_signal if side == Side.BUY else -raw_signal
+    metadata = {
+        **_dense_setup_metadata(bars),
+        "dense_side": side.value,
+        "dense_raw_signal_strength": raw_signal,
+        "dense_side_aligned_signal_strength": signal_strength,
+    }
     event_id = str(
         uuid5(
             NAMESPACE_URL,
-            f"dense_research_bar:{latest.source}:{latest.symbol}:{latest.bar_size}:{latest.timestamp_utc}",
+            f"dense_research_bar:{side.value}:{latest.source}:{latest.symbol}:{latest.bar_size}:{latest.timestamp_utc}",
         )
     )
     return CandidateEvent(
@@ -137,7 +144,7 @@ def dense_research_candidate(
         timestamp_utc=latest.timestamp_utc,
         symbol=latest.symbol,
         candidate_type="dense_research_bar",
-        side=Side.BUY,
+        side=side,
         bar_size=latest.bar_size,
         signal_strength=signal_strength,
         reference_price=latest.close,
@@ -154,8 +161,24 @@ def candidates_for_history(
     if len(bars) < config.min_history_bars:
         return []
     if config.mode == "dense_research":
-        candidate = dense_research_candidate(bars, max_holding_hours=config.max_holding_hours)
-        return [candidate] if candidate is not None else []
+        dense_candidates: list[CandidateEvent] = []
+        if config.side_mode in {"long", "long_short"}:
+            candidate = dense_research_candidate(
+                bars,
+                max_holding_hours=config.max_holding_hours,
+                side=Side.BUY,
+            )
+            if candidate is not None:
+                dense_candidates.append(candidate)
+        if config.side_mode in {"short", "long_short"}:
+            candidate = dense_research_candidate(
+                bars,
+                max_holding_hours=config.max_holding_hours,
+                side=Side.SELL,
+            )
+            if candidate is not None:
+                dense_candidates.append(candidate)
+        return dense_candidates
     candidates: list[CandidateEvent] = []
     if config.mode == "active_research":
         active_horizon = min(config.max_holding_hours, 12)

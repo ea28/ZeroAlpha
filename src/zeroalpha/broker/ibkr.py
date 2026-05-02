@@ -179,6 +179,36 @@ class IBKRBroker:
             )
         return bars
 
+    def _order_from_intent(
+        self,
+        intent: OrderIntent,
+        *,
+        parent_order_ids: dict[str, int] | None = None,
+    ) -> Any:
+        ib_async = _ib_async()
+        order = ib_async.Order()
+        order.action = intent.side.value
+        order.orderType = intent.order_type.value
+        order.tif = intent.time_in_force.value
+        order.transmit = intent.transmit
+        if intent.order_type == OrderType.MKT:
+            order.tif = "IOC"
+        if intent.limit_price is not None:
+            order.lmtPrice = intent.limit_price
+        if intent.aux_price is not None:
+            order.auxPrice = intent.aux_price
+        if intent.cash_qty is not None:
+            order.cashQty = intent.cash_qty
+        if intent.quantity is not None:
+            order.totalQuantity = intent.quantity
+        if intent.parent_internal_order_id and parent_order_ids:
+            parent_id = parent_order_ids.get(intent.parent_internal_order_id)
+            if parent_id is not None:
+                order.parentId = parent_id
+        if intent.order_type == OrderType.MKT and intent.side.value == "BUY" and intent.cash_qty is None:
+            raise ValueError("IBKR crypto BUY market orders require cash_qty")
+        return order
+
     def place_order_intent(self, contract: QualifiedCryptoContract, intent: OrderIntent) -> Any:
         if not self._ib:
             raise BrokerConnectionError("connect before placing orders")
@@ -186,22 +216,27 @@ class IBKRBroker:
             raise ConfigError("broker connection is read-only; refusing to place order")
         if self.config.runtime.mode in {RuntimeMode.RESEARCH, RuntimeMode.SHADOW}:
             raise ConfigError(f"{self.config.runtime.mode.value} mode cannot submit orders")
-        ib_async = _ib_async()
-        order = ib_async.Order()
-        order.action = intent.side.value
-        order.orderType = intent.order_type.value
-        order.tif = intent.time_in_force.value
-        if intent.order_type == OrderType.MKT:
-            order.tif = "IOC"
-        if intent.limit_price is not None:
-            order.lmtPrice = intent.limit_price
-        if intent.cash_qty is not None:
-            order.cashQty = intent.cash_qty
-        if intent.quantity is not None:
-            order.totalQuantity = intent.quantity
-        if intent.order_type == OrderType.MKT and intent.side.value == "BUY" and intent.cash_qty is None:
-            raise ValueError("IBKR crypto BUY market orders require cash_qty")
+        order = self._order_from_intent(intent)
         return self._ib.placeOrder(contract.raw, order)
+
+    def place_order_intents(self, contract: QualifiedCryptoContract, intents: list[OrderIntent]) -> list[Any]:
+        if not self._ib:
+            raise BrokerConnectionError("connect before placing orders")
+        if self._read_only:
+            raise ConfigError("broker connection is read-only; refusing to place order")
+        if self.config.runtime.mode in {RuntimeMode.RESEARCH, RuntimeMode.SHADOW}:
+            raise ConfigError(f"{self.config.runtime.mode.value} mode cannot submit orders")
+        parent_order_ids: dict[str, int] = {}
+        trades: list[Any] = []
+        for intent in intents:
+            order = self._order_from_intent(intent, parent_order_ids=parent_order_ids)
+            trade = self._ib.placeOrder(contract.raw, order)
+            trades.append(trade)
+            trade_order = getattr(trade, "order", order)
+            order_id = getattr(trade_order, "orderId", None)
+            if isinstance(order_id, int):
+                parent_order_ids[intent.internal_order_id] = order_id
+        return trades
 
     async def wait(self, seconds: float) -> None:
         await asyncio.sleep(seconds)

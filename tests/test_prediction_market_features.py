@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from zeroalpha.data.external.prediction_markets import (
+    KalshiPublicDataClient,
     PreparedPredictionMarketSnapshots,
     PredictionMarketSnapshot,
     _polymarket_slug,
@@ -140,3 +141,51 @@ def test_prediction_market_features_flip_side_alignment_for_short_research() -> 
     assert features["pm_kalshi_15m_direction_skew"] == pytest.approx(-0.20)
     assert features["pm_kalshi_15m_side_aligned_skew"] == pytest.approx(0.20)
     assert features["pm_kalshi_15m_side_aligned_mid"] == 0.60
+
+
+def test_kalshi_loader_attempts_requested_5m_series() -> None:
+    class FakeKalshi(KalshiPublicDataClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_series: list[str] = []
+
+        def get_markets(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.seen_series.append(kwargs["series_ticker"])
+            if kwargs["series_ticker"] != "KXBTC5M" or kwargs.get("status") != "open":
+                return []
+            return [
+                {
+                    "ticker": "KXBTC5M-26MAY022355-55",
+                    "event_ticker": "KXBTC5M-26MAY022355",
+                    "title": "BTC price up in next 5 mins?",
+                    "open_time": "2026-05-03T03:55:00Z",
+                    "close_time": "2026-05-03T04:00:00Z",
+                    "liquidity_dollars": "1000",
+                }
+            ]
+
+        def market_candlesticks(self, **kwargs):  # type: ignore[no-untyped-def]
+            return [
+                {
+                    "end_period_ts": 1777780800,
+                    "price": {"close_dollars": "0.57"},
+                    "yes_bid": {"close_dollars": "0.56"},
+                    "yes_ask": {"close_dollars": "0.58"},
+                    "volume": "12",
+                }
+            ]
+
+    client = FakeKalshi()
+
+    snapshots, coverage = client.snapshots_from_btc_series(
+        start=datetime(2026, 5, 3, 3, 55, tzinfo=UTC),
+        end=datetime(2026, 5, 3, 4, 0, tzinfo=UTC),
+        max_markets=10,
+        durations=("5m",),
+    )
+
+    assert "KXBTC5M" in client.seen_series
+    assert coverage["series"]["KXBTC5M"]["markets"] == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].duration == "5m"
+    assert snapshots[0].up_mid == 0.57

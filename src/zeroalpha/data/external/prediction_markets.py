@@ -32,7 +32,15 @@ BTC_PREDICTION_MARKET_DURATIONS: tuple[str, ...] = (
 )
 
 POLYMARKET_BTC_UPDOWN_DURATIONS: tuple[str, ...] = ("5m", "15m", "1h", "4h")
-KALSHI_BTC_SIGNAL_SERIES: tuple[str, ...] = ("KXBTC15M", "KXBTC", "KXBTCD")
+KALSHI_BTC_DURATION_SERIES: dict[str, tuple[str, ...]] = {
+    "5m": ("KXBTC5M",),
+    "15m": ("KXBTC15M",),
+    "1h": ("KXBTC", "KXBTCD"),
+    "24h": ("KXBTCD",),
+}
+KALSHI_BTC_SIGNAL_SERIES: tuple[str, ...] = tuple(
+    dict.fromkeys(series for values in KALSHI_BTC_DURATION_SERIES.values() for series in values)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,8 +253,9 @@ class PolymarketClobV2Client:
         self.gamma_base_url = gamma_base_url
         self.clob_base_url = clob_base_url
 
-    def market_by_slug(self, slug: str) -> dict[str, Any] | None:
-        for closed in (False, True):
+    def market_by_slug(self, slug: str, *, prefer_closed: bool = False) -> dict[str, Any] | None:
+        closed_order = (True, False) if prefer_closed else (False, True)
+        for closed in closed_order:
             url = _url(self.gamma_base_url, "markets", {"slug": slug, "closed": str(closed).lower()})
             try:
                 payload = _request_json(url)
@@ -285,14 +294,13 @@ class PolymarketClobV2Client:
                     break
                 slug = _polymarket_slug(duration, window_start)
                 attempted[duration] = attempted.get(duration, 0) + 1
-                market = self.market_by_slug(slug)
+                window_end = window_start + timedelta(seconds=_duration_seconds(duration))
+                market = self.market_by_slug(slug, prefer_closed=window_end < datetime.now(tz=UTC))
                 if market is None:
                     continue
                 market["_zeroalpha_duration"] = duration
                 market["_zeroalpha_window_start_utc"] = window_start.isoformat()
-                market["_zeroalpha_window_end_utc"] = (
-                    window_start + timedelta(seconds=_duration_seconds(duration))
-                ).isoformat()
+                market["_zeroalpha_window_end_utc"] = window_end.isoformat()
                 markets.append(market)
                 duration_markets += 1
                 found[duration] = found.get(duration, 0) + 1
@@ -360,6 +368,53 @@ class PolymarketClobV2Client:
                 rows.append({"t": ts, "p": price})
         return rows
 
+    def batch_prices_history(
+        self,
+        token_ids: Sequence[str],
+        *,
+        start: datetime,
+        end: datetime,
+        fidelity_minutes: int,
+    ) -> dict[str, list[dict[str, float]]]:
+        if not token_ids:
+            return {}
+        body = {
+            "markets": list(token_ids),
+            "start_ts": int(ensure_utc(start).timestamp()),
+            "end_ts": int(ensure_utc(end).timestamp()),
+            "interval": "1m" if fidelity_minutes <= 1 else "all",
+            "fidelity": max(fidelity_minutes, 1),
+        }
+        try:
+            payload = _request_json(
+                _url(self.clob_base_url, "batch-prices-history"),
+                method="POST",
+                payload=body,
+            )
+        except HTTPError as exc:
+            if exc.code in {400, 404, 429}:
+                return {}
+            raise
+        except (TimeoutError, URLError):
+            return {}
+        history = payload.get("history", {}) if isinstance(payload, dict) else {}
+        if not isinstance(history, dict):
+            return {}
+        results: dict[str, list[dict[str, float]]] = {}
+        for token_id, rows in history.items():
+            parsed_rows: list[dict[str, float]] = []
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                ts = _float(row.get("t"))
+                price = _float(row.get("p"))
+                if ts is not None and price is not None:
+                    parsed_rows.append({"t": ts, "p": price})
+            results[str(token_id)] = parsed_rows
+        return results
+
     def snapshots_from_markets(
         self,
         markets: Sequence[dict[str, Any]],
@@ -374,6 +429,17 @@ class PolymarketClobV2Client:
         for market in markets:
             token_ids.extend(str(token) for token in _json_array(market.get("clobTokenIds"))[:2])
         books = self.order_books(token_ids) if include_orderbooks else {}
+        history_by_token: dict[str, list[dict[str, float]]] = {}
+        unique_token_ids = list(dict.fromkeys(token_ids))
+        for idx in range(0, len(unique_token_ids), 20):
+            history_by_token.update(
+                self.batch_prices_history(
+                    unique_token_ids[idx : idx + 20],
+                    start=start,
+                    end=end,
+                    fidelity_minutes=fidelity_minutes,
+                )
+            )
         for market in markets:
             duration = str(market.get("_zeroalpha_duration") or "")
             outcomes = [str(value).lower() for value in _json_array(market.get("outcomes"))]
@@ -393,18 +459,22 @@ class PolymarketClobV2Client:
             market_end = min(end, window_end)
             if market_end <= market_start:
                 continue
-            up_history = self.prices_history(
-                up_token,
-                start=market_start,
-                end=market_end,
-                fidelity_minutes=fidelity_minutes,
-            )
-            down_history = self.prices_history(
-                down_token,
-                start=market_start,
-                end=market_end,
-                fidelity_minutes=fidelity_minutes,
-            )
+            up_history = history_by_token.get(up_token)
+            if up_history is None:
+                up_history = self.prices_history(
+                    up_token,
+                    start=market_start,
+                    end=market_end,
+                    fidelity_minutes=fidelity_minutes,
+                )
+            down_history = history_by_token.get(down_token)
+            if down_history is None:
+                down_history = self.prices_history(
+                    down_token,
+                    start=market_start,
+                    end=market_end,
+                    fidelity_minutes=fidelity_minutes,
+                )
             by_ts: dict[int, dict[str, float | None]] = {}
             for row in up_history:
                 by_ts.setdefault(int(row["t"]), {})["up_mid"] = row["p"]
@@ -558,11 +628,31 @@ class KalshiPublicDataClient:
         start: datetime,
         end: datetime,
         max_markets: int,
+        durations: Sequence[str] = BTC_PREDICTION_MARKET_DURATIONS,
     ) -> tuple[list[PredictionMarketSnapshot], dict[str, Any]]:
         snapshots: list[PredictionMarketSnapshot] = []
-        coverage: dict[str, Any] = {"series": {}, "max_markets": max_markets}
-        for series_ticker in KALSHI_BTC_SIGNAL_SERIES:
-            statuses = ("open", "closed", "settled") if series_ticker == "KXBTC15M" else ("open",)
+        requested_durations = tuple(dict.fromkeys(duration.strip().lower() for duration in durations))
+        requested_series = tuple(
+            dict.fromkeys(
+                series
+                for duration in requested_durations
+                for series in KALSHI_BTC_DURATION_SERIES.get(duration, ())
+            )
+        )
+        coverage: dict[str, Any] = {
+            "series": {},
+            "durations": list(requested_durations),
+            "unsupported_durations": [
+                duration for duration in requested_durations if duration not in KALSHI_BTC_DURATION_SERIES
+            ],
+            "max_markets": max_markets,
+        }
+        for series_ticker in requested_series:
+            statuses = (
+                ("open", "closed", "settled")
+                if series_ticker in {"KXBTC5M", "KXBTC15M"}
+                else ("open",)
+            )
             markets: list[dict[str, Any]] = []
             for status in statuses:
                 markets.extend(
@@ -578,20 +668,31 @@ class KalshiPublicDataClient:
             markets = markets[:max_markets]
             coverage["series"][series_ticker] = {"markets": len(markets), "statuses": list(statuses)}
             for market in markets:
-                if series_ticker == "KXBTC15M":
-                    snapshots.extend(self._snapshots_from_15m_market(series_ticker, market, start, end))
+                if series_ticker in {"KXBTC5M", "KXBTC15M"}:
+                    duration = "5m" if series_ticker == "KXBTC5M" else "15m"
+                    snapshots.extend(
+                        self._snapshots_from_directional_market(
+                            series_ticker,
+                            market,
+                            start,
+                            end,
+                            duration=duration,
+                        )
+                    )
                 else:
                     snapshot = self._snapshot_from_market_ladder(series_ticker, market)
                     if snapshot is not None:
                         snapshots.append(snapshot)
         return snapshots, coverage
 
-    def _snapshots_from_15m_market(
+    def _snapshots_from_directional_market(
         self,
         series_ticker: str,
         market: dict[str, Any],
         start: datetime,
         end: datetime,
+        *,
+        duration: str,
     ) -> list[PredictionMarketSnapshot]:
         ticker = str(market.get("ticker", ""))
         close_time = _parse_iso(market.get("close_time"))
@@ -619,7 +720,7 @@ class KalshiPublicDataClient:
             snapshots.append(
                 PredictionMarketSnapshot(
                     provider="kalshi",
-                    duration="15m",
+                    duration=duration,
                     timestamp_utc=parse_unix_timestamp(ts),
                     market_id=ticker,
                     market_slug=ticker,
@@ -640,13 +741,15 @@ class KalshiPublicDataClient:
                 )
             )
         if not snapshots:
-            snapshot = self._snapshot_from_15m_market_quote(market)
+            snapshot = self._snapshot_from_directional_market_quote(market, duration=duration)
             return [snapshot] if snapshot is not None else []
         return snapshots
 
-    def _snapshot_from_15m_market_quote(
+    def _snapshot_from_directional_market_quote(
         self,
         market: dict[str, Any],
+        *,
+        duration: str,
     ) -> PredictionMarketSnapshot | None:
         timestamp = _parse_iso(market.get("updated_time")) or ensure_utc(datetime.now(tz=UTC))
         close_time = _parse_iso(market.get("close_time"))
@@ -657,7 +760,7 @@ class KalshiPublicDataClient:
         up_mid = _midpoint(yes_bid, yes_ask, last)
         return PredictionMarketSnapshot(
             provider="kalshi",
-            duration="15m",
+            duration=duration,
             timestamp_utc=timestamp,
             market_id=str(market.get("ticker", "")),
             market_slug=str(market.get("ticker", "")),
@@ -813,6 +916,7 @@ def load_prediction_market_snapshots(
         start=start,
         end=end,
         max_markets=max_markets,
+        durations=durations,
     )
 
     snapshots = sorted(

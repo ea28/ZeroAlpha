@@ -284,6 +284,8 @@ def _load_prediction_market_signals(args: argparse.Namespace, start: datetime, e
 
 
 def _override_config_from_args(cfg, args: argparse.Namespace):
+    if getattr(args, "instrument_model", ""):
+        cfg = replace(cfg, contract=replace(cfg.contract, instrument_model=args.instrument_model))
     label_updates = {}
     if getattr(args, "max_holding_hours", 0):
         label_updates["max_holding_hours"] = args.max_holding_hours
@@ -1036,6 +1038,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--end", default="")
     ml_backtest.add_argument("--starting-equity", type=float, default=10_000.0)
     ml_backtest.add_argument("--notional", type=float, default=10_000.0)
+    ml_backtest.add_argument("--instrument-model", choices=["spot_crypto", "futures"], default="")
     ml_backtest.add_argument("--assumed-spread-bps", type=float, default=10.0)
     ml_backtest.add_argument("--minimum-data-coverage", type=float, default=0.95)
     ml_backtest.add_argument("--allow-data-gaps", action="store_true")
@@ -1140,6 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--start", default="")
     train_meta.add_argument("--end", default="")
     train_meta.add_argument("--notional", type=float, default=10_000.0)
+    train_meta.add_argument("--instrument-model", choices=["spot_crypto", "futures"], default="")
     train_meta.add_argument("--assumed-spread-bps", type=float, default=10.0)
     train_meta.add_argument("--minimum-data-coverage", type=float, default=0.95)
     train_meta.add_argument("--allow-data-gaps", action="store_true")
@@ -1244,6 +1248,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--end", default="")
     signal_audit.add_argument("--starting-equity", type=float, default=10_000.0)
     signal_audit.add_argument("--notional", type=float, default=10_000.0)
+    signal_audit.add_argument("--instrument-model", choices=["spot_crypto", "futures"], default="")
     signal_audit.add_argument("--assumed-spread-bps", type=float, default=4.0)
     signal_audit.add_argument("--minimum-data-coverage", type=float, default=0.95)
     signal_audit.add_argument("--allow-data-gaps", action="store_true")
@@ -1331,6 +1336,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_labels.add_argument("--end", default="")
     sweep_labels.add_argument("--starting-equity", type=float, default=10_000.0)
     sweep_labels.add_argument("--notional", type=float, default=10_000.0)
+    sweep_labels.add_argument("--instrument-model", choices=["spot_crypto", "futures"], default="")
     sweep_labels.add_argument("--assumed-spread-bps", type=float, default=10.0)
     sweep_labels.add_argument("--max-source-divergence-bps", type=float, default=500.0)
     sweep_labels.add_argument("--max-bar-return-bps", type=float, default=0.0)

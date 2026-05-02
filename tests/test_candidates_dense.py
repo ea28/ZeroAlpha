@@ -8,7 +8,7 @@ from zeroalpha.candidates.rules import (
     intraday_volatility_breakout_candidate,
     liquidity_sweep_reclaim_candidate,
 )
-from zeroalpha.domain import Bar
+from zeroalpha.domain import Bar, Side
 
 
 def _bar(idx: int) -> Bar:
@@ -42,6 +42,28 @@ def test_dense_research_candidates_can_emit_every_bar_after_warmup() -> None:
     assert events[0].timestamp_utc == bars[4].timestamp_utc
     assert all(isinstance(event.metadata.get("setup_family"), str) for event in events)
     assert all("dense_range_position_24" in event.metadata for event in events)
+
+
+def test_dense_research_can_emit_long_and_short_candidates() -> None:
+    bars = [_bar(idx) for idx in range(20)]
+    events = generate_candidate_events(
+        bars,
+        config=CandidateGenerationConfig(
+            mode="dense_research",
+            min_history_bars=5,
+            dense_stride_bars=1,
+            max_holding_hours=1,
+            side_mode="long_short",
+            allow_short_research=True,
+        ),
+    )
+
+    assert len(events) == 32
+    assert {event.side for event in events} == {Side.BUY, Side.SELL}
+    assert len({event.event_id for event in events}) == len(events)
+    short = next(event for event in events if event.side == Side.SELL)
+    assert short.metadata["dense_side"] == "SELL"
+    assert short.signal_strength == pytest.approx(-short.metadata["dense_raw_signal_strength"])
 
 
 def test_spot_short_research_requires_explicit_override() -> None:

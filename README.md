@@ -294,10 +294,27 @@ quota ranking instead of the strict probability/EV gate:
 --max-open-positions 4
 ```
 
+If you are studying long/short notional rather than IBKR spot BTC/USD, model it
+explicitly as futures research and use bracket/stop-capable order intents before
+considering any paper execution:
+
+```bash
+--instrument-model futures \
+--side-mode long_short \
+--risk-per-trade 0.005
+```
+
+Spot crypto stays long/flat by default. The futures override is a research
+assumption; live deployment still needs an instrument and broker route that can
+actually short and attach stop-loss orders.
+
 Polymarket discovery attempts every requested duration but currently active BTC
 short-form markets are mainly 5m, 15m, 1h, and 4h. Kalshi contributes the exact
 15-minute BTC up/down series and hourly BTC ladder signals when available. The
-model report records per-venue coverage and skipped durations.
+model report records per-venue coverage and skipped durations. Current Kalshi
+public market discovery did not expose a BTC 5-minute series in testing; 5-minute
+history should be collected continuously from Polymarket CLOB v2 rather than
+reconstructed after the fact.
 
 Enable Kronos proxy features:
 

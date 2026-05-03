@@ -710,3 +710,20 @@ def test_confidence_sizing_trusts_strong_candidate_type_calibration() -> None:
     )
 
     assert scale == 1.0
+
+
+def test_confidence_sizing_uses_intraday_label_geometry_for_ev_floor() -> None:
+    ts = datetime(2024, 1, 1, tzinfo=UTC)
+    sample = replace(_sample("a", ts), net_profit_target=0.001, net_stop_loss=0.001)
+    prediction = replace(_prediction("a", ts), probability=0.80, expected_value=0.0004)
+
+    scale = _confidence_notional_scale(
+        prediction,
+        AppConfig(
+            labels=LabelConfig(net_profit_target=0.001, net_stop_loss=0.001),
+            model=ModelConfig(minimum_probability=0.60, minimum_expected_value=0.0),
+        ),
+        sample=sample,
+    )
+
+    assert scale > 0.60

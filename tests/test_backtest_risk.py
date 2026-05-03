@@ -14,6 +14,18 @@ def test_backtest_notional_uses_risk_based_sizing() -> None:
     assert notional == 1_750
 
 
+def test_backtest_notional_can_skip_equity_cap_for_futures_research() -> None:
+    notional = _estimate_trade_notional(
+        equity=10_000,
+        risk_per_trade=0.006,
+        net_stop_loss=0.001,
+        requested_notional=12_000,
+        max_notional=12_000,
+        cap_by_equity=False,
+    )
+    assert notional == 12_000
+
+
 def test_backtest_period_pnl_resets_by_day_and_week() -> None:
     start = datetime(2026, 1, 1, tzinfo=UTC)
     realized = [

@@ -22,6 +22,8 @@ class QuoteRecord:
     con_id: int
     bid: float
     ask: float
+    bid_size: float | None
+    ask_size: float | None
     midpoint: float
     spread_bps: float
     quote_age_ms: float
@@ -37,6 +39,8 @@ def quote_to_record(quote: MarketQuote, contract: QualifiedCryptoContract) -> Qu
         con_id=contract.con_id,
         bid=quote.bid,
         ask=quote.ask,
+        bid_size=quote.bid_size,
+        ask_size=quote.ask_size,
         midpoint=quote.midpoint,
         spread_bps=quote.spread_bps,
         quote_age_ms=quote.quote_age_ms(),

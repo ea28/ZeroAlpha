@@ -1,6 +1,9 @@
 from pathlib import Path
+from dataclasses import replace
 
-from zeroalpha.config import load_config
+import pytest
+
+from zeroalpha.config import AppConfig, ConfigError, ContractConfig, RiskConfig, load_config
 from zeroalpha.domain import RuntimeMode
 
 
@@ -9,3 +12,19 @@ def test_load_example_config() -> None:
     assert cfg.runtime.mode == RuntimeMode.PAPER
     assert cfg.broker.port == 4002
     assert cfg.contract.symbol == "BTC"
+
+
+def test_futures_research_can_validate_multiple_open_positions() -> None:
+    cfg = AppConfig(
+        contract=ContractConfig(instrument_model="futures"),
+        risk=RiskConfig(max_open_positions=4),
+    )
+
+    cfg.validate()
+
+
+def test_spot_crypto_still_requires_single_open_position() -> None:
+    cfg = replace(AppConfig(), risk=RiskConfig(max_open_positions=2))
+
+    with pytest.raises(ConfigError, match="spot crypto mode"):
+        cfg.validate()

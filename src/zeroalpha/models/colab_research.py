@@ -68,6 +68,7 @@ class ResearchExperiment:
     kronos_embedding_dims: int = 0
     foundation_max_samples: int = 0
     hpo_profile: str = "standard"
+    hpo_trials: int = 0
     assumed_spread_bps: float = 4.0
     tier_rate: float = 0.0004
     base_slippage_bps: float = 1.0
@@ -221,6 +222,8 @@ def build_signal_audit_command(
         args.extend(["--foundation-max-samples", str(experiment.foundation_max_samples)])
     if experiment.hpo_profile != "standard":
         args.extend(["--hpo-profile", experiment.hpo_profile])
+    if experiment.hpo_trials:
+        args.extend(["--hpo-trials", str(experiment.hpo_trials)])
     return args
 
 

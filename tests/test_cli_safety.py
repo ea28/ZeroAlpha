@@ -6,13 +6,50 @@ import pytest
 
 from zeroalpha.cli import (
     _context_quality_or_raise,
+    _filter_samples_from_args,
     _quality_or_raise,
     _validate_paper_order_test_config,
     _validate_research_short_backtest_args,
 )
 from zeroalpha.config import AppConfig, BrokerConfig, RuntimeConfig
 from zeroalpha.data.quality import validate_bars
-from zeroalpha.domain import Bar, RuntimeMode
+from zeroalpha.domain import Bar, RuntimeMode, TripleBarrierLabel
+from zeroalpha.models.dataset import MetaLabelSample
+
+
+def _meta_sample(name: str) -> MetaLabelSample:
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    detail = TripleBarrierLabel(
+        event_id=name,
+        entry_timestamp_utc=timestamp + timedelta(minutes=15),
+        entry_price=100,
+        upper_barrier_price=101,
+        lower_barrier_price=99,
+        vertical_barrier_timestamp_utc=timestamp + timedelta(hours=2),
+        exit_timestamp_utc=timestamp + timedelta(hours=1),
+        exit_price=101,
+        outcome_type="upper",
+        gross_return=0.01,
+        net_return=0.005,
+        label=1,
+        t1=timestamp + timedelta(hours=1),
+    )
+    return MetaLabelSample(
+        event_id=name,
+        timestamp_utc=timestamp,
+        t1=detail.t1,
+        candidate_type="dense_research_bar",
+        side="BUY",
+        net_profit_target=0.005,
+        net_stop_loss=0.005,
+        features={"event_setup_family": name},
+        label=1,
+        net_return=0.005,
+        notional=1_000,
+        round_trip_cost_bps=10,
+        outcome_type="upper",
+        label_detail=detail,
+    )
 
 
 def test_paper_order_test_requires_explicit_confirmation() -> None:
@@ -52,6 +89,26 @@ def test_research_short_backtest_requires_research_gate() -> None:
     _validate_research_short_backtest_args(
         Namespace(allow_research_short_backtest=True, research_gate=True)
     )
+
+
+def test_sample_filter_can_include_and_exclude_setup_families() -> None:
+    samples = [_meta_sample("dense_baseline"), _meta_sample("dense_trend_continuation")]
+
+    included = _filter_samples_from_args(
+        samples,
+        Namespace(candidate_types="", setup_families="dense_baseline", exclude_setup_families=""),
+    )
+    excluded = _filter_samples_from_args(
+        samples,
+        Namespace(
+            candidate_types="",
+            setup_families="",
+            exclude_setup_families="dense_trend_continuation",
+        ),
+    )
+
+    assert [sample.event_id for sample in included] == ["dense_baseline"]
+    assert [sample.event_id for sample in excluded] == ["dense_baseline"]
 
 
 def test_allow_data_gaps_accepts_only_gap_issues() -> None:

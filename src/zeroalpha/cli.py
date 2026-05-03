@@ -20,6 +20,7 @@ from zeroalpha.data.external.binance import (
     fetch_klines_archive_range,
 )
 from zeroalpha.data.external.coinbase import CoinbaseExchangeClient
+from zeroalpha.data.external.ibkr_quotes import read_ibkr_quote_records
 from zeroalpha.data.external.prediction_markets import (
     BTC_PREDICTION_MARKET_DURATIONS,
     load_prediction_market_snapshots,
@@ -283,6 +284,32 @@ def _load_prediction_market_signals(args: argparse.Namespace, start: datetime, e
     }
 
 
+def _load_ibkr_quote_records(args: argparse.Namespace, start: datetime, end: datetime):
+    raw_path = getattr(args, "ibkr_quote_records", "") or ""
+    if not raw_path:
+        return [], {"enabled": False}
+    path = Path(raw_path)
+    quotes = read_ibkr_quote_records(path)
+    filtered = [
+        quote
+        for quote in quotes
+        if start <= quote.timestamp_utc <= end
+        and (not getattr(args, "symbol", "") or "BTC" in quote.symbol.upper())
+    ]
+    average_spread_bps = (
+        sum(quote.spread_bps for quote in filtered) / len(filtered) if filtered else 0.0
+    )
+    return filtered, {
+        "enabled": True,
+        "path": str(path),
+        "records": len(quotes),
+        "used_records": len(filtered),
+        "average_spread_bps": average_spread_bps,
+        "start": filtered[0].timestamp_utc.isoformat() if filtered else "",
+        "end": filtered[-1].timestamp_utc.isoformat() if filtered else "",
+    }
+
+
 def _override_config_from_args(cfg, args: argparse.Namespace):
     if getattr(args, "instrument_model", ""):
         cfg = replace(cfg, contract=replace(cfg.contract, instrument_model=args.instrument_model))
@@ -382,15 +409,50 @@ def _candidate_config_from_args(args: argparse.Namespace, cfg) -> CandidateGener
 
 def _filter_samples_from_args(samples, args: argparse.Namespace):
     raw = getattr(args, "candidate_types", "").strip()
-    if not raw:
-        return samples
-    allowed = {value.strip() for value in raw.split(",") if value.strip()}
-    filtered = [sample for sample in samples if sample.candidate_type in allowed]
-    if samples and not filtered:
-        available = ", ".join(sorted({sample.candidate_type for sample in samples}))
-        requested = ", ".join(sorted(allowed))
-        raise SystemExit(f"--candidate-types matched no samples. Requested: {requested}. Available: {available}")
+    filtered = samples
+    if raw:
+        allowed = {value.strip() for value in raw.split(",") if value.strip()}
+        filtered = [sample for sample in filtered if sample.candidate_type in allowed]
+        if samples and not filtered:
+            available = ", ".join(sorted({sample.candidate_type for sample in samples}))
+            requested = ", ".join(sorted(allowed))
+            raise SystemExit(
+                f"--candidate-types matched no samples. Requested: {requested}. Available: {available}"
+            )
+    setup_raw = getattr(args, "setup_families", "").strip()
+    exclude_setup_raw = getattr(args, "exclude_setup_families", "").strip()
+    if setup_raw:
+        allowed_setups = {value.strip() for value in setup_raw.split(",") if value.strip()}
+        filtered = [
+            sample
+            for sample in filtered
+            if _sample_setup_family(sample) in allowed_setups
+        ]
+        if samples and not filtered:
+            available = ", ".join(sorted({_sample_setup_family(sample) for sample in samples}))
+            requested = ", ".join(sorted(allowed_setups))
+            raise SystemExit(
+                f"--setup-families matched no samples. Requested: {requested}. Available: {available}"
+            )
+    if exclude_setup_raw:
+        excluded_setups = {value.strip() for value in exclude_setup_raw.split(",") if value.strip()}
+        filtered = [
+            sample
+            for sample in filtered
+            if _sample_setup_family(sample) not in excluded_setups
+        ]
+        if samples and not filtered:
+            requested = ", ".join(sorted(excluded_setups))
+            raise SystemExit(f"--exclude-setup-families removed every sample. Excluded: {requested}")
     return filtered
+
+
+def _sample_setup_family(sample) -> str:
+    for key in ("event_setup_family", "event_dense_setup_family", "setup_family", "dense_setup_family"):
+        value = sample.features.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "unknown"
 
 
 def _sample_span_days(samples) -> float:
@@ -442,6 +504,7 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
+    market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -451,12 +514,14 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
     )
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
+    data_coverage["ibkr_quotes"] = ibkr_quote_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        market_quotes=market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
@@ -476,6 +541,7 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
         hpo_profile=args.hpo_profile,
+        hpo_trials=args.hpo_trials,
         foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day,
@@ -490,6 +556,8 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         min_signal_spacing_hours=args.min_signal_spacing_hours,
         max_signals_per_group_per_day=args.max_signals_per_group_per_day,
         max_signals_per_timestamp=args.max_signals_per_timestamp,
+        selection_setup_families=tuple(_csv_values(args.selection_setup_families)),
+        selection_exclude_setup_families=tuple(_csv_values(args.selection_exclude_setup_families)),
     )
     summary, trades, rejections = run_ml_backtest(
         report=report,
@@ -516,6 +584,7 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
+    market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -525,12 +594,14 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
     )
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
+    data_coverage["ibkr_quotes"] = ibkr_quote_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        market_quotes=market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
@@ -550,6 +621,7 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
         hpo_profile=args.hpo_profile,
+        hpo_trials=args.hpo_trials,
         foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day,
@@ -563,6 +635,8 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         min_signal_spacing_hours=args.min_signal_spacing_hours,
         max_signals_per_group_per_day=args.max_signals_per_group_per_day,
         max_signals_per_timestamp=args.max_signals_per_timestamp,
+        selection_setup_families=tuple(_csv_values(args.selection_setup_families)),
+        selection_exclude_setup_families=tuple(_csv_values(args.selection_exclude_setup_families)),
     )
     if args.output:
         write_meta_label_report(Path(args.output), report)
@@ -612,7 +686,9 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
+    market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
     data_coverage["prediction_markets"] = prediction_market_coverage
+    data_coverage["ibkr_quotes"] = ibkr_quote_coverage
     candidate_config = _candidate_config_from_args(args, cfg)
     samples = build_meta_label_samples(
         primary_bars,
@@ -620,6 +696,7 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         assumed_spread_bps=args.assumed_spread_bps,
         research_notional=args.notional,
         context_bars=context_bars,
+        market_quotes=market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=candidate_config,
     )
@@ -639,6 +716,7 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         adaptive_minimum_threshold=args.adaptive_minimum_threshold,
         tune_hyperparameters=args.hpo,
         hpo_profile=args.hpo_profile,
+        hpo_trials=args.hpo_trials,
         foundation_max_samples=args.foundation_max_samples or 1024,
         data_coverage=data_coverage,
         target_trades_per_day=args.target_trades_per_day or None,
@@ -653,6 +731,8 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         min_signal_spacing_hours=args.min_signal_spacing_hours,
         max_signals_per_group_per_day=args.max_signals_per_group_per_day,
         max_signals_per_timestamp=args.max_signals_per_timestamp,
+        selection_setup_families=tuple(_csv_values(args.selection_setup_families)),
+        selection_exclude_setup_families=tuple(_csv_values(args.selection_exclude_setup_families)),
     )
     summary, trades, rejections = run_ml_backtest(
         report=report,
@@ -769,8 +849,10 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
     start, end = _date_range_from_args(args)
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
+    market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
+    data_coverage["ibkr_quotes"] = ibkr_quote_coverage
     model_names = [value.strip().lower() for value in args.models.split(",") if value.strip()]
     results = run_label_geometry_sweep(
         primary_bars,
@@ -779,6 +861,7 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
         research_notional=args.notional,
         starting_equity=args.starting_equity,
         context_bars=context_bars,
+        market_quotes=market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         net_profit_targets=_parse_float_list(args.net_profit_targets),
         net_stop_losses=_parse_float_list(args.net_stop_losses),
@@ -812,6 +895,9 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
         min_signal_spacing_hours=args.min_signal_spacing_hours,
         max_signals_per_group_per_day=args.max_signals_per_group_per_day,
         max_signals_per_timestamp=args.max_signals_per_timestamp,
+        tune_hyperparameters=args.hpo,
+        hpo_profile=args.hpo_profile,
+        hpo_trials=args.hpo_trials,
     )
     payload = {
         "data_coverage": data_coverage,
@@ -971,6 +1057,14 @@ def _add_prediction_market_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--refresh-prediction-market-cache", action="store_true")
 
 
+def _add_ibkr_quote_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ibkr-quote-records",
+        default="",
+        help="Path to broker record-quotes JSONL for IBKR bid/ask, spread, and top-of-book size features.",
+    )
+
+
 def _add_target_frequency_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--target-frequency-mode",
@@ -1048,6 +1142,8 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--cache-dir", default="data/raw/binance")
     ml_backtest.add_argument("--candidate-mode", choices=["rules", "aggressive", "dense", "active"], default="rules")
     ml_backtest.add_argument("--candidate-types", default="")
+    ml_backtest.add_argument("--setup-families", default="")
+    ml_backtest.add_argument("--exclude-setup-families", default="")
     ml_backtest.add_argument("--side-mode", choices=["long", "short", "long_short"], default="long")
     ml_backtest.add_argument(
         "--allow-spot-short-research",
@@ -1090,6 +1186,8 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--min-signal-spacing-hours", type=float, default=0.0)
     ml_backtest.add_argument("--max-signals-per-group-per-day", type=int, default=0)
     ml_backtest.add_argument("--max-signals-per-timestamp", type=int, default=0)
+    ml_backtest.add_argument("--selection-setup-families", default="")
+    ml_backtest.add_argument("--selection-exclude-setup-families", default="")
     ml_backtest.add_argument("--risk-per-trade", type=float, default=0.0)
     ml_backtest.add_argument("--daily-loss-stop", type=float, default=0.0)
     ml_backtest.add_argument("--weekly-loss-stop", type=float, default=0.0)
@@ -1118,7 +1216,8 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     ml_backtest.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="average")
     ml_backtest.add_argument("--hpo", action="store_true")
-    ml_backtest.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    ml_backtest.add_argument("--hpo-profile", choices=["standard", "deep", "wide", "quota"], default="standard")
+    ml_backtest.add_argument("--hpo-trials", type=int, default=0)
     ml_backtest.add_argument("--foundation-max-samples", type=int, default=0)
     ml_backtest.add_argument("--kronos-features", action="store_true")
     ml_backtest.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
@@ -1126,6 +1225,7 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--kronos-embedding-dims", type=int, default=0)
     ml_backtest.add_argument("--kronos-device", default="")
     _add_prediction_market_args(ml_backtest)
+    _add_ibkr_quote_args(ml_backtest)
     ml_backtest.add_argument("--output", default="artifacts/backtests/ml_btcusdt_1h.json")
     ml_backtest.set_defaults(func=_cmd_backtest_ml)
 
@@ -1152,6 +1252,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--cache-dir", default="data/raw/binance")
     train_meta.add_argument("--candidate-mode", choices=["rules", "aggressive", "dense", "active"], default="rules")
     train_meta.add_argument("--candidate-types", default="")
+    train_meta.add_argument("--setup-families", default="")
+    train_meta.add_argument("--exclude-setup-families", default="")
     train_meta.add_argument("--side-mode", choices=["long", "short", "long_short"], default="long")
     train_meta.add_argument(
         "--allow-spot-short-research",
@@ -1192,6 +1294,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--min-signal-spacing-hours", type=float, default=0.0)
     train_meta.add_argument("--max-signals-per-group-per-day", type=int, default=0)
     train_meta.add_argument("--max-signals-per-timestamp", type=int, default=0)
+    train_meta.add_argument("--selection-setup-families", default="")
+    train_meta.add_argument("--selection-exclude-setup-families", default="")
     train_meta.add_argument("--max-open-positions", type=int, default=0)
     train_meta.add_argument("--tier-rate", type=float, default=None)
     train_meta.add_argument("--base-slippage-bps", type=float, default=None)
@@ -1212,7 +1316,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     train_meta.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="average")
     train_meta.add_argument("--hpo", action="store_true")
-    train_meta.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    train_meta.add_argument("--hpo-profile", choices=["standard", "deep", "wide", "quota"], default="standard")
+    train_meta.add_argument("--hpo-trials", type=int, default=0)
     train_meta.add_argument("--foundation-max-samples", type=int, default=0)
     train_meta.add_argument("--kronos-features", action="store_true")
     train_meta.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
@@ -1220,6 +1325,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--kronos-embedding-dims", type=int, default=0)
     train_meta.add_argument("--kronos-device", default="")
     _add_prediction_market_args(train_meta)
+    _add_ibkr_quote_args(train_meta)
     train_meta.add_argument(
         "--output",
         default="artifacts/models/meta_label_walk_forward_btcusdt_1h.json",
@@ -1258,6 +1364,8 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--cache-dir", default="data/raw/binance")
     signal_audit.add_argument("--candidate-mode", choices=["rules", "aggressive", "dense", "active"], default="active")
     signal_audit.add_argument("--candidate-types", default="")
+    signal_audit.add_argument("--setup-families", default="")
+    signal_audit.add_argument("--exclude-setup-families", default="")
     signal_audit.add_argument("--side-mode", choices=["long", "short", "long_short"], default="long")
     signal_audit.add_argument("--allow-spot-short-research", action="store_true")
     signal_audit.add_argument("--dense-stride-bars", type=int, default=1)
@@ -1308,7 +1416,8 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
     signal_audit.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="weighted")
     signal_audit.add_argument("--hpo", action="store_true")
-    signal_audit.add_argument("--hpo-profile", choices=["standard", "deep"], default="standard")
+    signal_audit.add_argument("--hpo-profile", choices=["standard", "deep", "wide", "quota"], default="standard")
+    signal_audit.add_argument("--hpo-trials", type=int, default=0)
     signal_audit.add_argument("--foundation-max-samples", type=int, default=0)
     signal_audit.add_argument("--selection-score", choices=["probability", "expected_value", "predicted_return", "expected_utility"], default="expected_utility")
     signal_audit.add_argument("--specialist-models", action="store_true")
@@ -1316,12 +1425,15 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--min-signal-spacing-hours", type=float, default=0.0)
     signal_audit.add_argument("--max-signals-per-group-per-day", type=int, default=0)
     signal_audit.add_argument("--max-signals-per-timestamp", type=int, default=1)
+    signal_audit.add_argument("--selection-setup-families", default="")
+    signal_audit.add_argument("--selection-exclude-setup-families", default="")
     signal_audit.add_argument("--kronos-features", action="store_true")
     signal_audit.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
     signal_audit.add_argument("--kronos-lookback-bars", type=int, default=0)
     signal_audit.add_argument("--kronos-embedding-dims", type=int, default=0)
     signal_audit.add_argument("--kronos-device", default="")
     _add_prediction_market_args(signal_audit)
+    _add_ibkr_quote_args(signal_audit)
     signal_audit.add_argument("--output", default="artifacts/models/signal_audit_btcusdt_15m.json")
     signal_audit.set_defaults(func=_cmd_model_signal_audit)
     sweep_labels = model_sub.add_parser("sweep-labels")
@@ -1372,12 +1484,16 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_labels.add_argument("--adaptive-threshold", action="store_true", default=True)
     sweep_labels.add_argument("--fixed-threshold", dest="adaptive_threshold", action="store_false")
     sweep_labels.add_argument("--adaptive-minimum-threshold", type=float, default=0.0)
+    sweep_labels.add_argument("--hpo", action="store_true")
+    sweep_labels.add_argument("--hpo-profile", choices=["standard", "deep", "wide", "quota"], default="standard")
+    sweep_labels.add_argument("--hpo-trials", type=int, default=0)
     sweep_labels.add_argument("--kronos-features", action="store_true")
     sweep_labels.add_argument("--kronos-mode", choices=["proxy", "auto", "official"], default="")
     sweep_labels.add_argument("--kronos-lookback-bars", type=int, default=0)
     sweep_labels.add_argument("--kronos-embedding-dims", type=int, default=0)
     sweep_labels.add_argument("--kronos-device", default="")
     _add_prediction_market_args(sweep_labels)
+    _add_ibkr_quote_args(sweep_labels)
     sweep_labels.add_argument("--top", type=int, default=5)
     sweep_labels.add_argument("--output", default="artifacts/models/label_geometry_sweep.json")
     sweep_labels.set_defaults(func=_cmd_model_sweep_labels)

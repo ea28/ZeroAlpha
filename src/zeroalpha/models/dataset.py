@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from bisect import bisect_right
-from math import sqrt
+from math import log1p, sqrt
 from statistics import median, pstdev
 from typing import Mapping, Sequence
 
@@ -17,7 +17,7 @@ from zeroalpha.data.external.prediction_markets import (
     PredictionMarketSnapshot,
     prediction_market_duration_seconds,
 )
-from zeroalpha.domain import Bar, CandidateEvent, TripleBarrierLabel
+from zeroalpha.domain import Bar, CandidateEvent, MarketQuote, TripleBarrierLabel
 from zeroalpha.features.basic import build_event_features
 from zeroalpha.features.kronos import build_kronos_features
 from zeroalpha.features.regime import classify_market_regime
@@ -65,6 +65,105 @@ class _PreparedContext:
     timestamps: tuple[datetime, ...]
     closes: tuple[float, ...]
     volumes: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMarketQuotes:
+    timestamps: tuple[datetime, ...]
+    bids: tuple[float, ...]
+    asks: tuple[float, ...]
+    mids: tuple[float, ...]
+    spread_bps: tuple[float, ...]
+    bid_sizes: tuple[float | None, ...]
+    ask_sizes: tuple[float | None, ...]
+
+
+def _prepare_market_quotes(quotes: Sequence[MarketQuote] | None) -> _PreparedMarketQuotes | None:
+    if not quotes:
+        return None
+    ordered = sorted(quotes, key=lambda quote: quote.timestamp_utc)
+    return _PreparedMarketQuotes(
+        timestamps=tuple(quote.timestamp_utc for quote in ordered),
+        bids=tuple(quote.bid for quote in ordered),
+        asks=tuple(quote.ask for quote in ordered),
+        mids=tuple(quote.midpoint for quote in ordered),
+        spread_bps=tuple(quote.spread_bps for quote in ordered),
+        bid_sizes=tuple(quote.bid_size for quote in ordered),
+        ask_sizes=tuple(quote.ask_size for quote in ordered),
+    )
+
+
+def _quote_index_at_or_before(quotes: _PreparedMarketQuotes, timestamp: datetime) -> int:
+    return bisect_right(quotes.timestamps, ensure_utc(timestamp)) - 1
+
+
+def _quote_index_before_lookback(
+    quotes: _PreparedMarketQuotes,
+    timestamp: datetime,
+    lookback: timedelta,
+) -> int:
+    return bisect_right(quotes.timestamps, ensure_utc(timestamp) - lookback) - 1
+
+
+def _add_market_quote_features(
+    features: dict[str, float | str],
+    *,
+    event: CandidateEvent,
+    market_quotes: _PreparedMarketQuotes | None,
+) -> None:
+    if market_quotes is None:
+        return
+    idx = _quote_index_at_or_before(market_quotes, event.timestamp_utc)
+    features["ibkr_quote_available"] = 1.0 if idx >= 0 else 0.0
+    if idx < 0:
+        return
+
+    quote_time = market_quotes.timestamps[idx]
+    age_seconds = max(0.0, (ensure_utc(event.timestamp_utc) - quote_time).total_seconds())
+    bid = market_quotes.bids[idx]
+    ask = market_quotes.asks[idx]
+    mid = market_quotes.mids[idx]
+    spread = market_quotes.spread_bps[idx]
+    bar_close = float(features.get("bar_close", 0.0) or 0.0)
+    features["ibkr_quote_age_seconds"] = age_seconds
+    features["ibkr_quote_stale_5s"] = 1.0 if age_seconds > 5 else 0.0
+    features["ibkr_quote_stale_30s"] = 1.0 if age_seconds > 30 else 0.0
+    features["ibkr_spread_bps"] = spread
+    features["ibkr_log_spread_bps"] = log1p(max(0.0, spread))
+    if bar_close > 0:
+        features["ibkr_mid_to_bar_close_bps"] = 10_000 * (mid / bar_close - 1)
+        features["ibkr_bid_to_bar_close_bps"] = 10_000 * (bid / bar_close - 1)
+        features["ibkr_ask_to_bar_close_bps"] = 10_000 * (ask / bar_close - 1)
+
+    bid_size = market_quotes.bid_sizes[idx]
+    ask_size = market_quotes.ask_sizes[idx]
+    if bid_size is not None or ask_size is not None:
+        bid_size_value = float(bid_size or 0.0)
+        ask_size_value = float(ask_size or 0.0)
+        total_size = bid_size_value + ask_size_value
+        features["ibkr_quote_size_available"] = 1.0
+        features["ibkr_bid_size_log"] = log1p(bid_size_value)
+        features["ibkr_ask_size_log"] = log1p(ask_size_value)
+        features["ibkr_top_of_book_size_log"] = log1p(total_size)
+        features["ibkr_top_of_book_imbalance"] = (
+            (bid_size_value - ask_size_value) / total_size if total_size > 0 else 0.0
+        )
+    else:
+        features["ibkr_quote_size_available"] = 0.0
+
+    for label, lookback in {
+        "1m": timedelta(minutes=1),
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+    }.items():
+        previous_idx = _quote_index_before_lookback(market_quotes, event.timestamp_utc, lookback)
+        if previous_idx < 0 or previous_idx >= idx:
+            continue
+        previous_mid = market_quotes.mids[previous_idx]
+        if previous_mid > 0:
+            features[f"ibkr_mid_return_{label}"] = mid / previous_mid - 1
+        features[f"ibkr_spread_change_bps_{label}"] = spread - market_quotes.spread_bps[previous_idx]
 
 
 def _prepare_context_bars(context_bars: Mapping[str, list[Bar]] | None) -> dict[str, _PreparedContext]:
@@ -537,6 +636,7 @@ def build_meta_label_samples(
     assumed_spread_bps: float,
     research_notional: float | None = None,
     context_bars: Mapping[str, list[Bar]] | None = None,
+    market_quotes: Sequence[MarketQuote] | None = None,
     prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None = None,
     candidate_config: CandidateGenerationConfig | None = None,
 ) -> list[MetaLabelSample]:
@@ -557,6 +657,7 @@ def build_meta_label_samples(
 
     events = generate_candidate_events(ordered, config=candidate_config)
     prepared_context = _prepare_context_bars(context_bars)
+    prepared_market_quotes = _prepare_market_quotes(market_quotes)
     prepared_prediction_markets = (
         PreparedPredictionMarketSnapshots.from_snapshots(prediction_market_snapshots)
         if prediction_market_snapshots
@@ -599,6 +700,7 @@ def build_meta_label_samples(
         features.update(classify_market_regime(history).as_features())
         _add_event_metadata(features, event)
         _add_cross_asset_features(features, event=event, context_bars=prepared_context)
+        _add_market_quote_features(features, event=event, market_quotes=prepared_market_quotes)
         _add_prediction_market_features(
             features,
             event=event,

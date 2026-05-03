@@ -308,6 +308,7 @@ def _confidence_notional_scale(
     prediction: FoldPrediction,
     config: AppConfig,
     *,
+    sample: MetaLabelSample | None = None,
     type_threshold: dict[str, object] | None = None,
 ) -> float:
     type_scale = _candidate_type_notional_scale(type_threshold)
@@ -318,7 +319,10 @@ def _confidence_notional_scale(
     probability_threshold = max(config.model.minimum_probability, 1e-9)
     probability_room = max(1.0 - probability_threshold, 1e-9)
     probability_scale = max(0.0, (prediction.probability - probability_threshold) / probability_room)
-    ev_floor = max(config.model.minimum_expected_value, 0.01)
+    label_target = sample.net_profit_target if sample is not None else config.labels.net_profit_target
+    label_stop = sample.net_stop_loss if sample is not None else config.labels.net_stop_loss
+    geometry_floor = max(min(label_target, label_stop) * 0.25, 1e-6)
+    ev_floor = max(config.model.minimum_expected_value, geometry_floor)
     ev_scale = max(0.0, prediction.expected_value / ev_floor)
     confidence = min(1.0, probability_scale, ev_scale)
     return max(0.25, min(1.0, 0.25 + 0.75 * confidence))
@@ -595,11 +599,13 @@ def run_ml_backtest(
             net_stop_loss=sample.net_stop_loss,
             requested_notional=requested_notional,
             max_notional=config.risk.paper_max_notional,
+            cap_by_equity=config.contract.instrument_model != "futures",
         )
         if confidence_scaled_sizing:
             scaled_notional = trade_notional * _confidence_notional_scale(
                 prediction,
                 config,
+                sample=sample,
                 type_threshold=type_threshold_by_fold.get((prediction.fold_id, prediction.candidate_type)),
             )
             if trade_notional >= config.risk.minimum_fee_efficient_notional:

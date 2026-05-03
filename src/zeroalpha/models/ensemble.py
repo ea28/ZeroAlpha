@@ -536,10 +536,8 @@ def _return_regressor() -> Any:
 
 
 def _sample_group(sample: MetaLabelSample) -> str:
-    family = sample.features.get("event_setup_family")
-    if isinstance(family, str) and family:
-        group = family
-    else:
+    group = _sample_setup_family(sample)
+    if group == "unknown":
         candidate_type = sample.candidate_type
         if "breakout" in candidate_type or "breakdown" in candidate_type:
             group = "breakout"
@@ -552,6 +550,14 @@ def _sample_group(sample: MetaLabelSample) -> str:
         else:
             group = "global"
     return f"short_{group}" if sample.side == "SELL" else group
+
+
+def _sample_setup_family(sample: MetaLabelSample) -> str:
+    for key in ("event_setup_family", "event_dense_setup_family", "setup_family", "dense_setup_family"):
+        family = sample.features.get(key)
+        if isinstance(family, str) and family:
+            return family
+    return "unknown"
 
 
 def _sample_regime(sample: MetaLabelSample) -> str:
@@ -678,6 +684,70 @@ def _selection_score(
     raise ValueError("selection_score must be probability, expected_value, predicted_return, or expected_utility")
 
 
+def _quota_frequency_returns(
+    *,
+    samples: list[MetaLabelSample],
+    scores: Any,
+    target_trades_per_day: float,
+    min_signal_spacing_hours: float = 0.0,
+    max_signals_per_group_per_day: int = 0,
+    max_signals_per_timestamp: int = 0,
+) -> list[float]:
+    if target_trades_per_day <= 0:
+        return []
+
+    grouped: dict[object, list[tuple[MetaLabelSample, float, str]]] = {}
+    for sample, score in zip(samples, scores, strict=True):
+        grouped.setdefault(sample.timestamp_utc.date(), []).append(
+            (sample, float(score), _threshold_group_key(sample))
+        )
+
+    selected_returns: list[float] = []
+    spacing = timedelta(hours=max(min_signal_spacing_hours, 0.0))
+    whole_day_quota = math.floor(target_trades_per_day)
+    fractional_quota = target_trades_per_day - whole_day_quota
+    fractional_accumulator = 0.0
+    for day in sorted(grouped):
+        quota = whole_day_quota
+        fractional_accumulator += fractional_quota
+        if fractional_accumulator >= 1.0:
+            quota += 1
+            fractional_accumulator -= 1.0
+        if quota <= 0:
+            continue
+        selected_for_day = 0
+        selected_times_by_group: dict[str, list[Any]] = {}
+        selected_counts_by_group: dict[str, int] = {}
+        selected_counts_by_timestamp: dict[Any, int] = {}
+        ranked = sorted(grouped[day], key=lambda row: row[1], reverse=True)
+        for sample, _, group_key in ranked:
+            if selected_for_day >= quota:
+                break
+            if (
+                max_signals_per_timestamp > 0
+                and selected_counts_by_timestamp.get(sample.timestamp_utc, 0)
+                >= max_signals_per_timestamp
+            ):
+                continue
+            if (
+                max_signals_per_group_per_day > 0
+                and selected_counts_by_group.get(group_key, 0) >= max_signals_per_group_per_day
+            ):
+                continue
+            if spacing > timedelta(0):
+                group_times = selected_times_by_group.get(group_key, [])
+                if any(abs(sample.timestamp_utc - timestamp) < spacing for timestamp in group_times):
+                    continue
+            selected_returns.append(sample.net_return)
+            selected_for_day += 1
+            selected_times_by_group.setdefault(group_key, []).append(sample.timestamp_utc)
+            selected_counts_by_group[group_key] = selected_counts_by_group.get(group_key, 0) + 1
+            selected_counts_by_timestamp[sample.timestamp_utc] = (
+                selected_counts_by_timestamp.get(sample.timestamp_utc, 0) + 1
+            )
+    return selected_returns
+
+
 def _class_balance_params(name: str, labels: Any) -> dict[str, Any]:
     if name not in {"lightgbm", "catboost", "xgboost", "randomforest", "extratrees"}:
         return {}
@@ -711,12 +781,21 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
             {"learning_rate": 0.03, "n_estimators": 150, "num_leaves": 7, "colsample_bytree": 0.70},
             {"learning_rate": 0.06, "n_estimators": 90, "num_leaves": 15, "reg_lambda": 8.0},
         ]
-        if profile == "deep":
+        if profile in {"deep", "wide", "quota"}:
             grid.extend(
                 [
-                    {"learning_rate": 0.015, "n_estimators": 360, "num_leaves": 31, "min_child_samples": 50, "reg_lambda": 10.0},
-                    {"learning_rate": 0.025, "n_estimators": 260, "num_leaves": 63, "feature_fraction": 0.75, "bagging_fraction": 0.75},
+                    {"learning_rate": 0.015, "n_estimators": 360, "num_leaves": 31, "min_child_samples": 50, "subsample": 0.80, "subsample_freq": 5, "colsample_bytree": 0.80, "reg_lambda": 10.0},
+                    {"learning_rate": 0.025, "n_estimators": 260, "num_leaves": 63, "min_child_samples": 60, "subsample": 0.75, "subsample_freq": 5, "colsample_bytree": 0.75},
                     {"learning_rate": 0.04, "n_estimators": 220, "num_leaves": 127, "min_child_samples": 80, "reg_alpha": 0.25},
+                ]
+            )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"learning_rate": 0.012, "n_estimators": 520, "num_leaves": 15, "max_depth": 5, "min_child_samples": 80, "subsample": 0.70, "subsample_freq": 5, "colsample_bytree": 0.70, "reg_alpha": 0.15, "reg_lambda": 15.0},
+                    {"learning_rate": 0.018, "n_estimators": 420, "num_leaves": 31, "max_depth": 6, "min_child_samples": 120, "subsample": 0.65, "subsample_freq": 5, "colsample_bytree": 0.85, "reg_alpha": 0.40, "reg_lambda": 20.0},
+                    {"learning_rate": 0.035, "n_estimators": 260, "num_leaves": 7, "max_depth": 3, "min_child_samples": 40, "subsample": 0.90, "subsample_freq": 3, "colsample_bytree": 0.60, "reg_alpha": 0.05, "reg_lambda": 6.0},
+                    {"learning_rate": 0.008, "n_estimators": 700, "num_leaves": 63, "max_depth": 6, "min_child_samples": 160, "subsample": 0.80, "subsample_freq": 5, "colsample_bytree": 0.65, "reg_alpha": 0.75, "reg_lambda": 30.0},
                 ]
             )
         return grid
@@ -731,12 +810,21 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
             {"iterations": 160, "learning_rate": 0.03, "depth": 5, "l2_leaf_reg": 12.0},
             {"iterations": 90, "learning_rate": 0.04, "depth": 6, "l2_leaf_reg": 15.0},
         ]
-        if profile == "deep":
+        if profile in {"deep", "wide", "quota"}:
             grid.extend(
                 [
-                    {"iterations": 320, "learning_rate": 0.018, "depth": 4, "l2_leaf_reg": 16.0, "random_strength": 0.5},
-                    {"iterations": 240, "learning_rate": 0.03, "depth": 7, "l2_leaf_reg": 10.0, "random_strength": 1.0},
-                    {"iterations": 180, "learning_rate": 0.045, "depth": 5, "l2_leaf_reg": 20.0, "random_strength": 2.0},
+                    {"iterations": 320, "learning_rate": 0.018, "depth": 4, "l2_leaf_reg": 16.0, "random_strength": 0.5, "bootstrap_type": "Bayesian", "bagging_temperature": 0.5},
+                    {"iterations": 240, "learning_rate": 0.03, "depth": 7, "l2_leaf_reg": 10.0, "random_strength": 1.0, "bootstrap_type": "Bayesian", "bagging_temperature": 1.0},
+                    {"iterations": 180, "learning_rate": 0.045, "depth": 5, "l2_leaf_reg": 20.0, "random_strength": 2.0, "bootstrap_type": "Bayesian", "bagging_temperature": 0.25},
+                ]
+            )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"iterations": 420, "learning_rate": 0.012, "depth": 3, "l2_leaf_reg": 24.0, "random_strength": 1.5, "bootstrap_type": "Bayesian", "bagging_temperature": 0.75},
+                    {"iterations": 360, "learning_rate": 0.018, "depth": 6, "l2_leaf_reg": 30.0, "random_strength": 3.0, "bootstrap_type": "Bayesian", "bagging_temperature": 1.5},
+                    {"iterations": 260, "learning_rate": 0.026, "depth": 4, "l2_leaf_reg": 18.0, "random_strength": 0.25, "bootstrap_type": "Bernoulli", "subsample": 0.70},
+                    {"iterations": 180, "learning_rate": 0.05, "depth": 3, "l2_leaf_reg": 10.0, "random_strength": 2.5, "bootstrap_type": "Bernoulli", "subsample": 0.85},
                 ]
             )
         return grid
@@ -751,7 +839,7 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
             {"learning_rate": 0.03, "n_estimators": 140, "max_depth": 2, "colsample_bytree": 0.70},
             {"learning_rate": 0.06, "n_estimators": 90, "max_depth": 3, "reg_lambda": 8.0},
         ]
-        if profile == "deep":
+        if profile in {"deep", "wide", "quota"}:
             grid.extend(
                 [
                     {"learning_rate": 0.015, "n_estimators": 360, "max_depth": 4, "min_child_weight": 12, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 10.0},
@@ -759,9 +847,18 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
                     {"learning_rate": 0.05, "n_estimators": 180, "max_depth": 3, "min_child_weight": 16, "subsample": 0.9, "colsample_bytree": 0.9, "reg_lambda": 15.0},
                 ]
             )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"learning_rate": 0.01, "n_estimators": 520, "max_depth": 2, "min_child_weight": 20, "subsample": 0.75, "colsample_bytree": 0.75, "reg_alpha": 0.25, "reg_lambda": 18.0, "gamma": 0.05, "tree_method": "hist"},
+                    {"learning_rate": 0.018, "n_estimators": 420, "max_depth": 4, "min_child_weight": 16, "subsample": 0.65, "colsample_bytree": 0.70, "reg_alpha": 0.75, "reg_lambda": 25.0, "gamma": 0.10, "tree_method": "hist"},
+                    {"learning_rate": 0.035, "n_estimators": 240, "max_depth": 3, "min_child_weight": 10, "subsample": 0.90, "colsample_bytree": 0.55, "reg_alpha": 0.10, "reg_lambda": 8.0, "gamma": 0.0, "tree_method": "hist"},
+                    {"learning_rate": 0.008, "n_estimators": 700, "max_depth": 5, "min_child_weight": 24, "subsample": 0.80, "colsample_bytree": 0.60, "reg_alpha": 1.0, "reg_lambda": 35.0, "gamma": 0.20, "tree_method": "hist"},
+                ]
+            )
         return grid
     if name == "histgb":
-        return [
+        grid = [
             {},
             {"learning_rate": 0.02, "max_iter": 260, "max_leaf_nodes": 15, "l2_regularization": 0.25},
             {"learning_rate": 0.04, "max_iter": 180, "max_leaf_nodes": 7, "l2_regularization": 0.40},
@@ -769,23 +866,88 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
             {"learning_rate": 0.03, "max_iter": 220, "max_leaf_nodes": 31, "l2_regularization": 0.25},
             {"learning_rate": 0.05, "max_iter": 150, "max_leaf_nodes": 11, "min_samples_leaf": 25},
         ]
+        if profile in {"deep", "wide", "quota"}:
+            grid.extend(
+                [
+                    {"learning_rate": 0.018, "max_iter": 360, "max_leaf_nodes": 15, "max_depth": 5, "min_samples_leaf": 35, "l2_regularization": 0.50},
+                    {"learning_rate": 0.025, "max_iter": 300, "max_leaf_nodes": 31, "max_depth": 6, "min_samples_leaf": 45, "l2_regularization": 0.75},
+                    {"learning_rate": 0.045, "max_iter": 180, "max_leaf_nodes": 7, "max_depth": 3, "min_samples_leaf": 20, "l2_regularization": 0.20},
+                ]
+            )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"learning_rate": 0.012, "max_iter": 520, "max_leaf_nodes": 15, "max_depth": 4, "min_samples_leaf": 60, "l2_regularization": 1.0, "max_features": 0.75},
+                    {"learning_rate": 0.03, "max_iter": 260, "max_leaf_nodes": 63, "max_depth": 7, "min_samples_leaf": 80, "l2_regularization": 1.5, "max_features": 0.60},
+                    {"learning_rate": 0.06, "max_iter": 150, "max_leaf_nodes": 5, "max_depth": 2, "min_samples_leaf": 15, "l2_regularization": 0.35, "max_features": 0.90},
+                ]
+            )
+        return grid
     if name == "randomforest":
-        return [
+        grid = [
             {},
             {"n_estimators": 300, "max_depth": 4, "min_samples_leaf": 20, "max_features": "sqrt"},
             {"n_estimators": 500, "max_depth": 6, "min_samples_leaf": 12, "max_features": "sqrt"},
             {"n_estimators": 500, "max_depth": 9, "min_samples_leaf": 8, "max_features": 0.35},
             {"n_estimators": 700, "max_depth": None, "min_samples_leaf": 20, "max_features": 0.25},
         ]
+        if profile in {"deep", "wide", "quota"}:
+            grid.extend(
+                [
+                    {"n_estimators": 600, "max_depth": 5, "min_samples_leaf": 24, "max_features": 0.45, "max_samples": 0.85, "bootstrap": True},
+                    {"n_estimators": 900, "max_depth": 8, "min_samples_leaf": 16, "max_features": 0.30, "max_samples": 0.70, "bootstrap": True},
+                ]
+            )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"n_estimators": 800, "max_depth": 3, "min_samples_leaf": 35, "max_features": 0.60, "max_samples": 0.90, "bootstrap": True},
+                    {"n_estimators": 1000, "max_depth": 10, "min_samples_leaf": 10, "max_features": 0.20, "max_samples": 0.65, "bootstrap": True},
+                ]
+            )
+        return grid
     if name == "extratrees":
-        return [
+        grid = [
             {},
             {"n_estimators": 400, "max_depth": 5, "min_samples_leaf": 16, "max_features": "sqrt"},
             {"n_estimators": 600, "max_depth": 8, "min_samples_leaf": 10, "max_features": 0.35},
             {"n_estimators": 700, "max_depth": None, "min_samples_leaf": 24, "max_features": 0.25},
             {"n_estimators": 500, "max_depth": 10, "min_samples_leaf": 6, "max_features": "log2"},
         ]
+        if profile in {"deep", "wide", "quota"}:
+            grid.extend(
+                [
+                    {"n_estimators": 700, "max_depth": 4, "min_samples_leaf": 25, "max_features": 0.50, "bootstrap": True, "max_samples": 0.85},
+                    {"n_estimators": 900, "max_depth": 7, "min_samples_leaf": 14, "max_features": 0.30, "bootstrap": True, "max_samples": 0.70},
+                ]
+            )
+        if profile in {"wide", "quota"}:
+            grid.extend(
+                [
+                    {"n_estimators": 900, "max_depth": 3, "min_samples_leaf": 35, "max_features": 0.70},
+                    {"n_estimators": 1000, "max_depth": 12, "min_samples_leaf": 12, "max_features": 0.20, "bootstrap": True, "max_samples": 0.60},
+                ]
+            )
+        return grid
     return [{}]
+
+
+def _limit_hpo_grid(grid: list[dict[str, Any]], hpo_trials: int) -> list[dict[str, Any]]:
+    if hpo_trials <= 0 or hpo_trials >= len(grid):
+        return grid
+    target = max(1, hpo_trials)
+    if target == 1:
+        return [grid[0]]
+    last_index = len(grid) - 1
+    indices = {
+        round(slot * last_index / (target - 1))
+        for slot in range(target)
+    }
+    for index in range(len(grid)):
+        if len(indices) >= target:
+            break
+        indices.add(index)
+    return [grid[index] for index in sorted(indices)]
 
 
 def _select_hyperparameters(
@@ -795,6 +957,12 @@ def _select_hyperparameters(
     y_train: Any,
     training_samples: list[MetaLabelSample],
     hpo_profile: str = "standard",
+    hpo_trials: int = 0,
+    target_trades_per_day: float | None = None,
+    target_frequency_mode: str = "strict",
+    min_signal_spacing_hours: float = 0.0,
+    max_signals_per_group_per_day: int = 0,
+    max_signals_per_timestamp: int = 0,
 ) -> dict[str, Any]:
     if name not in {"lightgbm", "catboost", "xgboost", "histgb", "randomforest", "extratrees"}:
         return {}
@@ -816,33 +984,63 @@ def _select_hyperparameters(
         return {}
 
     best_params: dict[str, Any] = {}
-    best_score: tuple[float, float, float] | None = None
-    for params in _hpo_grid(name, profile=hpo_profile):
+    best_score: tuple[float, float, float, float] | None = None
+    for params in _limit_hpo_grid(_hpo_grid(name, profile=hpo_profile), hpo_trials):
         balanced_params = {**_class_balance_params(name, inner_y_train), **params}
-        estimator = _build_model(name, balanced_params)
-        _fit_estimator(estimator, inner_x_train, inner_y_train, sample_weight=inner_weights)
-        raw = _predict_probability(estimator, inner_x_validation)
+        try:
+            estimator = _build_model(name, balanced_params)
+            _fit_estimator(estimator, inner_x_train, inner_y_train, sample_weight=inner_weights)
+            raw = _predict_probability(estimator, inner_x_validation)
+        except Exception:
+            continue
         brier = float(brier_score_loss(inner_y_validation, raw, sample_weight=validation_weights))
-        sweep = _threshold_sweep(
-            test_samples=validation_samples,
-            probabilities=raw,
-            thresholds=tuple(round(idx * 0.05, 2) for idx in range(2, 17)),
-        )
         min_validation_trades = max(3, min(12, int(len(validation_samples) * 0.05)))
-        viable = [row for row in sweep if row.traded_signals >= min_validation_trades]
-        best_row = max(
-            viable,
-            key=lambda row: (
-                row.average_trade_return,
-                row.net_pnl / max(row.traded_signals**0.5, 1.0),
-                row.hit_rate,
-            ),
-            default=None,
+        quota_returns = (
+            _quota_frequency_returns(
+                samples=validation_samples,
+                scores=raw,
+                target_trades_per_day=float(target_trades_per_day or 0.0),
+                min_signal_spacing_hours=min_signal_spacing_hours,
+                max_signals_per_group_per_day=max_signals_per_group_per_day,
+                max_signals_per_timestamp=max_signals_per_timestamp,
+            )
+            if hpo_profile == "quota" and target_frequency_mode == "quota" and target_trades_per_day
+            else []
         )
-        if best_row is None:
-            score = (0.0, 0.0, -brier)
+        if len(quota_returns) >= min_validation_trades:
+            quota_pnl = sum(quota_returns)
+            quota_hit_rate = sum(1 for value in quota_returns if value > 0) / len(quota_returns)
+            score = (
+                sum(quota_returns) / len(quota_returns),
+                quota_pnl / max(len(quota_returns) ** 0.5, 1.0),
+                quota_hit_rate,
+                -brier,
+            )
         else:
-            score = (best_row.average_trade_return, best_row.net_pnl, -brier)
+            sweep = _threshold_sweep(
+                test_samples=validation_samples,
+                probabilities=raw,
+                thresholds=tuple(round(idx * 0.05, 2) for idx in range(2, 17)),
+            )
+            viable = [row for row in sweep if row.traded_signals >= min_validation_trades]
+            best_row = max(
+                viable,
+                key=lambda row: (
+                    row.average_trade_return,
+                    row.net_pnl / max(row.traded_signals**0.5, 1.0),
+                    row.hit_rate,
+                ),
+                default=None,
+            )
+            if best_row is None:
+                score = (0.0, 0.0, 0.0, -brier)
+            else:
+                score = (
+                    best_row.average_trade_return,
+                    best_row.net_pnl / max(best_row.traded_signals**0.5, 1.0),
+                    best_row.hit_rate,
+                    -brier,
+                )
         if best_score is None or score > best_score:
             best_score = score
             best_params = balanced_params
@@ -1075,7 +1273,13 @@ def _fit_base_prediction_sets(
     calibration_method: str,
     tune_hyperparameters: bool,
     hpo_profile: str = "standard",
+    hpo_trials: int = 0,
     foundation_max_samples: int = 1024,
+    target_trades_per_day: float | None = None,
+    target_frequency_mode: str = "strict",
+    min_signal_spacing_hours: float = 0.0,
+    max_signals_per_group_per_day: int = 0,
+    max_signals_per_timestamp: int = 0,
 ) -> tuple[list[BaseFoldPredictionSet], dict[str, str]]:
     prediction_sets: list[BaseFoldPredictionSet] = []
     skipped: dict[str, str] = {}
@@ -1131,6 +1335,12 @@ def _fit_base_prediction_sets(
                         y_train=model_y_train,
                         training_samples=train_samples[-len(model_y_train) :],
                         hpo_profile=hpo_profile,
+                        hpo_trials=hpo_trials,
+                        target_trades_per_day=target_trades_per_day,
+                        target_frequency_mode=target_frequency_mode,
+                        min_signal_spacing_hours=min_signal_spacing_hours,
+                        max_signals_per_group_per_day=max_signals_per_group_per_day,
+                        max_signals_per_timestamp=max_signals_per_timestamp,
                     )
                 if name in {"lightgbm", "catboost", "xgboost", "randomforest", "extratrees"}:
                     selected_params = {**_class_balance_params(name, model_y_train), **selected_params}
@@ -1656,6 +1866,8 @@ def _select_target_frequency_event_ids(
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
+    selection_setup_families: tuple[str, ...] = (),
+    selection_exclude_setup_families: tuple[str, ...] = (),
 ) -> set[str]:
     if target_trades_per_day <= 0:
         return set()
@@ -1665,6 +1877,8 @@ def _select_target_frequency_event_ids(
         predicted_returns = [0.0 for _ in test_samples]
     if predicted_downsides is None:
         predicted_downsides = [0.0 for _ in test_samples]
+    allowed_setups = set(selection_setup_families)
+    excluded_setups = set(selection_exclude_setup_families)
     grouped: dict[object, list[tuple[MetaLabelSample, float, float, float, float, str]]] = {}
     for sample, probability, predicted_return, predicted_downside in zip(
         test_samples,
@@ -1676,6 +1890,11 @@ def _select_target_frequency_event_ids(
         probability = float(probability)
         predicted_return = float(predicted_return)
         predicted_downside = float(predicted_downside)
+        setup_family = _sample_setup_family(sample)
+        if allowed_setups and setup_family not in allowed_setups:
+            continue
+        if excluded_setups and setup_family in excluded_setups:
+            continue
         expected_value = _expected_value(
             probability=probability,
             sample=sample,
@@ -1803,6 +2022,7 @@ def _score_fold(
     adaptive_minimum_threshold: float,
     tune_hyperparameters: bool,
     hpo_profile: str,
+    hpo_trials: int,
     foundation_max_samples: int,
     target_trades_per_day: float | None,
     allow_negative_ev_target_frequency: bool,
@@ -1816,6 +2036,8 @@ def _score_fold(
     min_signal_spacing_hours: float,
     max_signals_per_group_per_day: int,
     max_signals_per_timestamp: int,
+    selection_setup_families: tuple[str, ...],
+    selection_exclude_setup_families: tuple[str, ...],
 ) -> tuple[FoldReport, list[FoldPrediction], FeatureEncoder]:
     import numpy as np
     from sklearn.metrics import brier_score_loss, log_loss
@@ -1847,7 +2069,13 @@ def _score_fold(
         calibration_method=calibration_method,
         tune_hyperparameters=tune_hyperparameters,
         hpo_profile=hpo_profile,
+        hpo_trials=hpo_trials,
         foundation_max_samples=foundation_max_samples,
+        target_trades_per_day=target_trades_per_day,
+        target_frequency_mode=target_frequency_mode,
+        min_signal_spacing_hours=min_signal_spacing_hours,
+        max_signals_per_group_per_day=max_signals_per_group_per_day,
+        max_signals_per_timestamp=max_signals_per_timestamp,
     )
     if not prediction_sets:
         constant = float(y_train.mean()) if len(y_train) else 0.0
@@ -1985,6 +2213,8 @@ def _score_fold(
             min_signal_spacing_hours=min_signal_spacing_hours,
             max_signals_per_group_per_day=max_signals_per_group_per_day,
             max_signals_per_timestamp=max_signals_per_timestamp,
+            selection_setup_families=selection_setup_families,
+            selection_exclude_setup_families=selection_exclude_setup_families,
         )
         if target_trades_per_day and target_trades_per_day > 0
         else None
@@ -2193,6 +2423,7 @@ def run_meta_label_walk_forward(
     adaptive_minimum_threshold: float = 0.0,
     tune_hyperparameters: bool = False,
     hpo_profile: str = "standard",
+    hpo_trials: int = 0,
     foundation_max_samples: int = 1024,
     data_coverage: dict[str, Any] | None = None,
     target_trades_per_day: float | None = None,
@@ -2207,6 +2438,8 @@ def run_meta_label_walk_forward(
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
+    selection_setup_families: tuple[str, ...] = (),
+    selection_exclude_setup_families: tuple[str, ...] = (),
 ) -> MetaLabelWalkForwardReport:
     if not samples:
         raise ValueError("no samples supplied")
@@ -2256,6 +2489,7 @@ def run_meta_label_walk_forward(
             adaptive_minimum_threshold=adaptive_minimum_threshold,
             tune_hyperparameters=tune_hyperparameters,
             hpo_profile=hpo_profile,
+            hpo_trials=hpo_trials,
             foundation_max_samples=foundation_max_samples,
             target_trades_per_day=target_trades_per_day,
             allow_negative_ev_target_frequency=allow_negative_ev_target_frequency,
@@ -2269,6 +2503,8 @@ def run_meta_label_walk_forward(
             min_signal_spacing_hours=min_signal_spacing_hours,
             max_signals_per_group_per_day=max_signals_per_group_per_day,
             max_signals_per_timestamp=max_signals_per_timestamp,
+            selection_setup_families=selection_setup_families,
+            selection_exclude_setup_families=selection_exclude_setup_families,
         )
         reports.append(fold_report)
         predictions.extend(fold_predictions)

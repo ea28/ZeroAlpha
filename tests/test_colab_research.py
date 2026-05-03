@@ -323,6 +323,7 @@ def test_foundation_signal_audit_command_includes_kronos_and_hpo_flags(tmp_path:
         kronos_embedding_dims=16,
         foundation_max_samples=2048,
         hpo_profile="deep",
+        hpo_trials=8,
     )
 
     command = build_signal_audit_command(
@@ -338,6 +339,7 @@ def test_foundation_signal_audit_command_includes_kronos_and_hpo_flags(tmp_path:
     assert command[command.index("--kronos-embedding-dims") + 1] == "16"
     assert command[command.index("--foundation-max-samples") + 1] == "2048"
     assert command[command.index("--hpo-profile") + 1] == "deep"
+    assert command[command.index("--hpo-trials") + 1] == "8"
 
 
 def test_foundation_model_stack_excludes_failed_optional_smoke_models() -> None:

@@ -13,6 +13,13 @@ instrument model.
 This is trading software, not financial advice. Live trading remains disabled
 by default.
 
+## Crypto Futures Research Branch
+
+This branch adds a focused BTCUSDT crypto-futures research write-up at
+[`docs/crypto-futures-strategy.md`](docs/crypto-futures-strategy.md). The
+futures strategy is research-only and separate from the spot BTC/USD paper
+execution target.
+
 ## Strategy
 
 ZeroAlpha uses a two-layer meta-labeling strategy:
@@ -111,6 +118,7 @@ src/zeroalpha/labels/     triple-barrier labeler
 src/zeroalpha/models/     dataset builder, ensemble, HPO, sweeps
 src/zeroalpha/risk/       paper/live risk checks
 src/zeroalpha/validation/ purged walk-forward splitting
+docs/                    strategy and performance write-ups
 tests/                    unit and integration-style tests
 ```
 

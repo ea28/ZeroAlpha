@@ -11,7 +11,10 @@ from zeroalpha.models.ensemble import (
     ProbabilityCalibrator,
     _economic_sample_weights,
     _expected_value,
+    _hpo_grid,
+    _limit_hpo_grid,
     _payoff_estimate,
+    _quota_frequency_returns,
     _select_candidate_type_thresholds,
     _select_target_frequency_event_ids,
     _split_calibration_samples,
@@ -554,6 +557,32 @@ def test_target_frequency_respects_group_spacing_and_daily_caps() -> None:
     assert selected == {samples[0].event_id, samples[2].event_id}
 
 
+def test_target_frequency_can_veto_setup_families_at_selection_time() -> None:
+    strong_blocked = replace(
+        _sample(0),
+        event_id="blocked",
+        features={**_sample(0).features, "event_setup_family": "dense_trend_continuation"},
+    )
+    weaker_allowed = replace(
+        _sample(1),
+        event_id="allowed",
+        features={**_sample(1).features, "event_setup_family": "dense_baseline"},
+    )
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[strong_blocked, weaker_allowed],
+        probabilities=[0.95, 0.70],
+        target_trades_per_day=1,
+        selected_threshold=0.10,
+        config=AppConfig(labels=LabelConfig(net_profit_target=0.0045, net_stop_loss=0.003)),
+        allow_negative_ev=True,
+        target_frequency_mode="quota",
+        selection_exclude_setup_families=("dense_trend_continuation",),
+    )
+
+    assert selected == {"allowed"}
+
+
 def test_target_frequency_limits_duplicate_timestamp_bets() -> None:
     first = _sample(0)
     second = replace(_sample(0), event_id="same-bar-other-setup", candidate_type="active_squeeze_breakout")
@@ -626,6 +655,54 @@ def test_meta_label_walk_forward_can_tune_lightgbm_fold_locally() -> None:
     assert report.folds
     assert "lightgbm" in report.folds[0].selected_model_params
     assert report.folds[0].selected_model_params["lightgbm"].get("class_weight") == "balanced"
+
+
+def test_wide_hpo_profile_adds_regularized_model_candidates() -> None:
+    lightgbm_deep = _hpo_grid("lightgbm", profile="deep")
+    lightgbm_wide = _hpo_grid("lightgbm", profile="wide")
+    lightgbm_quota = _hpo_grid("lightgbm", profile="quota")
+    histgb_wide = _hpo_grid("histgb", profile="wide")
+    forest_wide = _hpo_grid("extratrees", profile="wide")
+
+    assert len(lightgbm_wide) > len(lightgbm_deep)
+    assert lightgbm_quota == lightgbm_wide
+    assert any("reg_alpha" in params for params in lightgbm_wide)
+    assert any(params.get("min_samples_leaf", 0) >= 60 for params in histgb_wide)
+    assert any(params.get("bootstrap") is True for params in forest_wide)
+
+
+def test_hpo_trial_cap_samples_across_wide_grid() -> None:
+    grid = _hpo_grid("lightgbm", profile="wide")
+    limited = _limit_hpo_grid(grid, 4)
+
+    assert len(limited) == 4
+    assert limited[0] == grid[0]
+    assert limited[-1] == grid[-1]
+
+
+def test_quota_frequency_returns_match_spaced_daily_selection() -> None:
+    samples = [
+        replace(
+            _sample(i),
+            candidate_type="volatility_breakout",
+            features={
+                **_sample(i).features,
+                "candidate_type": "volatility_breakout",
+                "market_regime": "range_day",
+            },
+            net_return=0.02 if i in {0, 2} else -0.02,
+        )
+        for i in range(4)
+    ]
+
+    returns = _quota_frequency_returns(
+        samples=samples,
+        scores=[0.90, 0.89, 0.88, 0.87],
+        target_trades_per_day=4,
+        min_signal_spacing_hours=2,
+    )
+
+    assert returns == [0.02, 0.02]
 
 
 def test_default_fold_sizes_cover_more_walk_forward_windows_for_large_datasets() -> None:

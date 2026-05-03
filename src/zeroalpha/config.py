@@ -156,8 +156,10 @@ class AppConfig:
             raise ConfigError("contract instrument_model must be spot_crypto or futures")
         if not self.broker.crypto_exchanges:
             raise ConfigError("at least one crypto exchange candidate is required")
-        if self.risk.max_open_positions != 1:
-            raise ConfigError("v1 supports max_open_positions = 1")
+        if self.risk.max_open_positions < 1:
+            raise ConfigError("risk max_open_positions must be positive")
+        if self.contract.instrument_model == "spot_crypto" and self.risk.max_open_positions != 1:
+            raise ConfigError("spot crypto mode supports max_open_positions = 1")
         if self.cost.tier_rate <= 0 or self.cost.minimum_commission < 0:
             raise ConfigError("invalid cost settings")
         if self.labels.net_profit_target <= 0 or self.labels.net_stop_loss <= 0:

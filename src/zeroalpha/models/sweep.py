@@ -9,7 +9,7 @@ from zeroalpha.backtest.ml import MLBacktestSummary, run_ml_backtest
 from zeroalpha.candidates.events import CandidateGenerationConfig
 from zeroalpha.config import AppConfig
 from zeroalpha.data.external.prediction_markets import PredictionMarketSnapshot
-from zeroalpha.domain import Bar
+from zeroalpha.domain import Bar, MarketQuote
 from zeroalpha.models.dataset import build_meta_label_samples
 from zeroalpha.models.ensemble import (
     MetaLabelWalkForwardReport,
@@ -104,6 +104,7 @@ def run_label_geometry_sweep(
     assumed_spread_bps: float,
     research_notional: float,
     context_bars: Mapping[str, list[Bar]] | None,
+    market_quotes: Sequence[MarketQuote] | None,
     prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None,
     net_profit_targets: list[float],
     net_stop_losses: list[float],
@@ -132,6 +133,9 @@ def run_label_geometry_sweep(
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
+    tune_hyperparameters: bool = False,
+    hpo_profile: str = "standard",
+    hpo_trials: int = 0,
 ) -> list[LabelSweepResult]:
     results: list[LabelSweepResult] = []
     for max_holding_hours in max_holding_hours_values:
@@ -152,6 +156,7 @@ def run_label_geometry_sweep(
                     assumed_spread_bps=assumed_spread_bps,
                     research_notional=research_notional,
                     context_bars=context_bars,
+                    market_quotes=market_quotes,
                     prediction_market_snapshots=prediction_market_snapshots,
                     candidate_config=CandidateGenerationConfig(
                         max_holding_hours=max_holding_hours,
@@ -182,6 +187,9 @@ def run_label_geometry_sweep(
                     min_signal_spacing_hours=min_signal_spacing_hours,
                     max_signals_per_group_per_day=max_signals_per_group_per_day,
                     max_signals_per_timestamp=max_signals_per_timestamp,
+                    tune_hyperparameters=tune_hyperparameters,
+                    hpo_profile=hpo_profile,
+                    hpo_trials=hpo_trials,
                 )
                 backtest_summary, _, _ = run_ml_backtest(
                     report=report,

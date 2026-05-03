@@ -74,11 +74,15 @@ def _estimate_trade_notional(
     net_stop_loss: float,
     requested_notional: float,
     max_notional: float,
+    cap_by_equity: bool = True,
 ) -> float:
     if equity <= 0:
         return 0.0
     risk_based = equity * risk_per_trade / net_stop_loss
-    return max(0.0, min(risk_based, requested_notional, max_notional, equity))
+    candidates = [risk_based, requested_notional, max_notional]
+    if cap_by_equity:
+        candidates.append(equity)
+    return max(0.0, min(candidates))
 
 
 def _dollar_component(notional: float, bps: float) -> float:

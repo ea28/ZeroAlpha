@@ -60,6 +60,8 @@ cooldown_hours_after_stopouts = 24
 [labels]
 bar_size = "1h"
 max_holding_hours = 72
+# Optional: set max_holding_seconds for sub-hour/tick-replay research.
+# max_holding_seconds = 60.0
 net_profit_target = 0.02
 net_stop_loss = 0.02
 conservative_same_bar = true

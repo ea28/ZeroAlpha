@@ -91,6 +91,33 @@ class CryptoOrderFactory:
         )
 
     @staticmethod
+    def stop_limit_loss_exit(
+        event_id: str | None,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        limit_price: float,
+        *,
+        side: Side = Side.SELL,
+        parent_internal_order_id: str | None = None,
+        transmit: bool = True,
+    ) -> OrderIntent:
+        return OrderIntent(
+            internal_order_id=new_order_id("stoplmt"),
+            event_id=event_id,
+            symbol=symbol,
+            side=side,
+            order_type=OrderType.STP_LMT,
+            time_in_force=TimeInForce.GTC,
+            quantity=quantity,
+            limit_price=limit_price,
+            aux_price=stop_price,
+            parent_internal_order_id=parent_internal_order_id,
+            transmit=transmit,
+            reason="attached_stop_limit_loss",
+        )
+
+    @staticmethod
     def bracket_entry(
         event_id: str,
         symbol: str,
@@ -100,6 +127,7 @@ class CryptoOrderFactory:
         stop_loss_price: float,
         *,
         side: Side = Side.BUY,
+        stop_loss_limit_price: float | None = None,
     ) -> tuple[OrderIntent, OrderIntent, OrderIntent]:
         parent = CryptoOrderFactory.limit_entry(
             event_id,
@@ -119,15 +147,27 @@ class CryptoOrderFactory:
             parent_internal_order_id=parent.internal_order_id,
             transmit=False,
         )
-        stop_loss = CryptoOrderFactory.stop_loss_exit(
-            event_id,
-            symbol,
-            quantity,
-            stop_loss_price,
-            side=exit_side,
-            parent_internal_order_id=parent.internal_order_id,
-            transmit=True,
-        )
+        if stop_loss_limit_price is None:
+            stop_loss = CryptoOrderFactory.stop_loss_exit(
+                event_id,
+                symbol,
+                quantity,
+                stop_loss_price,
+                side=exit_side,
+                parent_internal_order_id=parent.internal_order_id,
+                transmit=True,
+            )
+        else:
+            stop_loss = CryptoOrderFactory.stop_limit_loss_exit(
+                event_id,
+                symbol,
+                quantity,
+                stop_loss_price,
+                stop_loss_limit_price,
+                side=exit_side,
+                parent_internal_order_id=parent.internal_order_id,
+                transmit=True,
+            )
         return parent, take_profit, stop_loss
 
     @staticmethod

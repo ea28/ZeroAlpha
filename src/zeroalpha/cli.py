@@ -284,8 +284,15 @@ def _load_prediction_market_signals(args: argparse.Namespace, start: datetime, e
     }
 
 
-def _load_ibkr_quote_records(args: argparse.Namespace, start: datetime, end: datetime):
-    raw_path = getattr(args, "ibkr_quote_records", "") or ""
+def _load_ibkr_quote_records(
+    args: argparse.Namespace,
+    start: datetime,
+    end: datetime,
+    *,
+    attr: str = "ibkr_quote_records",
+    symbol_contains: str | None = "BTC",
+):
+    raw_path = getattr(args, attr, "") or ""
     if not raw_path:
         return [], {"enabled": False}
     path = Path(raw_path)
@@ -294,7 +301,7 @@ def _load_ibkr_quote_records(args: argparse.Namespace, start: datetime, end: dat
         quote
         for quote in quotes
         if start <= quote.timestamp_utc <= end
-        and (not getattr(args, "symbol", "") or "BTC" in quote.symbol.upper())
+        and (symbol_contains is None or symbol_contains.upper() in quote.symbol.upper())
     ]
     average_spread_bps = (
         sum(quote.spread_bps for quote in filtered) / len(filtered) if filtered else 0.0
@@ -316,6 +323,8 @@ def _override_config_from_args(cfg, args: argparse.Namespace):
     label_updates = {}
     if getattr(args, "max_holding_hours", 0):
         label_updates["max_holding_hours"] = args.max_holding_hours
+    if getattr(args, "max_holding_seconds", 0.0):
+        label_updates["max_holding_seconds"] = args.max_holding_seconds
     if getattr(args, "net_profit_target", 0.0):
         label_updates["net_profit_target"] = args.net_profit_target
     if getattr(args, "net_stop_loss", 0.0):
@@ -361,7 +370,13 @@ def _override_config_from_args(cfg, args: argparse.Namespace):
     if risk_updates:
         cfg = replace(cfg, risk=replace(cfg.risk, **risk_updates))
     cost_updates = {}
-    for attr in ("tier_rate", "base_slippage_bps", "safety_margin_bps"):
+    for attr in (
+        "tier_rate",
+        "minimum_commission",
+        "maximum_commission_rate",
+        "base_slippage_bps",
+        "safety_margin_bps",
+    ):
         value = getattr(args, attr, None)
         if value is not None:
             cost_updates[attr] = value
@@ -397,6 +412,7 @@ def _candidate_config_from_args(args: argparse.Namespace, cfg) -> CandidateGener
     )
     return CandidateGenerationConfig(
         max_holding_hours=cfg.labels.max_holding_hours,
+        max_holding_seconds=cfg.labels.max_holding_seconds,
         min_history_bars=getattr(args, "min_history_bars", 240),
         lookback=getattr(args, "candidate_lookback_bars", 24),
         rolling_window_bars=getattr(args, "candidate_rolling_window_bars", 500),
@@ -505,6 +521,13 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
+    futures_market_quotes, ibkr_futures_quote_coverage = _load_ibkr_quote_records(
+        args,
+        start,
+        end,
+        attr="ibkr_futures_quote_records",
+        symbol_contains=None,
+    )
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -515,6 +538,7 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
     data_coverage["ibkr_quotes"] = ibkr_quote_coverage
+    data_coverage["ibkr_futures_quotes"] = ibkr_futures_quote_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
@@ -522,6 +546,7 @@ def _cmd_backtest_ml(args: argparse.Namespace) -> int:
         research_notional=args.notional,
         context_bars=context_bars,
         market_quotes=market_quotes,
+        futures_market_quotes=futures_market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
@@ -585,6 +610,13 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
+    futures_market_quotes, ibkr_futures_quote_coverage = _load_ibkr_quote_records(
+        args,
+        start,
+        end,
+        attr="ibkr_futures_quote_records",
+        symbol_contains=None,
+    )
     data_coverage["label_geometry"] = asdict(
         label_geometry_diagnostics(
             config=cfg,
@@ -595,6 +627,7 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
     data_coverage["ibkr_quotes"] = ibkr_quote_coverage
+    data_coverage["ibkr_futures_quotes"] = ibkr_futures_quote_coverage
     samples = build_meta_label_samples(
         primary_bars,
         config=cfg,
@@ -602,6 +635,7 @@ def _cmd_model_train_meta(args: argparse.Namespace) -> int:
         research_notional=args.notional,
         context_bars=context_bars,
         market_quotes=market_quotes,
+        futures_market_quotes=futures_market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=_candidate_config_from_args(args, cfg),
     )
@@ -687,8 +721,16 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
+    futures_market_quotes, ibkr_futures_quote_coverage = _load_ibkr_quote_records(
+        args,
+        start,
+        end,
+        attr="ibkr_futures_quote_records",
+        symbol_contains=None,
+    )
     data_coverage["prediction_markets"] = prediction_market_coverage
     data_coverage["ibkr_quotes"] = ibkr_quote_coverage
+    data_coverage["ibkr_futures_quotes"] = ibkr_futures_quote_coverage
     candidate_config = _candidate_config_from_args(args, cfg)
     samples = build_meta_label_samples(
         primary_bars,
@@ -697,6 +739,7 @@ def _cmd_model_signal_audit(args: argparse.Namespace) -> int:
         research_notional=args.notional,
         context_bars=context_bars,
         market_quotes=market_quotes,
+        futures_market_quotes=futures_market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         candidate_config=candidate_config,
     )
@@ -850,9 +893,17 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
     primary_bars, context_bars, data_coverage = _load_research_bars(args, start, end)
     prediction_market_snapshots, prediction_market_coverage = _load_prediction_market_signals(args, start, end)
     market_quotes, ibkr_quote_coverage = _load_ibkr_quote_records(args, start, end)
+    futures_market_quotes, ibkr_futures_quote_coverage = _load_ibkr_quote_records(
+        args,
+        start,
+        end,
+        attr="ibkr_futures_quote_records",
+        symbol_contains=None,
+    )
     data_coverage["kronos"] = asdict(cfg.kronos)
     data_coverage["prediction_markets"] = prediction_market_coverage
     data_coverage["ibkr_quotes"] = ibkr_quote_coverage
+    data_coverage["ibkr_futures_quotes"] = ibkr_futures_quote_coverage
     model_names = [value.strip().lower() for value in args.models.split(",") if value.strip()]
     results = run_label_geometry_sweep(
         primary_bars,
@@ -862,6 +913,7 @@ def _cmd_model_sweep_labels(args: argparse.Namespace) -> int:
         starting_equity=args.starting_equity,
         context_bars=context_bars,
         market_quotes=market_quotes,
+        futures_market_quotes=futures_market_quotes,
         prediction_market_snapshots=prediction_market_snapshots,
         net_profit_targets=_parse_float_list(args.net_profit_targets),
         net_stop_losses=_parse_float_list(args.net_stop_losses),
@@ -1012,7 +1064,15 @@ async def _broker_record_quotes_async(args: argparse.Namespace) -> int:
         output_path=Path(args.output),
         interval_seconds=args.interval_seconds,
     )
-    count = await recorder.run(duration_seconds=args.duration_seconds)
+    count = await recorder.run(
+        duration_seconds=args.duration_seconds,
+        symbol=args.symbol or None,
+        security_type=args.security_type or None,
+        currency=args.currency or None,
+        exchange=args.exchange or None,
+        last_trade_date_or_contract_month=args.last_trade_date_or_contract_month,
+        local_symbol=args.local_symbol,
+    )
     print(f"ok: wrote {count} quote records to {args.output}")
     return 0
 
@@ -1062,6 +1122,14 @@ def _add_ibkr_quote_args(parser: argparse.ArgumentParser) -> None:
         "--ibkr-quote-records",
         default="",
         help="Path to broker record-quotes JSONL for IBKR bid/ask, spread, and top-of-book size features.",
+    )
+    parser.add_argument(
+        "--ibkr-futures-quote-records",
+        default="",
+        help=(
+            "Path to IBKR futures quote-recorder JSONL for futures basis, spread, "
+            "and top-of-book features."
+        ),
     )
 
 
@@ -1152,7 +1220,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ml_backtest.add_argument("--dense-stride-bars", type=int, default=1)
     ml_backtest.add_argument("--min-history-bars", type=int, default=240)
-    ml_backtest.add_argument("--max-holding-hours", type=int, default=0)
+    ml_backtest.add_argument("--max-holding-hours", type=float, default=0)
+    ml_backtest.add_argument(
+        "--max-holding-seconds",
+        type=float,
+        default=0.0,
+        help="Optional holding horizon in seconds. Use only with data granular enough to replay it.",
+    )
     ml_backtest.add_argument("--net-profit-target", type=float, default=0.0)
     ml_backtest.add_argument("--net-stop-loss", type=float, default=0.0)
     ml_backtest.add_argument("--volatility-lookback-bars", type=int, default=0)
@@ -1195,6 +1269,8 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--paper-max-notional", type=float, default=0.0)
     ml_backtest.add_argument("--minimum-fee-efficient-notional", type=float, default=0.0)
     ml_backtest.add_argument("--tier-rate", type=float, default=None)
+    ml_backtest.add_argument("--minimum-commission", type=float, default=None)
+    ml_backtest.add_argument("--maximum-commission-rate", type=float, default=None)
     ml_backtest.add_argument("--base-slippage-bps", type=float, default=None)
     ml_backtest.add_argument("--safety-margin-bps", type=float, default=None)
     ml_backtest.add_argument("--max-open-positions", type=int, default=0)
@@ -1262,7 +1338,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_meta.add_argument("--dense-stride-bars", type=int, default=1)
     train_meta.add_argument("--min-history-bars", type=int, default=240)
-    train_meta.add_argument("--max-holding-hours", type=int, default=0)
+    train_meta.add_argument("--max-holding-hours", type=float, default=0)
+    train_meta.add_argument(
+        "--max-holding-seconds",
+        type=float,
+        default=0.0,
+        help="Optional holding horizon in seconds. Use only with data granular enough to replay it.",
+    )
     train_meta.add_argument("--net-profit-target", type=float, default=0.0)
     train_meta.add_argument("--net-stop-loss", type=float, default=0.0)
     train_meta.add_argument("--volatility-lookback-bars", type=int, default=0)
@@ -1298,6 +1380,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--selection-exclude-setup-families", default="")
     train_meta.add_argument("--max-open-positions", type=int, default=0)
     train_meta.add_argument("--tier-rate", type=float, default=None)
+    train_meta.add_argument("--minimum-commission", type=float, default=None)
+    train_meta.add_argument("--maximum-commission-rate", type=float, default=None)
     train_meta.add_argument("--base-slippage-bps", type=float, default=None)
     train_meta.add_argument("--safety-margin-bps", type=float, default=None)
     train_meta.add_argument(
@@ -1370,7 +1454,13 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--allow-spot-short-research", action="store_true")
     signal_audit.add_argument("--dense-stride-bars", type=int, default=1)
     signal_audit.add_argument("--min-history-bars", type=int, default=240)
-    signal_audit.add_argument("--max-holding-hours", type=int, default=4)
+    signal_audit.add_argument("--max-holding-hours", type=float, default=4)
+    signal_audit.add_argument(
+        "--max-holding-seconds",
+        type=float,
+        default=0.0,
+        help="Optional holding horizon in seconds. Use only with data granular enough to replay it.",
+    )
     signal_audit.add_argument("--net-profit-target", type=float, default=0.001)
     signal_audit.add_argument("--net-stop-loss", type=float, default=0.001)
     signal_audit.add_argument("--volatility-lookback-bars", type=int, default=96)
@@ -1395,7 +1485,9 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--rolling-drawdown-stop", type=float, default=0.0)
     signal_audit.add_argument("--paper-max-notional", type=float, default=0.0)
     signal_audit.add_argument("--minimum-fee-efficient-notional", type=float, default=0.0)
-    signal_audit.add_argument("--tier-rate", type=float, default=0.0004)
+    signal_audit.add_argument("--tier-rate", type=float, default=None)
+    signal_audit.add_argument("--minimum-commission", type=float, default=None)
+    signal_audit.add_argument("--maximum-commission-rate", type=float, default=None)
     signal_audit.add_argument("--base-slippage-bps", type=float, default=1.0)
     signal_audit.add_argument("--safety-margin-bps", type=float, default=2.0)
     signal_audit.add_argument("--max-open-positions", type=int, default=4)
@@ -1523,6 +1615,12 @@ def build_parser() -> argparse.ArgumentParser:
     record_quotes.add_argument("--config", default="configs/paper.example.toml")
     record_quotes.add_argument("--interval-seconds", type=float, default=5.0)
     record_quotes.add_argument("--duration-seconds", type=float, default=60.0)
+    record_quotes.add_argument("--symbol", default="")
+    record_quotes.add_argument("--security-type", default="")
+    record_quotes.add_argument("--currency", default="")
+    record_quotes.add_argument("--exchange", default="")
+    record_quotes.add_argument("--last-trade-date-or-contract-month", default="")
+    record_quotes.add_argument("--local-symbol", default="")
     record_quotes.add_argument("--output", default="data/raw/ibkr/quotes_btcusd.jsonl")
     record_quotes.set_defaults(func=_cmd_broker_record_quotes)
 

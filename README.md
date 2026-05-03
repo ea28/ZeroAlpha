@@ -13,12 +13,11 @@ instrument model.
 This is trading software, not financial advice. Live trading remains disabled
 by default.
 
-## Crypto Futures Research Branch
+## Main Spot Crypto Research
 
-This branch adds a focused BTCUSDT crypto-futures research write-up at
-[`docs/crypto-futures-strategy.md`](docs/crypto-futures-strategy.md). The
-futures strategy is research-only and separate from the spot BTC/USD paper
-execution target.
+This branch targets BTC/USD spot crypto through IBKR. The current strategy and
+performance write-up is in [`docs/spot-crypto-strategy.md`](docs/spot-crypto-strategy.md).
+Crypto-futures research belongs on the `crypto-futures` branch, not `main`.
 
 ## Strategy
 
@@ -299,12 +298,12 @@ quota ranking instead of the strict probability/EV gate:
 --selection-score probability \
 --research-gate \
 --allow-negative-ev-frequency-probe \
---max-open-positions 4
+--max-open-positions 1
 ```
 
-If you are studying long/short notional rather than IBKR spot BTC/USD, model it
-explicitly as futures research and use bracket/stop-capable order intents before
-considering any paper execution:
+If you are studying long/short notional rather than IBKR spot BTC/USD, do that
+on a separate futures research branch and use bracket/stop-capable order intents
+before considering any paper execution:
 
 ```bash
 --instrument-model futures \
@@ -312,9 +311,8 @@ considering any paper execution:
 --risk-per-trade 0.005
 ```
 
-Spot crypto stays long/flat by default. The futures override is a research
-assumption; live deployment still needs an instrument and broker route that can
-actually short and attach stop-loss orders.
+Spot crypto stays long/flat on `main`. The futures override is a research
+assumption and is not the default branch strategy.
 
 Polymarket discovery attempts every requested duration but currently active BTC
 short-form markets are mainly 5m, 15m, 1h, and 4h. Kalshi contributes the exact
@@ -343,6 +341,7 @@ Use the rule-only candidate backtest only as a diagnostic baseline:
 
 Implemented:
 
+- second-level holding-horizon plumbing through `--max-holding-seconds`
 - timestamp-based holding horizons for 1m, 1h, and 4h bars
 - triple-barrier labels with conservative same-bar handling
 - per-notional IBKR-style commission model
@@ -359,7 +358,7 @@ Implemented:
 
 Not implemented for production claims:
 
-- sub-minute or 1-second order-book replay
+- sub-minute or 1-second order-book replay from tick/L2 data
 - queue position, partial queue depletion, and venue-specific maker/taker fill
   modeling
 - latency-sensitive cancel/replace replay

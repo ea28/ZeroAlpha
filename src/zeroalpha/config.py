@@ -89,6 +89,7 @@ class RiskConfig:
 class LabelConfig:
     bar_size: str = "1h"
     max_holding_hours: int = 72
+    max_holding_seconds: float | None = None
     net_profit_target: float = 0.02
     net_stop_loss: float = 0.02
     conservative_same_bar: bool = True
@@ -164,6 +165,10 @@ class AppConfig:
             raise ConfigError("invalid cost settings")
         if self.labels.net_profit_target <= 0 or self.labels.net_stop_loss <= 0:
             raise ConfigError("label net target and stop must be positive")
+        if self.labels.max_holding_seconds is not None and self.labels.max_holding_seconds <= 0:
+            raise ConfigError("label max_holding_seconds must be positive when set")
+        if self.labels.max_holding_seconds is None and self.labels.max_holding_hours <= 0:
+            raise ConfigError("label max_holding_hours must be positive")
         if self.labels.volatility_lookback_bars <= 1:
             raise ConfigError("label volatility_lookback_bars must be greater than 1")
         if min(

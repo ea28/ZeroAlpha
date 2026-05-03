@@ -105,16 +105,21 @@ def _quote_index_before_lookback(
     return bisect_right(quotes.timestamps, ensure_utc(timestamp) - lookback) - 1
 
 
+def _quote_feature_name(prefix: str, name: str) -> str:
+    return f"{prefix}_{name}"
+
+
 def _add_market_quote_features(
     features: dict[str, float | str],
     *,
     event: CandidateEvent,
     market_quotes: _PreparedMarketQuotes | None,
+    prefix: str = "ibkr",
 ) -> None:
     if market_quotes is None:
         return
     idx = _quote_index_at_or_before(market_quotes, event.timestamp_utc)
-    features["ibkr_quote_available"] = 1.0 if idx >= 0 else 0.0
+    features[_quote_feature_name(prefix, "quote_available")] = 1.0 if idx >= 0 else 0.0
     if idx < 0:
         return
 
@@ -125,15 +130,21 @@ def _add_market_quote_features(
     mid = market_quotes.mids[idx]
     spread = market_quotes.spread_bps[idx]
     bar_close = float(features.get("bar_close", 0.0) or 0.0)
-    features["ibkr_quote_age_seconds"] = age_seconds
-    features["ibkr_quote_stale_5s"] = 1.0 if age_seconds > 5 else 0.0
-    features["ibkr_quote_stale_30s"] = 1.0 if age_seconds > 30 else 0.0
-    features["ibkr_spread_bps"] = spread
-    features["ibkr_log_spread_bps"] = log1p(max(0.0, spread))
+    features[_quote_feature_name(prefix, "quote_age_seconds")] = age_seconds
+    features[_quote_feature_name(prefix, "quote_stale_5s")] = 1.0 if age_seconds > 5 else 0.0
+    features[_quote_feature_name(prefix, "quote_stale_30s")] = 1.0 if age_seconds > 30 else 0.0
+    features[_quote_feature_name(prefix, "spread_bps")] = spread
+    features[_quote_feature_name(prefix, "log_spread_bps")] = log1p(max(0.0, spread))
     if bar_close > 0:
-        features["ibkr_mid_to_bar_close_bps"] = 10_000 * (mid / bar_close - 1)
-        features["ibkr_bid_to_bar_close_bps"] = 10_000 * (bid / bar_close - 1)
-        features["ibkr_ask_to_bar_close_bps"] = 10_000 * (ask / bar_close - 1)
+        features[_quote_feature_name(prefix, "mid_to_bar_close_bps")] = 10_000 * (
+            mid / bar_close - 1
+        )
+        features[_quote_feature_name(prefix, "bid_to_bar_close_bps")] = 10_000 * (
+            bid / bar_close - 1
+        )
+        features[_quote_feature_name(prefix, "ask_to_bar_close_bps")] = 10_000 * (
+            ask / bar_close - 1
+        )
 
     bid_size = market_quotes.bid_sizes[idx]
     ask_size = market_quotes.ask_sizes[idx]
@@ -141,15 +152,15 @@ def _add_market_quote_features(
         bid_size_value = float(bid_size or 0.0)
         ask_size_value = float(ask_size or 0.0)
         total_size = bid_size_value + ask_size_value
-        features["ibkr_quote_size_available"] = 1.0
-        features["ibkr_bid_size_log"] = log1p(bid_size_value)
-        features["ibkr_ask_size_log"] = log1p(ask_size_value)
-        features["ibkr_top_of_book_size_log"] = log1p(total_size)
-        features["ibkr_top_of_book_imbalance"] = (
+        features[_quote_feature_name(prefix, "quote_size_available")] = 1.0
+        features[_quote_feature_name(prefix, "bid_size_log")] = log1p(bid_size_value)
+        features[_quote_feature_name(prefix, "ask_size_log")] = log1p(ask_size_value)
+        features[_quote_feature_name(prefix, "top_of_book_size_log")] = log1p(total_size)
+        features[_quote_feature_name(prefix, "top_of_book_imbalance")] = (
             (bid_size_value - ask_size_value) / total_size if total_size > 0 else 0.0
         )
     else:
-        features["ibkr_quote_size_available"] = 0.0
+        features[_quote_feature_name(prefix, "quote_size_available")] = 0.0
 
     for label, lookback in {
         "1m": timedelta(minutes=1),
@@ -162,8 +173,10 @@ def _add_market_quote_features(
             continue
         previous_mid = market_quotes.mids[previous_idx]
         if previous_mid > 0:
-            features[f"ibkr_mid_return_{label}"] = mid / previous_mid - 1
-        features[f"ibkr_spread_change_bps_{label}"] = spread - market_quotes.spread_bps[previous_idx]
+            features[_quote_feature_name(prefix, f"mid_return_{label}")] = mid / previous_mid - 1
+        features[_quote_feature_name(prefix, f"spread_change_bps_{label}")] = (
+            spread - market_quotes.spread_bps[previous_idx]
+        )
 
 
 def _prepare_context_bars(context_bars: Mapping[str, list[Bar]] | None) -> dict[str, _PreparedContext]:
@@ -637,6 +650,7 @@ def build_meta_label_samples(
     research_notional: float | None = None,
     context_bars: Mapping[str, list[Bar]] | None = None,
     market_quotes: Sequence[MarketQuote] | None = None,
+    futures_market_quotes: Sequence[MarketQuote] | None = None,
     prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None = None,
     candidate_config: CandidateGenerationConfig | None = None,
 ) -> list[MetaLabelSample]:
@@ -658,6 +672,7 @@ def build_meta_label_samples(
     events = generate_candidate_events(ordered, config=candidate_config)
     prepared_context = _prepare_context_bars(context_bars)
     prepared_market_quotes = _prepare_market_quotes(market_quotes)
+    prepared_futures_market_quotes = _prepare_market_quotes(futures_market_quotes)
     prepared_prediction_markets = (
         PreparedPredictionMarketSnapshots.from_snapshots(prediction_market_snapshots)
         if prediction_market_snapshots
@@ -701,6 +716,12 @@ def build_meta_label_samples(
         _add_event_metadata(features, event)
         _add_cross_asset_features(features, event=event, context_bars=prepared_context)
         _add_market_quote_features(features, event=event, market_quotes=prepared_market_quotes)
+        _add_market_quote_features(
+            features,
+            event=event,
+            market_quotes=prepared_futures_market_quotes,
+            prefix="ibkr_futures",
+        )
         _add_prediction_market_features(
             features,
             event=event,
@@ -714,6 +735,7 @@ def build_meta_label_samples(
                 "net_profit_target": net_profit_target,
                 "net_stop_loss": net_stop_loss,
                 "max_holding_hours": float(event.max_holding_hours),
+                "max_holding_seconds": event.max_holding_period.total_seconds(),
                 "gross_profit_move": net_profit_target + diagnostics.round_trip_cost_fraction,
                 "gross_stop_distance": net_stop_loss - diagnostics.round_trip_cost_fraction,
                 "horizon_volatility": horizon_volatility,

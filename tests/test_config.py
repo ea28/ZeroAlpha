@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from zeroalpha.config import AppConfig, ConfigError, ContractConfig, RiskConfig, load_config
+from zeroalpha.config import AppConfig, ConfigError, ContractConfig, LabelConfig, RiskConfig, load_config
 from zeroalpha.domain import RuntimeMode
 
 
@@ -28,3 +28,10 @@ def test_spot_crypto_still_requires_single_open_position() -> None:
 
     with pytest.raises(ConfigError, match="spot crypto mode"):
         cfg.validate()
+
+
+def test_second_level_holding_period_validates_when_set() -> None:
+    AppConfig(labels=LabelConfig(max_holding_seconds=1.0)).validate()
+
+    with pytest.raises(ConfigError, match="max_holding_seconds"):
+        AppConfig(labels=LabelConfig(max_holding_seconds=0.0)).validate()

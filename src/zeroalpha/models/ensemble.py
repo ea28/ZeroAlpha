@@ -2462,7 +2462,15 @@ def run_meta_label_walk_forward(
         train_size=train_size,
         calibration_size=calibration_size,
         test_size=test_size,
-        embargo=timedelta(hours=embargo_hours or config.labels.max_holding_hours),
+        embargo=(
+            timedelta(hours=embargo_hours)
+            if embargo_hours
+            else (
+                timedelta(seconds=config.labels.max_holding_seconds)
+                if config.labels.max_holding_seconds is not None
+                else timedelta(hours=config.labels.max_holding_hours)
+            )
+        ),
     )
     if not folds:
         raise ValueError("fold sizes produce no walk-forward folds")

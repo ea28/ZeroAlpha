@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import NAMESPACE_URL, uuid5
 
 from zeroalpha.candidates.rules import (
@@ -30,7 +30,8 @@ from zeroalpha.domain import Bar, CandidateEvent, Side
 @dataclass(frozen=True, slots=True)
 class CandidateGenerationConfig:
     lookback: int = 24
-    max_holding_hours: int = 72
+    max_holding_hours: float = 72
+    max_holding_seconds: float | None = None
     min_history_bars: int = 240
     rolling_window_bars: int = 500
     mode: str = "rules"
@@ -118,7 +119,8 @@ def _dense_setup_metadata(bars: list[Bar]) -> dict[str, float | str | bool]:
 def dense_research_candidate(
     bars: list[Bar],
     *,
-    max_holding_hours: int,
+    max_holding_hours: float,
+    max_holding_seconds: float | None = None,
     side: Side = Side.BUY,
 ) -> CandidateEvent | None:
     if len(bars) < 2:
@@ -149,8 +151,19 @@ def dense_research_candidate(
         signal_strength=signal_strength,
         reference_price=latest.close,
         max_holding_hours=max_holding_hours,
+        max_holding_seconds=max_holding_seconds,
         metadata=metadata,
     )
+
+
+def _with_horizon_override(
+    candidate: CandidateEvent | None,
+    *,
+    max_holding_seconds: float | None,
+) -> CandidateEvent | None:
+    if candidate is None or max_holding_seconds is None:
+        return candidate
+    return replace(candidate, max_holding_seconds=max_holding_seconds)
 
 
 def candidates_for_history(
@@ -166,6 +179,7 @@ def candidates_for_history(
             candidate = dense_research_candidate(
                 bars,
                 max_holding_hours=config.max_holding_hours,
+                max_holding_seconds=config.max_holding_seconds,
                 side=Side.BUY,
             )
             if candidate is not None:
@@ -174,6 +188,7 @@ def candidates_for_history(
             candidate = dense_research_candidate(
                 bars,
                 max_holding_hours=config.max_holding_hours,
+                max_holding_seconds=config.max_holding_seconds,
                 side=Side.SELL,
             )
             if candidate is not None:
@@ -209,13 +224,20 @@ def candidates_for_history(
                     max_holding_hours=min(active_horizon, 3),
                 ),
             ):
+                candidate = _with_horizon_override(
+                    candidate,
+                    max_holding_seconds=config.max_holding_seconds,
+                )
                 if candidate is not None:
                     candidates.append(candidate)
         if config.side_mode in {"short", "long_short"}:
-            candidate = active_short_breakdown_candidate(
-                bars,
-                lookback=max(8, min(config.lookback, 32)),
-                max_holding_hours=min(active_horizon, 4),
+            candidate = _with_horizon_override(
+                active_short_breakdown_candidate(
+                    bars,
+                    lookback=max(8, min(config.lookback, 32)),
+                    max_holding_hours=min(active_horizon, 4),
+                ),
+                max_holding_seconds=config.max_holding_seconds,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -268,6 +290,10 @@ def candidates_for_history(
                 ]
             )
         for candidate in long_candidates:
+            candidate = _with_horizon_override(
+                candidate,
+                max_holding_seconds=config.max_holding_seconds,
+            )
             if candidate is not None:
                 candidates.append(candidate)
     if config.side_mode in {"short", "long_short"}:
@@ -287,6 +313,10 @@ def candidates_for_history(
                 max_holding_hours=min(48, config.max_holding_hours),
             ),
         ):
+            candidate = _with_horizon_override(
+                candidate,
+                max_holding_seconds=config.max_holding_seconds,
+            )
             if candidate is not None:
                 candidates.append(candidate)
     return candidates

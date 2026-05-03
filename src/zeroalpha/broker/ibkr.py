@@ -81,30 +81,56 @@ class IBKRBroker:
     async def qualify_crypto_contract(self) -> QualifiedCryptoContract:
         if not self._ib:
             raise BrokerConnectionError("connect before qualifying contracts")
-        ib_async = _ib_async()
         last_error: Exception | None = None
         for exchange in self.config.broker.crypto_exchanges:
-            contract = ib_async.Contract(
-                symbol=self.config.contract.symbol,
-                secType=self.config.contract.security_type,
-                currency=self.config.contract.currency,
-                exchange=exchange,
-            )
             try:
-                qualified = await self._ib.qualifyContractsAsync(contract)
+                return await self.qualify_contract(
+                    symbol=self.config.contract.symbol,
+                    security_type=self.config.contract.security_type,
+                    currency=self.config.contract.currency,
+                    exchange=exchange,
+                )
             except Exception as exc:  # pragma: no cover - depends on Gateway
                 last_error = exc
                 continue
-            if qualified:
-                contract = qualified[0]
-                return QualifiedCryptoContract(
-                    symbol=self.config.contract.symbol,
-                    currency=self.config.contract.currency,
-                    exchange=exchange,
-                    con_id=getattr(contract, "conId", None),
-                    raw=contract,
-                )
         raise BrokerConnectionError(f"could not qualify BTC crypto contract: {last_error}")
+
+    async def qualify_contract(
+        self,
+        *,
+        symbol: str,
+        security_type: str,
+        currency: str,
+        exchange: str,
+        last_trade_date_or_contract_month: str = "",
+        local_symbol: str = "",
+    ) -> QualifiedCryptoContract:
+        if not self._ib:
+            raise BrokerConnectionError("connect before qualifying contracts")
+        ib_async = _ib_async()
+        contract = ib_async.Contract(
+            symbol=symbol,
+            secType=security_type,
+            currency=currency,
+            exchange=exchange,
+        )
+        if last_trade_date_or_contract_month:
+            contract.lastTradeDateOrContractMonth = last_trade_date_or_contract_month
+        if local_symbol:
+            contract.localSymbol = local_symbol
+        qualified = await self._ib.qualifyContractsAsync(contract)
+        if not qualified:
+            raise BrokerConnectionError(
+                f"could not qualify contract {security_type}:{symbol}/{currency}@{exchange}"
+            )
+        contract = qualified[0]
+        return QualifiedCryptoContract(
+            symbol=getattr(contract, "symbol", symbol),
+            currency=getattr(contract, "currency", currency),
+            exchange=getattr(contract, "exchange", exchange),
+            con_id=getattr(contract, "conId", None),
+            raw=contract,
+        )
 
     async def snapshot_quote(self, contract: QualifiedCryptoContract) -> MarketQuote:
         if not self._ib:

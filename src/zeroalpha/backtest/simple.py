@@ -240,6 +240,7 @@ def run_candidate_backtest(
     cooldown_until: datetime | None = None
     generation_config = CandidateGenerationConfig(
         max_holding_hours=config.labels.max_holding_hours,
+        max_holding_seconds=config.labels.max_holding_seconds,
         min_history_bars=240,
     )
     next_allowed_idx = generation_config.min_history_bars

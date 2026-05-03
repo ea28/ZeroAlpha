@@ -84,3 +84,39 @@ def test_dataset_includes_ibkr_quote_microstructure_features() -> None:
     assert "ibkr_spread_bps" in features
     assert "ibkr_top_of_book_imbalance" in features
     assert "ibkr_mid_return_1h" in features
+
+
+def test_dataset_includes_ibkr_futures_quote_features_with_separate_prefix() -> None:
+    bars = [_bar(idx) for idx in range(360)]
+    futures_quotes = [
+        MarketQuote(
+            timestamp_utc=bar.timestamp_utc,
+            received_timestamp_utc=bar.timestamp_utc,
+            symbol="MBT",
+            bid=bar.close + 4.0,
+            ask=bar.close + 5.0,
+            bid_size=10.0,
+            ask_size=12.0,
+        )
+        for bar in bars
+    ]
+
+    samples = build_meta_label_samples(
+        bars,
+        config=AppConfig(),
+        assumed_spread_bps=1.0,
+        research_notional=10_000,
+        futures_market_quotes=futures_quotes,
+        candidate_config=CandidateGenerationConfig(
+            mode="dense_research",
+            min_history_bars=240,
+            max_holding_hours=24,
+            dense_stride_bars=48,
+        ),
+    )
+
+    features = samples[0].features
+
+    assert features["ibkr_futures_quote_available"] == 1.0
+    assert "ibkr_futures_mid_to_bar_close_bps" in features
+    assert "ibkr_futures_top_of_book_imbalance" in features

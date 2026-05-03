@@ -26,6 +26,7 @@ class OrderType(StrEnum):
     LMT = "LMT"
     MKT = "MKT"
     STP = "STP"
+    STP_LMT = "STP LMT"
 
 
 class TimeInForce(StrEnum):
@@ -123,16 +124,23 @@ class CandidateEvent:
     bar_size: str
     signal_strength: float
     reference_price: float
-    max_holding_hours: int
+    max_holding_hours: float
+    max_holding_seconds: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp_utc", ensure_utc(self.timestamp_utc))
         if self.reference_price <= 0:
             raise ValueError("reference_price must be positive")
+        if self.max_holding_seconds is not None and self.max_holding_seconds <= 0:
+            raise ValueError("max_holding_seconds must be positive")
+        if self.max_holding_seconds is None and self.max_holding_hours <= 0:
+            raise ValueError("max_holding_hours must be positive")
 
     @property
     def max_holding_period(self) -> timedelta:
+        if self.max_holding_seconds is not None:
+            return timedelta(seconds=self.max_holding_seconds)
         return timedelta(hours=self.max_holding_hours)
 
     @property
@@ -199,9 +207,9 @@ class OrderIntent:
     reason: str = ""
 
     def __post_init__(self) -> None:
-        if self.order_type == OrderType.LMT and self.limit_price is None:
+        if self.order_type in {OrderType.LMT, OrderType.STP_LMT} and self.limit_price is None:
             raise ValueError("limit orders require limit_price")
-        if self.order_type == OrderType.STP and self.aux_price is None:
+        if self.order_type in {OrderType.STP, OrderType.STP_LMT} and self.aux_price is None:
             raise ValueError("stop orders require aux_price")
         if self.quantity is None and self.cash_qty is None:
             raise ValueError("order intent requires quantity or cash_qty")

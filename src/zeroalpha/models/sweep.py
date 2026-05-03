@@ -136,6 +136,7 @@ def run_label_geometry_sweep(
     tune_hyperparameters: bool = False,
     hpo_profile: str = "standard",
     hpo_trials: int = 0,
+    futures_market_quotes: Sequence[MarketQuote] | None = None,
 ) -> list[LabelSweepResult]:
     results: list[LabelSweepResult] = []
     for max_holding_hours in max_holding_hours_values:
@@ -157,6 +158,7 @@ def run_label_geometry_sweep(
                     research_notional=research_notional,
                     context_bars=context_bars,
                     market_quotes=market_quotes,
+                    futures_market_quotes=futures_market_quotes,
                     prediction_market_snapshots=prediction_market_snapshots,
                     candidate_config=CandidateGenerationConfig(
                         max_holding_hours=max_holding_hours,

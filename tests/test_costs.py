@@ -3,6 +3,7 @@ from zeroalpha.costs import CommissionModel, SlippageModel, estimate_round_trip_
 
 def test_commission_minimum_and_rate() -> None:
     model = CommissionModel()
+    assert model.commission(10) == 0.10
     assert model.commission(500) == 1.75
     assert round(model.commission(1_000), 2) == 1.80
     assert round(model.round_trip_commission_bps(10_000), 1) == 36.0

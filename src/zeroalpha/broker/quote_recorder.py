@@ -56,12 +56,32 @@ class IBKRQuoteRecorder:
         self.output_path = output_path
         self.interval_seconds = interval_seconds
 
-    async def run(self, *, duration_seconds: float | None = None) -> int:
+    async def run(
+        self,
+        *,
+        duration_seconds: float | None = None,
+        symbol: str | None = None,
+        security_type: str | None = None,
+        currency: str | None = None,
+        exchange: str | None = None,
+        last_trade_date_or_contract_month: str = "",
+        local_symbol: str = "",
+    ) -> int:
         broker = IBKRBroker(self.config)
         await broker.connect(read_only=True)
         count = 0
         try:
-            contract = await broker.qualify_crypto_contract()
+            if security_type or exchange or symbol or currency or last_trade_date_or_contract_month or local_symbol:
+                contract = await broker.qualify_contract(
+                    symbol=symbol or self.config.contract.symbol,
+                    security_type=security_type or self.config.contract.security_type,
+                    currency=currency or self.config.contract.currency,
+                    exchange=exchange or self.config.broker.crypto_exchanges[0],
+                    last_trade_date_or_contract_month=last_trade_date_or_contract_month,
+                    local_symbol=local_symbol,
+                )
+            else:
+                contract = await broker.qualify_crypto_contract()
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             started = asyncio.get_running_loop().time()
             with self.output_path.open("a", encoding="utf-8") as handle:

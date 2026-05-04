@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Paper-first IBKR-aware BTC/USD ML trading system"
 readme = "README.md"
 requires-python = ">=3.14.4,<3.15"
-license = "MIT"
+license = "LicenseRef-Proprietary"
 authors = [{ name = "ZeroAlpha" }]
 dependencies = []
 
@@ -16,11 +16,13 @@ dependencies = []
 broker = ["ib_async>=2.1.0"]
 data = ["pyarrow>=24.0.0", "duckdb>=1.5.2", "pandas>=3.0.2", "polars>=1.40.1"]
 ml = [
+  "joblib>=1.6.0",
   "numpy>=2.4.4",
   "scikit-learn>=1.8.0",
   "lightgbm>=4.6",
   "xgboost>=3.2",
   "catboost>=1.2.10",
+  "shap>=0.51",
   "tabicl>=2.1",
   "tabpfn>=7.1.1",
 ]
@@ -33,6 +35,29 @@ kronos = [
   "tqdm>=4.67.3",
 ]
 dev = ["numpy>=2.4.4", "scikit-learn>=1.8.0", "pytest>=9.0.3", "ruff>=0.15.12"]
+all = [
+  "ib_async>=2.1.0",
+  "pyarrow>=24.0.0",
+  "duckdb>=1.5.2",
+  "pandas>=3.0.2",
+  "polars>=1.40.1",
+  "joblib>=1.6.0",
+  "numpy>=2.4.4",
+  "scikit-learn>=1.8.0",
+  "lightgbm>=4.6",
+  "xgboost>=3.2",
+  "catboost>=1.2.10",
+  "shap>=0.51",
+  "tabicl>=2.1",
+  "tabpfn>=7.1.1",
+  "torch>=2.11.0",
+  "einops>=0.8.2",
+  "huggingface-hub>=1.12.0",
+  "safetensors>=0.7.0",
+  "tqdm>=4.67.3",
+  "pytest>=9.0.3",
+  "ruff>=0.15.12",
+]
 
 [project.scripts]
 zeroalpha = "zeroalpha.cli:main"

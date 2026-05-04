@@ -1,404 +1,390 @@
 # ZeroAlpha
 
-ZeroAlpha is a IBKR BTC/USD trading research and execution
-system. It is designed around one conservative standard: a strategy must pass
-cost-aware walk-forward research, model-driven backtesting, and IBKR paper
-operational checks before it is allowed anywhere near live capital.
+ZeroAlpha is a proprietary, paper-first BTC/USD spot crypto trading system for
+IBKR Gateway/TWS. It combines cost-aware walk-forward ML research with a gated
+IBKR execution runtime.
 
-The current production target is BTC/USD spot crypto through IBKR Gateway in
-paper mode, long/flat only. Short research is blocked for spot crypto because
-the current IBKR crypto order layer is not a shortable futures or margin
-instrument model.
+This repository is not financial advice. Paper trading can be operated from
+this branch after the checks below pass. Live trading is present only as a
+live-gated path and cannot be enabled accidentally: it requires a live IBKR
+Gateway/TWS login, live API port, explicit account, live config flags, hard
+confirmation strings, streaming logs, and notional/loss caps.
 
-This is trading software, not financial advice. Live trading remains disabled
-by default.
+No open-source license is granted.
 
-## Main Spot Crypto Research
+## Production Safety Statement
 
-This branch targets BTC/USD spot crypto through IBKR. The current strategy and
-performance write-up is in [`docs/spot-crypto-strategy.md`](docs/spot-crypto-strategy.md).
-Crypto-futures research belongs on the `crypto-futures` branch, not `main`.
+Main branch execution target:
 
-## Strategy
+- Instrument: IBKR spot BTC/USD crypto, `CRYPTO` / `BTC` / `USD`.
+- Venues: `PAXOS`, then `ZEROHASH` fallback when configured.
+- Mode: long/flat spot only.
+- Orders: IBKR market and limit orders only.
+- Stops: synthetic stop monitor only. Native `STP` and `STP LMT` are blocked for
+  IBKR spot crypto because IBKR documents crypto support as market/limit only.
+- Positioning: one open BTC spot position in the autonomous runner.
+- Account: every mutating broker command requires explicit `broker.account` or
+  `--account`, and the account must appear in TWS `managedAccounts()`.
+- Live mode: requires `mode = "live"`, port `4001` or `7496`,
+  `enable_live_trading = true`, `live_confirmation = "ZEROALPHA_LIVE"`,
+  `--confirm ZEROALPHA_LIVE_TRADE_RUN`, explicit account, max loss, and max
+  notional caps.
 
-ZeroAlpha uses a two-layer meta-labeling strategy:
-
-1. Candidate generators create possible BTC trades from price action, volatility,
-   liquidity, and cross-crypto context.
-2. A calibrated ML ensemble decides whether each candidate has positive expected
-   value after commissions, spread, slippage, missed-fill risk, and risk limits.
-
-The default trade lifecycle is:
-
-```text
-Binance/Coinbase/Kraken research data
-        -> data quality gates
-        -> candidate events
-        -> triple-barrier net-of-cost labels
-        -> causal feature table
-        -> purged walk-forward model training
-        -> calibrated probability and EV gate
-        -> model-driven backtest with live-style risk rules
-        -> IBKR paper smoke/order tests
-```
-
-The first executable instrument is IBKR spot BTC/USD. Normal entry and exit are
-limit-order-first. Urgent exits are modeled as market IOC. Stops, targets, and
-time exits are synthetic in the bot and backtester.
-
-## Models
-
-The implemented model stack is:
-
-- Logistic regression baseline
-- LightGBM
-- CatBoost
-- XGBoost
-- TabICL, when installed and stable
-- TabPFN, when installed and stable
-- Low-capacity stacker over out-of-fold predictions
-- Final probability calibrator
-
-The model target is:
-
-```text
-P(candidate trade is net-profitable after full estimated costs)
-```
-
-It is not a next-candle direction classifier.
-
-Fold-local hyperparameter tuning is available for the GBDT models with
-`--hpo`. Foundation models are bounded and run through isolated workers so a
-TabICL or TabPFN failure does not hang the full validation job.
-
-Kronos support is included as a feature generator, not as a direct trader:
-
-- `proxy` mode is available immediately and creates causal K-line embedding-like
-  features from lagged OHLCV windows.
-- `official` mode expects the Kronos repository/model import path to provide
-  `model.Kronos` and `model.KronosTokenizer`, plus compatible checkpoint access.
-- `auto` mode uses official Kronos when available and falls back to proxy mode.
-
-Use `zeroalpha model kronos-status` before enabling official Kronos features.
-
-## Data Feeds
-
-ZeroAlpha keeps public no-key feeds in the default repo:
-
-- IBKR Gateway/TWS API: execution truth for contract qualification, live bid/ask,
-  account state, order status, executions, commissions, rejects, and quote
-  recording.
-- Binance public archive: primary deep-history research feed for BTCUSDT plus
-  cross-crypto context such as ETHUSDT, SOLUSDT, and ETHBTC.
-- Coinbase Exchange REST candles: optional BTC-USD reference feed. It is off by
-  default in training/backtest commands and can be enabled explicitly.
-- Kraken public OHLC endpoint/parser: independent source health and validation
-  support.
-- Polymarket/Kalshi BTC prediction-market signals: optional research features
-  from Polymarket Gamma discovery plus production CLOB v2 market-data endpoints,
-  and Kalshi Trade API v2 public market data. These are off by default and can
-  be enabled for recent retraining windows with `--prediction-market-signals`.
-
-API-key feeds such as CoinGlass, paid institutional feeds, and macro/on-chain
-providers are intentionally not part of the default working path. They can be
-added later behind explicit connectors and licensing checks.
-
-## Repository Layout
-
-```text
-configs/                  paper IBKR example config
-src/zeroalpha/backtest/   candidate and model-driven backtests
-src/zeroalpha/broker/     IBKR Gateway adapter, pacing, quote recorder
-src/zeroalpha/candidates/ event generation
-src/zeroalpha/data/       public data clients and data quality gates
-src/zeroalpha/execution/  order intents and decision logic
-src/zeroalpha/features/   engineered and Kronos-compatible features
-src/zeroalpha/labels/     triple-barrier labeler
-src/zeroalpha/models/     dataset builder, ensemble, HPO, sweeps
-src/zeroalpha/risk/       paper/live risk checks
-src/zeroalpha/validation/ purged walk-forward splitting
-docs/                    strategy and performance write-ups
-tests/                    unit and integration-style tests
-```
-
-Generated `data/`, `artifacts/`, logs, caches, and virtual environments are
-ignored by git.
+Paper vs live depends on the IBKR Gateway/TWS session you are signed into. The
+app-level gates are an additional guardrail on top of that.
 
 ## Install
 
-The repo is tested with 64-bit CPython 3.14.4. On this machine:
+Tested with CPython `3.14.4`.
 
 ```bash
-/opt/homebrew/bin/python3.14 --version
 /opt/homebrew/bin/python3.14 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -e ".[broker,data,ml,kronos,dev]"
+.venv/bin/python -m pip install -e ".[all]"
 ```
 
-For a lighter development install without heavy model packages:
+For a smaller local install:
 
 ```bash
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
-Latest-version optional dependency floors are kept in `pyproject.toml`.
+`constraints-py314.txt` records the known-good local verification environment.
 
-## Configure IBKR Paper
+## Configuration
 
-Use `configs/paper.example.toml` as the starting point. The safe defaults are:
+Start with `configs/paper.example.toml` and set:
 
-- runtime mode: `paper`
-- IB Gateway paper port: `4002`
-- TWS paper port, if using TWS instead: `7497`
-- account equity assumption: `$10,000`
-- BTC/USD crypto exchange candidates: `PAXOS`, `ZEROHASH`
-- max open positions: `1`
-- spot crypto instrument model: `long/flat`
+```toml
+[runtime]
+mode = "paper"
 
-IB Gateway must already be authenticated. In Gateway/TWS, enable socket clients
-and disable read-only API only when you are intentionally testing paper orders.
-
-## Verification Commands
-
-Run local tests and lint:
-
-```bash
-.venv/bin/python -m ruff check .
-.venv/bin/python -m pytest -q
+[broker]
+host = "127.0.0.1"
+port = 4002       # Gateway paper. TWS paper is 7497.
+account = "YOUR_PAPER_ACCOUNT"
+read_only = true  # order commands connect with read_only=False after confirmation
 ```
 
-Check public data sources:
+For live-gated operation, use a separate local config with live port `4001` or
+`7496`, explicit live account, and:
 
-```bash
-.venv/bin/python -m zeroalpha.cli data health-check \
-  --cache-dir /tmp/zeroalpha-source-health
+```toml
+[runtime]
+mode = "live"
+enable_live_trading = true
+live_confirmation = "ZEROALPHA_LIVE"
 ```
 
-Check model imports:
+Do not commit real account numbers or local secrets.
 
-```bash
-.venv/bin/python -m zeroalpha.cli model smoke \
-  --models logistic,lightgbm,catboost,xgboost,tabicl,tabpfn
+## Strategy
+
+ZeroAlpha uses a two-stage meta-labeling strategy:
+
+1. Generate candidate long BTC/USD spot trades from completed bars.
+2. Score candidates with a calibrated tabular ensemble trained to predict
+   whether the candidate is net-profitable after IBKR-style commission, spread,
+   slippage, safety margin, and risk constraints.
+
+The production-like baseline keeps the 6h `100/80` style setup, online target
+frequency, planned capacity release, EV/probability selection, and one open spot
+position. `capacity_release_mode=actual` is research-only and requires
+`--research-gate` because it frees capacity using future backtest exit
+knowledge.
+
+## Data Sources
+
+Research feeds:
+
+- Binance spot archives: primary BTCUSDT history and cross-asset context such as
+  ETHUSDT, SOLUSDT, and ETHBTC.
+- Binance USD-M futures: optional BTC/ETH/SOL futures bars, open interest,
+  taker buy/sell flow, funding, and basis context.
+- Coinbase Exchange: optional BTC-USD reference candles and public order-book
+  surfaces.
+- Kraken: source health and independent OHLC validation.
+- Polymarket CLOB v2: BTC up/down discovery plus `/books`, `/midpoints`,
+  `/spreads`, `/prices-history`, and batch price history from
+  `https://clob.polymarket.com`.
+- Kalshi Trade API v2: BTC directional 5m/15m markets when available,
+  orderbooks, trades, candlesticks, and separated ladder/threshold series.
+- IBKR Gateway/TWS: execution truth, account/portfolio/PnL, commissions,
+  executions, top-of-book quotes, historical bars, market depth, and
+  tick-by-tick snapshots where permissions allow.
+
+Prediction-market durations attempted by default:
+
+```text
+5m, 15m, 30m, 45m, 1h, 2h, 4h, 24h
 ```
 
-Check Kronos availability:
+Unsupported or unavailable provider durations are recorded in coverage reports.
+Historical Polymarket price-history snapshots use timestamped prices only; live
+market totals such as current liquidity/open interest are not backfilled into
+past snapshots.
+
+All OHLCV research bars are normalized to completed bar close time before feature
+generation.
+
+## Features And Signals
+
+Core feature families:
+
+| Family | Examples |
+| --- | --- |
+| Momentum/trend | rolling returns, EMA/SMA gaps, breakout slope |
+| Technicals | RSI, MACD-style EMA spread, Bollinger z, ATR/range shock |
+| Volume/order flow | quote volume, VWAP distance, volume surprise, taker imbalance |
+| Microstructure | spread, microprice, top-book imbalance, depth imbalance |
+| Cross-asset | ETH/SOL relative strength, ETHBTC, spot/futures basis |
+| Futures context | Binance UM OI, taker flow, funding, basis, IBKR MBT context |
+| Prediction markets | PM deltas, term structure, side-aligned probability, liquidity weights, platform disagreement |
+| IBKR runtime | live bid/ask, quote age, spread, position/PnL snapshots |
+
+Interpretability:
+
+- `--permutation-importance` computes fold-local grouped permutation importance.
+- `--shap-importance` computes SHAP for supported fitted base models.
+- Native tree/linear importances are reported where available.
+- `net_pnl` permutation importance is labeled `threshold_only_net_pnl` unless a
+  full strategy policy replay is used.
+
+## Models
+
+Implemented model families:
+
+- Logistic regression
+- HistGradientBoosting
+- RandomForest
+- ExtraTrees
+- LightGBM
+- XGBoost
+- CatBoost
+- TabICL / TabPFN when installed and stable
+- Average, best, weighted, or logistic stacker
+- Sigmoid or isotonic probability calibration
+
+HPO is nested inside walk-forward folds with `--hpo`. The objective can be
+`sharpe`, `net_pnl`, or `calmar`; current research optimizes PnL first, Sharpe
+second, and trade count third.
+
+## Command Reference
+
+Local checks:
 
 ```bash
+.venv/bin/python -m zeroalpha.cli config check --config configs/paper.example.toml
+.venv/bin/python -m zeroalpha.cli data health-check --cache-dir /tmp/zeroalpha-source-health
+.venv/bin/python -m zeroalpha.cli model smoke --models logistic,histgb,extratrees,lightgbm,catboost,xgboost
 .venv/bin/python -m zeroalpha.cli model kronos-status
+.venv/bin/python -m zeroalpha.cli db init --path .zeroalpha/zeroalpha.sqlite
+.venv/bin/python -m zeroalpha.cli kill-switch enable --config configs/paper.example.toml
+.venv/bin/python -m zeroalpha.cli kill-switch disable --config configs/paper.example.toml
 ```
 
-Check IBKR paper connectivity without placing orders:
+Data acquisition:
 
 ```bash
-.venv/bin/python -m zeroalpha.cli broker smoke \
-  --config configs/paper.example.toml \
-  --read-only
+.venv/bin/python -m zeroalpha.cli data binance-url --symbol BTCUSDT --interval 1h --month 2026-04
+.venv/bin/python -m zeroalpha.cli broker historical-bars --config configs/paper.example.toml --account YOUR_PAPER_ACCOUNT --duration "2 D" --bar-size "1 min" --what-to-show AGGTRADES --output data/raw/ibkr/historical_btcusd_1m.jsonl
+.venv/bin/python -m zeroalpha.cli broker record-quotes --config configs/paper.example.toml --account YOUR_PAPER_ACCOUNT --duration-seconds 600 --interval-seconds 5 --output data/raw/ibkr/quotes_btcusd.jsonl
 ```
 
-Submit and cancel a tiny paper limit order only after confirming the config is
-paper mode and the port is a paper port:
+Research:
 
 ```bash
-.venv/bin/python -m zeroalpha.cli broker order-test \
+.venv/bin/python -m zeroalpha.cli backtest candidate --config configs/paper.example.toml --years 3 --interval 1h
+
+.venv/bin/python -m zeroalpha.cli backtest ml \
   --config configs/paper.example.toml \
-  --notional 100 \
-  --offset-bps 20 \
-  --wait-seconds 2 \
-  --cancel-wait-seconds 2 \
-  --confirm PAPER_ORDER_TEST
+  --years 3 \
+  --interval 1h \
+  --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
+  --stacker weighted \
+  --hpo \
+  --adaptive-threshold \
+  --candidate-type-thresholds \
+  --empirical-payoff-ev \
+  --target-frequency-mode online \
+  --capacity-release-mode planned \
+  --permutation-importance \
+  --shap-importance \
+  --output artifacts/backtests/ml_btcusdt_1h.json
+
+.venv/bin/python -m zeroalpha.cli model signal-audit \
+  --config configs/paper.example.toml \
+  --interval 15m \
+  --candidate-mode active \
+  --target-trades-per-day 4 \
+  --target-frequency-mode online \
+  --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
+  --permutation-importance \
+  --shap-importance \
+  --output artifacts/models/signal_audit_btcusdt_15m.json
+
+.venv/bin/python -m zeroalpha.cli model sweep-labels \
+  --config configs/paper.example.toml \
+  --net-profit-targets 0.01,0.015,0.02 \
+  --net-stop-losses 0.008,0.012,0.016 \
+  --max-holding-hours-values 4,6,8 \
+  --models logistic,histgb,extratrees,lightgbm
 ```
 
-The order-test command refuses non-paper mode, refuses live ports, and requires
-the explicit confirmation string.
-
-## Research Commands
-
-Train the full meta-label ensemble:
+Train and save a production scoring artifact:
 
 ```bash
 .venv/bin/python -m zeroalpha.cli model train-meta \
   --config configs/paper.example.toml \
   --years 3 \
   --interval 1h \
-  --models logistic,lightgbm,catboost,xgboost,tabicl,tabpfn \
-  --stacker average \
-  --hpo
-```
-
-Run the model-driven strategy backtest:
-
-```bash
-.venv/bin/python -m zeroalpha.cli backtest ml \
-  --config configs/paper.example.toml \
-  --years 3 \
-  --interval 1h \
-  --models logistic,lightgbm,catboost,xgboost \
+  --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
   --stacker weighted \
   --hpo \
-  --adaptive-threshold \
-  --candidate-type-thresholds \
-  --empirical-payoff-ev \
-  --confidence-scaled-sizing \
-  --output artifacts/backtests/ml_btcusdt_1h.json
+  --target-frequency-mode online \
+  --capacity-release-mode planned \
+  --permutation-importance \
+  --shap-importance \
+  --output artifacts/models/meta_label_walk_forward_btcusdt_1h.json \
+  --save-artifact artifacts/models/zeroalpha_spot_btc_prod.joblib
 ```
 
-Research-only short-side evaluation is available, but it remains gated and does
-not change the production BTC/USD spot long/flat safety model:
+Paper broker checks:
 
 ```bash
-.venv/bin/python -m zeroalpha.cli backtest ml \
+.venv/bin/python -m zeroalpha.cli broker smoke \
   --config configs/paper.example.toml \
-  --years 3 \
-  --interval 1h \
-  --models logistic,lightgbm,catboost,xgboost \
-  --stacker weighted \
-  --hpo \
-  --adaptive-threshold \
-  --side-mode long_short \
-  --allow-spot-short-research \
-  --research-gate \
-  --allow-research-short-backtest \
-  --candidate-type-thresholds \
-  --empirical-payoff-ev \
-  --confidence-scaled-sizing \
-  --target-trades-per-day 1 \
-  --output artifacts/backtests/ml_btcusdt_1h_research.json
-```
+  --account YOUR_PAPER_ACCOUNT \
+  --read-only
 
-Enable Coinbase reference candles explicitly when the interval is supported:
-
-```bash
---coinbase-reference-products BTC-USD
-```
-
-Enable Binance USD-M futures reference candles for spot/perp basis and futures
-flow context:
-
-```bash
---binance-um-futures-reference-symbols BTCUSDT,ETHUSDT,SOLUSDT
-```
-
-Enable BTC prediction-market signals from Polymarket and Kalshi:
-
-```bash
---prediction-market-signals \
---prediction-market-durations 5m,15m,30m,1h,2h,4h,24h \
---prediction-market-lookback-days 14
-```
-
-For dense intraday research where the model must take a few trades per day, use
-quota ranking instead of the strict probability/EV gate:
-
-```bash
---candidate-mode dense \
---interval 15m \
---max-holding-hours 2 \
---target-trades-per-day 3 \
---target-frequency-mode quota \
---selection-score probability \
---research-gate \
---allow-negative-ev-frequency-probe \
---max-open-positions 1
-```
-
-If you are studying long/short notional rather than IBKR spot BTC/USD, do that
-on a separate futures research branch and use bracket/stop-capable order intents
-before considering any paper execution:
-
-```bash
---instrument-model futures \
---side-mode long_short \
---risk-per-trade 0.005
-```
-
-Spot crypto stays long/flat on `main`. The futures override is a research
-assumption and is not the default branch strategy.
-
-Polymarket discovery attempts every requested duration but currently active BTC
-short-form markets are mainly 5m, 15m, 1h, and 4h. Kalshi contributes the exact
-15-minute BTC up/down series and hourly BTC ladder signals when available. The
-model report records per-venue coverage and skipped durations. Current Kalshi
-public market discovery did not expose a BTC 5-minute series in testing; 5-minute
-history should be collected continuously from Polymarket CLOB v2 rather than
-reconstructed after the fact.
-
-Enable Kronos proxy features:
-
-```bash
---kronos-features --kronos-mode proxy
-```
-
-Use the rule-only candidate backtest only as a diagnostic baseline:
-
-```bash
-.venv/bin/python -m zeroalpha.cli backtest candidate \
+.venv/bin/python -m zeroalpha.cli broker order-test \
   --config configs/paper.example.toml \
-  --years 3 \
-  --interval 1h
+  --account YOUR_PAPER_ACCOUNT \
+  --notional 100 \
+  --offset-bps 20 \
+  --confirm PAPER_ORDER_TEST
+
+.venv/bin/python -m zeroalpha.cli broker paper-test \
+  --config configs/paper.example.toml \
+  --account YOUR_PAPER_ACCOUNT \
+  --duration-seconds 600 \
+  --interval-seconds 30 \
+  --max-cash-usd 10000 \
+  --max-loss-usd 1000 \
+  --submit-order \
+  --order-notional 100 \
+  --confirm IBKR_PAPER_TEST
+
+.venv/bin/python -m zeroalpha.cli broker round-trip-test \
+  --config configs/paper.example.toml \
+  --account YOUR_PAPER_ACCOUNT \
+  --notional 100 \
+  --hold-seconds 10 \
+  --synthetic-stop-loss-bps 100 \
+  --max-cash-usd 10000 \
+  --max-loss-usd 1000 \
+  --confirm IBKR_ROUND_TRIP_TEST
 ```
 
-## Backtesting Guarantees And Limits
-
-Implemented:
-
-- second-level holding-horizon plumbing through `--max-holding-seconds`
-- timestamp-based holding horizons for 1m, 1h, and 4h bars
-- triple-barrier labels with conservative same-bar handling
-- per-notional IBKR-style commission model
-- spread, slippage, and safety-margin attribution
-- conservative bar-level limit-fill simulation
-- missed-fill reporting
-- exit replay from the actual simulated fill timestamp and price
-- max one BTC position
-- fee-efficient notional rejection
-- equity-based sizing
-- daily, weekly, drawdown, and cooldown controls
-- spot-short rejection for the spot crypto instrument model
-- calibrated probability and EV gates
-
-Not implemented for production claims:
-
-- sub-minute or 1-second order-book replay from tick/L2 data
-- queue position, partial queue depletion, and venue-specific maker/taker fill
-  modeling
-- latency-sensitive cancel/replace replay
-- autonomous paper trading daemon
-- live trading promotion workflow
-
-Any sub-minute or many-trades-per-day result should be treated as invalid until
-tick or L2 replay exists.
-
-## Trading Gate
-
-Do not start autonomous paper trading until a model-driven backtest:
-
-- beats no-trade, buy-and-hold reference, simple rule baselines, and logistic
-  regression after full costs
-- survives 2x cost stress
-- has acceptable calibration by fold and candidate type
-- has enough trades to be meaningful
-- does not rely on impossible fills
-- keeps drawdown inside paper limits
-- passes IBKR restart, reconnect, order reject, cancel, and reconciliation tests
-- is regenerated from clean `data/` and `artifacts/` directories
-
-Do not start live trading until paper and shadow-live operation prove that IBKR
-spreads, fill behavior, rejects, quote age, and reconciliation match the
-backtest assumptions.
-
-## Housekeeping
-
-Generated research data and reports are intentionally ignored by git:
+Autonomous paper trading example requested for this release:
 
 ```bash
-rm -rf data artifacts logs .zeroalpha .pytest_cache .ruff_cache
-find src tests -type d -name __pycache__ -prune -exec rm -rf {} +
+.venv/bin/python -m zeroalpha.cli broker trade-run \
+  --config configs/paper.example.toml \
+  --account YOUR_PAPER_ACCOUNT \
+  --model-artifact artifacts/models/zeroalpha_spot_btc_prod.joblib \
+  --capital-usd 5000 \
+  --max-loss-usd 250 \
+  --max-order-notional-usd 5000 \
+  --duration-seconds 600 \
+  --signal-interval 60 \
+  --history-what-to-show AGGTRADES \
+  --max-signal-bar-age-seconds 300 \
+  --stream-format json \
+  --event-log data/raw/ibkr/trade_run_events.jsonl \
+  --state-log data/raw/ibkr/trade_run_state.jsonl \
+  --confirm IBKR_PAPER_TRADE_RUN
 ```
 
-The repository should remain reproducible from source, config, and the commands
-above. Do not commit virtual environments, downloaded candles, backtest JSON
-artifacts, broker logs, or local kill-switch state.
+Live-gated example. This will only work with a live config, live Gateway/TWS
+session, live port, explicit account, and both live confirmation strings:
+
+```bash
+.venv/bin/python -m zeroalpha.cli broker trade-run \
+  --config configs/live.local.toml \
+  --account YOUR_LIVE_ACCOUNT \
+  --model-artifact artifacts/models/zeroalpha_spot_btc_prod.joblib \
+  --capital-usd 5000 \
+  --max-loss-usd 250 \
+  --max-order-notional-usd 1000 \
+  --duration-seconds 600 \
+  --signal-interval 60 \
+  --history-what-to-show AGGTRADES \
+  --max-signal-bar-age-seconds 300 \
+  --stream-format json \
+  --event-log data/raw/ibkr/live_trade_run_events.jsonl \
+  --state-log data/raw/ibkr/live_trade_run_state.jsonl \
+  --confirm ZEROALPHA_LIVE_TRADE_RUN
+```
+
+## Operational Checklist
+
+Before paper trade-run:
+
+- Gateway/TWS is signed into paper trading.
+- API socket is enabled.
+- Config mode is `paper`.
+- Port is `4002` for Gateway paper or `7497` for TWS paper.
+- `broker.account` or `--account` is set and appears in `managedAccounts()`.
+- `ruff`, `pytest`, `pip check`, `data health-check`, `model smoke`, and
+  `broker smoke` pass.
+- A fresh model artifact and manifest exist.
+- `kill-switch` is disabled before starting and can be enabled to stop the bot.
+- `--max-loss-usd`, `--capital-usd`, and `--max-order-notional-usd` are set.
+- Runtime events are streamed and written to JSONL.
+
+Before live-gated trade-run:
+
+- Paper run has already passed with TWS execution, commission, and PnL
+  reconciliation.
+- Gateway/TWS is intentionally signed into live.
+- Config mode is `live`, port is `4001` or `7496`, and live config flags are set.
+- Live notional is smaller than paper verification size.
+- You accept that this is still experimental trading software.
+
+## Verification
+
+```bash
+.venv/bin/python -m pip check
+.venv/bin/python -m ruff check .
+.venv/bin/python -m pytest -q
+.venv/bin/python -m zeroalpha.cli data health-check
+.venv/bin/python -m zeroalpha.cli model smoke
+.venv/bin/python -m zeroalpha.cli broker smoke --config configs/paper.example.toml --account YOUR_PAPER_ACCOUNT --read-only
+git diff --check
+```
+
+## Repository Layout
+
+```text
+configs/                  local config templates
+src/zeroalpha/backtest/   candidate and model backtests
+src/zeroalpha/broker/     IBKR Gateway/TWS adapter and quote recorder
+src/zeroalpha/candidates/ event generation
+src/zeroalpha/data/       data clients and quality checks
+src/zeroalpha/execution/  order intents and synthetic stops
+src/zeroalpha/features/   engineered features
+src/zeroalpha/labels/     triple-barrier labels
+src/zeroalpha/models/     dataset, ensemble, artifact, interpretability, HPO
+src/zeroalpha/monitoring/ runtime event streaming
+src/zeroalpha/risk/       risk primitives
+tests/                    unit and integration-style tests
+```
+
+Generated `data/`, `artifacts/`, logs, caches, and virtual environments are not
+source artifacts and should stay out of git.
 
 ## License
 
-MIT. See `LICENSE`.
+Private proprietary code. `LicenseRef-Proprietary`. No open-source license is
+granted.

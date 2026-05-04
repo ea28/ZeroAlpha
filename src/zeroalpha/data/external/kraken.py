@@ -17,9 +17,11 @@ def parse_ohlcvt_csv(text: str, *, symbol: str, interval_minutes: int) -> list[B
     for fields in reader:
         if not fields or fields[0].lower() in {"time", "timestamp"}:
             continue
+        bar_start = parse_unix_timestamp(int(fields[0]))
+        bar_close = bar_start + timedelta(minutes=interval_minutes)
         bars.append(
             Bar(
-                timestamp_utc=parse_unix_timestamp(int(fields[0])),
+                timestamp_utc=bar_close,
                 symbol=symbol,
                 bar_size=f"{interval_minutes}m",
                 open=float(fields[1]),
@@ -29,6 +31,10 @@ def parse_ohlcvt_csv(text: str, *, symbol: str, interval_minutes: int) -> list[B
                 volume=float(fields[5]),
                 trade_count=int(float(fields[6])) if len(fields) > 6 and fields[6] else None,
                 source="KRAKEN",
+                extra={
+                    "bar_start_timestamp_utc": bar_start.isoformat(),
+                    "bar_close_timestamp_utc": bar_close.isoformat(),
+                },
             )
         )
     return bars

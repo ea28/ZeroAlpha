@@ -111,6 +111,9 @@ def run_label_geometry_sweep(
     max_holding_hours_values: list[int],
     model_names: list[str],
     starting_equity: float = 10_000.0,
+    prediction_market_feature_profile: str = "full",
+    feature_asof: str = "entry",
+    external_feature_latency_seconds: float = 0.0,
     adaptive_threshold: bool = True,
     stacker_mode: str = "average",
     adaptive_minimum_threshold: float = 0.0,
@@ -128,6 +131,7 @@ def run_label_geometry_sweep(
     selection_score_mode: str = "expected_value",
     target_frequency_mode: str = "strict",
     selection_score_floor: float | None = None,
+    adaptive_selection_score_floor: bool = False,
     specialist_models: bool = False,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
@@ -137,6 +141,7 @@ def run_label_geometry_sweep(
     hpo_profile: str = "standard",
     hpo_trials: int = 0,
     futures_market_quotes: Sequence[MarketQuote] | None = None,
+    capacity_release_mode: str = "planned",
 ) -> list[LabelSweepResult]:
     results: list[LabelSweepResult] = []
     for max_holding_hours in max_holding_hours_values:
@@ -160,6 +165,9 @@ def run_label_geometry_sweep(
                     market_quotes=market_quotes,
                     futures_market_quotes=futures_market_quotes,
                     prediction_market_snapshots=prediction_market_snapshots,
+                    prediction_market_feature_profile=prediction_market_feature_profile,
+                    feature_asof=feature_asof,
+                    external_feature_latency_seconds=external_feature_latency_seconds,
                     candidate_config=CandidateGenerationConfig(
                         max_holding_hours=max_holding_hours,
                         side_mode=candidate_side_mode,
@@ -184,6 +192,7 @@ def run_label_geometry_sweep(
                     selection_score_mode=selection_score_mode,
                     target_frequency_mode=target_frequency_mode,
                     selection_score_floor=selection_score_floor,
+                    adaptive_selection_score_floor=adaptive_selection_score_floor,
                     specialist_models=specialist_models,
                     require_calibrated_selection=require_calibrated_selection,
                     min_signal_spacing_hours=min_signal_spacing_hours,
@@ -192,6 +201,8 @@ def run_label_geometry_sweep(
                     tune_hyperparameters=tune_hyperparameters,
                     hpo_profile=hpo_profile,
                     hpo_trials=hpo_trials,
+                    capacity_release_mode=capacity_release_mode,
+                    optimize_metric=optimize_metric,
                 )
                 backtest_summary, _, _ = run_ml_backtest(
                     report=report,

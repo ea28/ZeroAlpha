@@ -52,6 +52,8 @@ class CostConfig:
     maximum_commission_rate: float = 0.01
     base_slippage_bps: float = 5.0
     safety_margin_bps: float = 10.0
+    futures_fee_per_contract: float = 0.0
+    futures_contract_multiplier: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +157,8 @@ class AppConfig:
             raise ConfigError("v1 only supports USD crypto contracts")
         if self.contract.instrument_model not in {"spot_crypto", "futures"}:
             raise ConfigError("contract instrument_model must be spot_crypto or futures")
+        if self.broker.market_data_type not in {"live", "frozen", "delayed", "delayed_frozen", "delayed-frozen"}:
+            raise ConfigError("broker market_data_type must be live, frozen, delayed, or delayed_frozen")
         if not self.broker.crypto_exchanges:
             raise ConfigError("at least one crypto exchange candidate is required")
         if self.risk.max_open_positions < 1:
@@ -163,6 +167,12 @@ class AppConfig:
             raise ConfigError("spot crypto mode supports max_open_positions = 1")
         if self.cost.tier_rate <= 0 or self.cost.minimum_commission < 0:
             raise ConfigError("invalid cost settings")
+        if self.cost.futures_fee_per_contract < 0 or self.cost.futures_contract_multiplier < 0:
+            raise ConfigError("invalid futures cost settings")
+        if (self.cost.futures_fee_per_contract > 0) != (self.cost.futures_contract_multiplier > 0):
+            raise ConfigError(
+                "futures_fee_per_contract and futures_contract_multiplier must be set together"
+            )
         if self.labels.net_profit_target <= 0 or self.labels.net_stop_loss <= 0:
             raise ConfigError("label net target and stop must be positive")
         if self.labels.max_holding_seconds is not None and self.labels.max_holding_seconds <= 0:

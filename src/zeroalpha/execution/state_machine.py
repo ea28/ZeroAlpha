@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from zeroalpha.domain import BotState
+from zeroalpha.monitoring.events import RuntimeEventStream
 
 
 ALLOWED_TRANSITIONS: dict[BotState, set[BotState]] = {
@@ -24,8 +25,18 @@ ALLOWED_TRANSITIONS: dict[BotState, set[BotState]] = {
 @dataclass(slots=True)
 class StateMachine:
     state: BotState = BotState.INITIALIZING
+    events: RuntimeEventStream | None = None
 
-    def transition(self, new_state: BotState) -> None:
+    def transition(self, new_state: BotState, *, reason: str = "") -> None:
         if new_state not in ALLOWED_TRANSITIONS[self.state]:
             raise ValueError(f"invalid transition {self.state.value} -> {new_state.value}")
+        old_state = self.state
         self.state = new_state
+        if self.events is not None:
+            self.events.emit(
+                "bot.state_transition",
+                "bot state changed",
+                from_state=old_state.value,
+                to_state=new_state.value,
+                reason=reason,
+            )

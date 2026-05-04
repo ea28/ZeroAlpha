@@ -1,7 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from zeroalpha.config import AppConfig, LabelConfig
 from zeroalpha.domain import Bar, CandidateEvent, Side
 from zeroalpha.labels.triple_barrier import label_long_event
+from zeroalpha.models.dataset import build_meta_label_samples
 
 
 def _event(start: datetime, *, hours: int = 72) -> CandidateEvent:
@@ -49,6 +53,18 @@ def test_candidate_event_accepts_second_level_holding_period() -> None:
 
     assert event.max_holding_period == timedelta(seconds=1)
     assert event.vertical_barrier_timestamp_utc == start + timedelta(seconds=1)
+
+
+def test_meta_label_dataset_rejects_sub_bar_holding_horizon() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    bars = [_bar(start + timedelta(minutes=i), bar_size="1m") for i in range(300)]
+
+    with pytest.raises(ValueError, match="shorter than the input bar interval"):
+        build_meta_label_samples(
+            bars,
+            config=AppConfig(labels=LabelConfig(max_holding_seconds=1.0)),
+            assumed_spread_bps=1.0,
+        )
 
 
 def test_label_horizon_uses_elapsed_time_for_1m_bars_not_row_count() -> None:

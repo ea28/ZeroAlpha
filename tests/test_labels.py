@@ -106,9 +106,35 @@ def test_label_geometry_warns_when_gross_stop_is_tiny_after_costs() -> None:
     )
 
     assert round(diagnostics.round_trip_cost_bps, 1) == 76.0
+    assert round(diagnostics.round_trip_commission_bps, 1) == 36.0
+    assert round(diagnostics.spread_bps, 1) == 10.0
+    assert round(diagnostics.slippage_bps, 1) == 20.0
+    assert round(diagnostics.safety_margin_bps, 1) == 10.0
     assert round(diagnostics.gross_profit_move, 4) == 0.0176
     assert round(diagnostics.gross_stop_distance, 4) == 0.0024
     assert diagnostics.warning == "gross_stop_distance_below_50_bps"
+
+
+def test_label_geometry_supports_per_contract_futures_costs() -> None:
+    diagnostics = label_geometry_diagnostics(
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.01, net_stop_loss=0.01),
+            cost=CostConfig(
+                tier_rate=0.0018,
+                minimum_commission=1.75,
+                base_slippage_bps=0.25,
+                safety_margin_bps=1.0,
+                futures_fee_per_contract=2.02,
+                futures_contract_multiplier=0.1,
+            ),
+        ),
+        assumed_spread_bps=0.5,
+        research_notional=10_000,
+        reference_price=100_000,
+    )
+
+    assert round(diagnostics.round_trip_commission_bps, 2) == 4.04
+    assert round(diagnostics.round_trip_cost_bps, 2) == 6.54
 
 
 def test_short_triple_barrier_targets_explicit_net_outcomes() -> None:

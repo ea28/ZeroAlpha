@@ -68,11 +68,24 @@ def estimate_round_trip_cost(
     slippage_model: SlippageModel,
     safety_margin_bps: float,
     volatility_bps: float = 0.0,
+    futures_fee_per_contract: float = 0.0,
+    futures_contract_multiplier: float = 0.0,
+    reference_price: float | None = None,
 ) -> RoundTripCost:
     if safety_margin_bps < 0:
         raise ValueError("safety_margin_bps must be nonnegative")
+    commission_bps = commission_model.round_trip_commission_bps(trade_notional)
+    if futures_fee_per_contract > 0 or futures_contract_multiplier > 0:
+        if futures_fee_per_contract <= 0:
+            raise ValueError("futures_fee_per_contract must be positive when futures fees are enabled")
+        if futures_contract_multiplier <= 0:
+            raise ValueError("futures_contract_multiplier must be positive when futures fees are enabled")
+        if reference_price is None or reference_price <= 0:
+            raise ValueError("reference_price must be positive when futures fees are enabled")
+        contract_notional = reference_price * futures_contract_multiplier
+        commission_bps = 10_000 * (2 * futures_fee_per_contract) / contract_notional
     return RoundTripCost(
-        commission_bps=commission_model.round_trip_commission_bps(trade_notional),
+        commission_bps=commission_bps,
         # ``spread_bps`` is measured as ask-bid over midpoint. Crossing into and
         # out of a position pays half the spread on each leg, or one full spread
         # round trip.

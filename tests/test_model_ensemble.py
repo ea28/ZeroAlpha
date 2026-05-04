@@ -3,9 +3,15 @@ from dataclasses import replace
 
 import pytest
 
-from zeroalpha.config import AppConfig, LabelConfig, ModelConfig
+from zeroalpha.config import AppConfig, LabelConfig, ModelConfig, RiskConfig
 from zeroalpha.domain import TripleBarrierLabel
 from zeroalpha.models.dataset import MetaLabelSample
+from zeroalpha.models.artifact import (
+    fit_production_model_artifact,
+    load_production_model_artifact,
+    save_production_model_artifact,
+    score_production_artifact,
+)
 from zeroalpha.models.ensemble import (
     FeatureEncoder,
     ProbabilityCalibrator,
@@ -13,12 +19,17 @@ from zeroalpha.models.ensemble import (
     _expected_value,
     _hpo_grid,
     _limit_hpo_grid,
+    _online_threshold_frequency_returns,
     _payoff_estimate,
     _quota_frequency_returns,
     _select_candidate_type_thresholds,
+    _select_selection_score_floor_for_target_frequency,
     _select_target_frequency_event_ids,
     _split_calibration_samples,
     default_fold_sizes,
+    report_feature_importance_summary,
+    report_native_importance_summary,
+    report_shap_importance_summary,
     run_meta_label_walk_forward,
 )
 
@@ -82,6 +93,194 @@ def test_meta_label_walk_forward_trains_logistic_stack() -> None:
     assert report.folds
     assert any("logistic" in fold.fitted_models for fold in report.folds)
     assert report.predictions
+
+
+def test_meta_label_walk_forward_reports_fold_local_permutation_importance() -> None:
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.55, minimum_expected_value=0.0),
+    )
+    report = run_meta_label_walk_forward(
+        [_sample(i) for i in range(120)],
+        config=config,
+        model_names=["logistic"],
+        train_size=50,
+        calibration_size=20,
+        test_size=20,
+        embargo_hours=24,
+        permutation_importance=True,
+        permutation_repeats=2,
+        permutation_max_features=5,
+        permutation_sample_limit=20,
+        interpretability_top_n=3,
+        importance_scoring=("brier", "log_loss", "net_pnl"),
+        permutation_grouping="both",
+    )
+
+    rows = [row for fold in report.folds for row in fold.permutation_importance]
+
+    assert rows
+    assert {row.scope for row in rows} >= {"base_model", "final_ensemble"}
+    assert all(row.sample_count <= 20 for row in rows)
+    assert all(row.rank <= 3 for row in rows)
+    assert any(row.feature.startswith("family:") for row in rows)
+    assert any(row.metric == "threshold_only_net_pnl" for row in rows)
+    assert any(
+        "threshold_only" in warning
+        for fold in report.folds
+        for warning in fold.interpretability_warnings
+    )
+    assert report_feature_importance_summary(report)
+    assert report_native_importance_summary(report)
+
+
+def test_meta_label_walk_forward_reports_fold_local_shap_importance() -> None:
+    pytest.importorskip("shap")
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.55, minimum_expected_value=0.0),
+    )
+    report = run_meta_label_walk_forward(
+        [_sample(i) for i in range(120)],
+        config=config,
+        model_names=["extratrees"],
+        train_size=50,
+        calibration_size=20,
+        test_size=20,
+        embargo_hours=24,
+        shap_importance=True,
+        shap_sample_limit=12,
+        shap_background_limit=20,
+        shap_top_n=4,
+        shap_grouping="both",
+    )
+
+    rows = [row for fold in report.folds for row in fold.shap_importance]
+
+    assert rows
+    assert all(row.sample_count <= 12 for row in rows)
+    assert all(row.background_count <= 20 for row in rows)
+    assert any(row.feature.startswith("family:") for row in rows)
+    assert report_shap_importance_summary(report)
+
+
+def test_production_model_artifact_can_be_saved_loaded_and_scored(tmp_path) -> None:
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.55, minimum_expected_value=0.0),
+    )
+    samples = [_sample(i) for i in range(120)]
+    report = run_meta_label_walk_forward(
+        samples,
+        config=config,
+        model_names=["logistic"],
+        train_size=50,
+        calibration_size=20,
+        test_size=20,
+        embargo_hours=24,
+    )
+    artifact = fit_production_model_artifact(
+        samples,
+        config=config,
+        report=report,
+        model_names=["logistic"],
+        stacker_mode="average",
+        tune_hyperparameters=False,
+        hpo_profile="standard",
+        hpo_trials=0,
+        foundation_max_samples=128,
+        target_trades_per_day=None,
+        target_frequency_mode="online",
+        allow_negative_ev_target_frequency=False,
+        selection_score_mode="expected_value",
+        selection_score_floor=None,
+        adaptive_selection_score_floor=False,
+        min_signal_spacing_hours=0.0,
+        max_signals_per_group_per_day=0,
+        max_signals_per_timestamp=0,
+        respect_open_positions=False,
+        capacity_release_mode="planned",
+        optimize_metric="sharpe",
+    )
+    path = tmp_path / "prod.joblib"
+
+    checksum = save_production_model_artifact(path, artifact)
+    loaded = load_production_model_artifact(path)
+    score = score_production_artifact(loaded, samples[-1].features)
+
+    assert checksum
+    assert path.exists()
+    assert path.with_suffix(".joblib.manifest.json").exists()
+    assert loaded.base_models[0].name == "logistic"
+    assert loaded.selected_threshold >= config.model.minimum_probability
+    assert 0.0 <= score.probability <= 1.0
+    assert score.feature_count == len(loaded.feature_names)
+
+
+def test_meta_label_walk_forward_can_prune_feature_families() -> None:
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.55, minimum_expected_value=0.0),
+    )
+    samples = [
+        replace(
+            _sample(i),
+            features={
+                **_sample(i).features,
+                "rsi_14": float(i % 100),
+                "ibkrmbt_value": float(i),
+            },
+        )
+        for i in range(120)
+    ]
+
+    report = run_meta_label_walk_forward(
+        samples,
+        config=config,
+        model_names=["logistic"],
+        train_size=50,
+        calibration_size=20,
+        test_size=20,
+        embargo_hours=24,
+        feature_exclude_families=("technical",),
+    )
+
+    assert "rsi_14" not in report.feature_names
+    assert "ibkrmbt_value" in report.feature_names
+    assert report.data_coverage["feature_family_filter"]["exclude_families"] == ["technical"]
+
+
+def test_meta_label_walk_forward_can_prune_feature_patterns() -> None:
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.55, minimum_expected_value=0.0),
+    )
+    samples = [
+        replace(
+            _sample(i),
+            features={
+                **_sample(i).features,
+                "rsi_14": float(i % 100),
+                "sma_distance_8": float(i) / 100,
+            },
+        )
+        for i in range(120)
+    ]
+
+    report = run_meta_label_walk_forward(
+        samples,
+        config=config,
+        model_names=["logistic"],
+        train_size=50,
+        calibration_size=20,
+        test_size=20,
+        embargo_hours=24,
+        feature_exclude_patterns=("rsi_*",),
+    )
+
+    assert "rsi_14" not in report.feature_names
+    assert "sma_distance_8" in report.feature_names
+    assert report.data_coverage["feature_family_filter"]["exclude_patterns"] == ["rsi_*"]
 
 
 def test_feature_encoder_marks_unseen_categorical_values() -> None:
@@ -487,6 +686,183 @@ def test_quota_target_frequency_can_rank_below_static_probability_and_ev_gates()
     assert selected == {"strong-rank"}
 
 
+def test_online_target_frequency_selects_chronologically_without_future_rank() -> None:
+    early = replace(_sample(0), event_id="early")
+    later = replace(_sample(1), event_id="later")
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[early, later],
+        probabilities=[0.55, 0.95],
+        predicted_returns=[0.01, 0.05],
+        target_trades_per_day=1,
+        selected_threshold=0.50,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.50, minimum_expected_value=0.0),
+        ),
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+    )
+
+    assert selected == {"early"}
+
+
+def test_online_target_frequency_respects_selection_score_floor() -> None:
+    early = replace(_sample(0), event_id="early")
+    later = replace(_sample(1), event_id="later")
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[early, later],
+        probabilities=[0.55, 0.80],
+        predicted_returns=[0.01, 0.05],
+        target_trades_per_day=1,
+        selected_threshold=0.50,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.50, minimum_expected_value=0.0),
+        ),
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+        selection_score_floor=0.70,
+    )
+
+    assert selected == {"later"}
+
+
+def test_online_target_frequency_can_respect_open_position_capacity() -> None:
+    samples = [replace(_sample(i), event_id=f"s{i}") for i in range(8)]
+    selected = _select_target_frequency_event_ids(
+        test_samples=samples,
+        probabilities=[0.80 for _ in samples],
+        target_trades_per_day=8,
+        selected_threshold=0.50,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.50, minimum_expected_value=0.0),
+        ),
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+        respect_open_positions=True,
+    )
+
+    assert selected == {"s0"}
+
+
+def test_online_capacity_can_release_at_actual_exit() -> None:
+    first_ts = datetime(2024, 1, 1, 0, tzinfo=UTC)
+    second_ts = datetime(2024, 1, 1, 3, tzinfo=UTC)
+    first_detail = replace(
+        _sample(0).label_detail,
+        entry_timestamp_utc=first_ts,
+        exit_timestamp_utc=first_ts + timedelta(hours=2),
+        vertical_barrier_timestamp_utc=first_ts + timedelta(hours=6),
+        t1=first_ts + timedelta(hours=2),
+    )
+    second_detail = replace(
+        _sample(1).label_detail,
+        entry_timestamp_utc=second_ts,
+        exit_timestamp_utc=second_ts + timedelta(hours=2),
+        vertical_barrier_timestamp_utc=second_ts + timedelta(hours=6),
+        t1=second_ts + timedelta(hours=2),
+    )
+    first = replace(_sample(0), event_id="first", timestamp_utc=first_ts, label_detail=first_detail)
+    second = replace(_sample(1), event_id="second", timestamp_utc=second_ts, label_detail=second_detail)
+    config = AppConfig(
+        labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+        model=ModelConfig(minimum_probability=0.50, minimum_expected_value=0.0),
+        risk=RiskConfig(max_open_positions=1),
+    )
+
+    planned = _select_target_frequency_event_ids(
+        test_samples=[first, second],
+        probabilities=[0.80, 0.80],
+        target_trades_per_day=2,
+        selected_threshold=0.50,
+        config=config,
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+        respect_open_positions=True,
+    )
+    actual = _select_target_frequency_event_ids(
+        test_samples=[first, second],
+        probabilities=[0.80, 0.80],
+        target_trades_per_day=2,
+        selected_threshold=0.50,
+        config=config,
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+        respect_open_positions=True,
+        capacity_release_mode="actual",
+    )
+
+    assert planned == {"first"}
+    assert actual == {"first", "second"}
+
+
+def test_online_position_capacity_carries_across_days() -> None:
+    first_ts = datetime(2024, 1, 1, 23, tzinfo=UTC)
+    second_ts = datetime(2024, 1, 2, 1, tzinfo=UTC)
+    first_detail = replace(
+        _sample(0).label_detail,
+        entry_timestamp_utc=first_ts,
+        vertical_barrier_timestamp_utc=first_ts + timedelta(hours=12),
+    )
+    second_detail = replace(
+        _sample(1).label_detail,
+        entry_timestamp_utc=second_ts,
+        vertical_barrier_timestamp_utc=second_ts + timedelta(hours=12),
+    )
+    first = replace(_sample(0), event_id="first", timestamp_utc=first_ts, label_detail=first_detail)
+    second = replace(_sample(1), event_id="second", timestamp_utc=second_ts, label_detail=second_detail)
+
+    selected = _select_target_frequency_event_ids(
+        test_samples=[first, second],
+        probabilities=[0.80, 0.80],
+        target_trades_per_day=1,
+        selected_threshold=0.50,
+        config=AppConfig(
+            labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02),
+            model=ModelConfig(minimum_probability=0.50, minimum_expected_value=0.0),
+        ),
+        allow_negative_ev=False,
+        selection_score_mode="probability",
+        target_frequency_mode="online",
+        respect_open_positions=True,
+    )
+
+    assert selected == {"first"}
+
+
+def test_adaptive_selection_score_floor_targets_turnover_without_future_rank() -> None:
+    samples = [
+        replace(_sample(i), event_id=f"s{i}", net_return=0.02 if i < 2 else -0.02)
+        for i in range(4)
+    ]
+    samples[-1] = replace(samples[-1], timestamp_utc=samples[0].timestamp_utc + timedelta(days=1))
+
+    row = _select_selection_score_floor_for_target_frequency(
+        calibration_samples=samples,
+        probabilities=[0.80, 0.80, 0.80, 0.80],
+        predicted_returns=[0.05, 0.04, 0.01, -0.02],
+        target_trades_per_day=2,
+        selected_threshold=0.50,
+        config=AppConfig(labels=LabelConfig(net_profit_target=0.02, net_stop_loss=0.02)),
+        allow_negative_ev=True,
+        selection_score_mode="predicted_return",
+        target_frequency_mode="online",
+    )
+
+    assert row is not None
+    assert row.threshold == pytest.approx(0.04)
+    assert row.traded_signals == 2
+    assert row.average_trade_return == pytest.approx(0.02)
+
+
 def test_quota_target_frequency_respects_selection_score_floor() -> None:
     sample = replace(_sample(0), event_id="negative-rank")
 
@@ -661,11 +1037,13 @@ def test_wide_hpo_profile_adds_regularized_model_candidates() -> None:
     lightgbm_deep = _hpo_grid("lightgbm", profile="deep")
     lightgbm_wide = _hpo_grid("lightgbm", profile="wide")
     lightgbm_quota = _hpo_grid("lightgbm", profile="quota")
+    lightgbm_capacity = _hpo_grid("lightgbm", profile="capacity")
     histgb_wide = _hpo_grid("histgb", profile="wide")
     forest_wide = _hpo_grid("extratrees", profile="wide")
 
     assert len(lightgbm_wide) > len(lightgbm_deep)
     assert lightgbm_quota == lightgbm_wide
+    assert lightgbm_capacity == lightgbm_wide
     assert any("reg_alpha" in params for params in lightgbm_wide)
     assert any(params.get("min_samples_leaf", 0) >= 60 for params in histgb_wide)
     assert any(params.get("bootstrap") is True for params in forest_wide)
@@ -703,6 +1081,73 @@ def test_quota_frequency_returns_match_spaced_daily_selection() -> None:
     )
 
     assert returns == [0.02, 0.02]
+
+
+def test_online_threshold_frequency_returns_can_respect_capacity() -> None:
+    samples = []
+    for i in range(4):
+        base_sample = _sample(i)
+        net_return = 0.009 if i in {0, 3} else -0.009
+        label = 1 if i in {0, 3} else 0
+        detail = replace(
+            base_sample.label_detail,
+            vertical_barrier_timestamp_utc=base_sample.timestamp_utc + timedelta(hours=3),
+            exit_timestamp_utc=base_sample.timestamp_utc + timedelta(hours=3),
+            t1=base_sample.timestamp_utc + timedelta(hours=3),
+            outcome_type="upper" if label else "lower",
+            gross_return=net_return,
+            net_return=net_return,
+            label=label,
+        )
+        samples.append(
+            replace(
+                base_sample,
+                t1=detail.t1,
+                label_detail=detail,
+                net_return=net_return,
+                label=label,
+                outcome_type=detail.outcome_type,
+            )
+        )
+
+    returns = _online_threshold_frequency_returns(
+        samples=samples,
+        scores=[0.90, 0.89, 0.80, 0.88],
+        target_trades_per_day=4,
+        config=AppConfig(),
+        respect_open_positions=True,
+    )
+
+    assert sorted(returns) == [0.009, 0.009]
+
+
+def test_online_threshold_frequency_returns_can_use_expected_value_floor() -> None:
+    base = _sample(0)
+    low_ev = replace(
+        base,
+        event_id="low-ev",
+        net_profit_target=0.001,
+        net_stop_loss=0.02,
+        net_return=-0.01,
+    )
+    high_ev = replace(
+        base,
+        event_id="high-ev",
+        net_profit_target=0.03,
+        net_stop_loss=0.005,
+        net_return=0.02,
+    )
+
+    returns = _online_threshold_frequency_returns(
+        samples=[low_ev, high_ev],
+        scores=[0.60, 0.60],
+        target_trades_per_day=1,
+        config=AppConfig(),
+        selection_score_mode="expected_value",
+        selection_score_floor=0.005,
+    )
+
+    assert returns == [0.02]
 
 
 def test_default_fold_sizes_cover_more_walk_forward_windows_for_large_datasets() -> None:

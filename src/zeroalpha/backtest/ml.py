@@ -5,7 +5,7 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from math import sqrt
+from math import floor, sqrt
 from pathlib import Path
 from statistics import mean, pstdev
 import json
@@ -21,7 +21,14 @@ from zeroalpha.config import AppConfig
 from zeroalpha.costs import CommissionModel, SlippageModel, estimate_round_trip_cost
 from zeroalpha.domain import Bar, Side
 from zeroalpha.models.dataset import MetaLabelSample
-from zeroalpha.models.ensemble import FoldPrediction, MetaLabelWalkForwardReport
+from zeroalpha.models.ensemble import (
+    FoldPrediction,
+    MetaLabelWalkForwardReport,
+    report_feature_importance_summary,
+    report_model_family_summary,
+    report_native_importance_summary,
+    report_shap_importance_summary,
+)
 from zeroalpha.timeutils import ensure_utc
 
 
@@ -33,7 +40,13 @@ class MLBacktestTrade:
     candidate_type: str
     probability: float
     expected_value: float
+    predicted_return: float
+    predicted_downside: float
+    selection_score: float
     notional: float
+    requested_notional: float
+    notional_scale: float
+    sizing_mode: str
     gross_return: float
     net_return: float
     gross_pnl: float
@@ -50,6 +63,7 @@ class MLBacktestTrade:
     slippage_cost_estimate: float
     safety_margin_estimate: float
     side: str = ""
+    exit_overlay_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +118,7 @@ class ReplayedExit:
     outcome_type: str
     gross_return: float
     net_return: float
+    overlay_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +129,13 @@ class PendingMLBacktestTrade:
     candidate_type: str
     probability: float
     expected_value: float
+    predicted_return: float
+    predicted_downside: float
+    selection_score: float
     notional: float
+    requested_notional: float
+    notional_scale: float
+    sizing_mode: str
     gross_return: float
     net_return: float
     gross_pnl: float
@@ -130,6 +151,7 @@ class PendingMLBacktestTrade:
     slippage_cost_estimate: float
     safety_margin_estimate: float
     side: str = ""
+    exit_overlay_reason: str = ""
 
 
 def _prediction_timestamp(prediction: FoldPrediction) -> datetime:
@@ -253,6 +275,110 @@ def _replay_exit_from_fill(
     )
 
 
+def _side_gross_return(side: Side, *, entry_price: float, exit_price: float) -> float:
+    if side == Side.SELL:
+        return (entry_price - exit_price) / entry_price
+    return exit_price / entry_price - 1
+
+
+def _bar_side_extreme_return(side: Side, *, entry_price: float, bar: Bar) -> tuple[float, float]:
+    if side == Side.SELL:
+        favorable = (entry_price - bar.low) / entry_price
+        adverse = (entry_price - bar.high) / entry_price
+    else:
+        favorable = bar.high / entry_price - 1
+        adverse = bar.low / entry_price - 1
+    return favorable, adverse
+
+
+def _checkpoint_bar(
+    ordered: list[Bar],
+    *,
+    fill_timestamp: datetime,
+    replayed_exit_timestamp: datetime,
+    checkpoint_minutes: int,
+) -> tuple[int, Bar] | None:
+    target = fill_timestamp + timedelta(minutes=checkpoint_minutes)
+    if target >= replayed_exit_timestamp:
+        return None
+    for idx, bar in enumerate(ordered):
+        if bar.timestamp_utc >= target:
+            if bar.timestamp_utc >= replayed_exit_timestamp:
+                return None
+            return idx, bar
+    return None
+
+
+def _apply_dynamic_exit_overlay(
+    *,
+    sample: MetaLabelSample,
+    prediction: FoldPrediction,
+    side: Side,
+    fill_price: float,
+    fill_timestamp: datetime,
+    exit_bars: list[Bar],
+    replayed_exit: ReplayedExit,
+    round_trip_cost_bps: float,
+    checkpoints_minutes: tuple[int, ...],
+    adverse_bps: float,
+    giveback_bps: float,
+    min_profit_bps: float,
+    weak_probability: float,
+    weak_expected_value_bps: float,
+) -> ReplayedExit:
+    if not checkpoints_minutes:
+        return replayed_exit
+    ordered = [
+        bar
+        for bar in sorted(exit_bars, key=lambda row: row.timestamp_utc)
+        if fill_timestamp <= bar.timestamp_utc <= replayed_exit.timestamp_utc
+    ]
+    if not ordered:
+        return replayed_exit
+
+    max_favorable_bps = 0.0
+    weak_signal = (
+        prediction.probability <= weak_probability
+        or prediction.expected_value * 10_000 <= weak_expected_value_bps
+        or prediction.predicted_return < 0
+    )
+    for checkpoint in sorted({value for value in checkpoints_minutes if value > 0}):
+        row = _checkpoint_bar(
+            ordered,
+            fill_timestamp=fill_timestamp,
+            replayed_exit_timestamp=replayed_exit.timestamp_utc,
+            checkpoint_minutes=checkpoint,
+        )
+        if row is None:
+            continue
+        idx, bar = row
+        for prior in ordered[: idx + 1]:
+            favorable, _ = _bar_side_extreme_return(side, entry_price=fill_price, bar=prior)
+            max_favorable_bps = max(max_favorable_bps, favorable * 10_000)
+        current_gross_return = _side_gross_return(side, entry_price=fill_price, exit_price=bar.close)
+        current_bps = current_gross_return * 10_000
+        giveback = max_favorable_bps - current_bps
+        reason = ""
+        if current_bps <= -adverse_bps and weak_signal:
+            reason = f"adverse_{checkpoint}m"
+        elif giveback >= giveback_bps and current_bps >= min_profit_bps:
+            reason = f"giveback_{checkpoint}m"
+        elif checkpoint >= 120 and weak_signal and current_bps <= 0:
+            reason = f"weak_no_progress_{checkpoint}m"
+        if not reason:
+            continue
+        net_return = current_gross_return - round_trip_cost_bps / 10_000
+        return ReplayedExit(
+            timestamp_utc=bar.timestamp_utc,
+            price=bar.close,
+            outcome_type=f"dynamic_exit_{reason}",
+            gross_return=current_gross_return,
+            net_return=net_return,
+            overlay_reason=reason,
+        )
+    return replayed_exit
+
+
 def _annualized_daily_sharpe(
     *,
     report: MetaLabelWalkForwardReport,
@@ -328,6 +454,128 @@ def _confidence_notional_scale(
     return max(0.25, min(1.0, 0.25 + 0.75 * confidence))
 
 
+def _prediction_score_value(prediction: FoldPrediction, field: str) -> float:
+    if field == "probability":
+        return prediction.probability
+    if field == "expected_value":
+        return prediction.expected_value
+    if field == "predicted_return":
+        return prediction.predicted_return
+    if field == "selection_score":
+        return prediction.selection_score
+    raise ValueError("sizing_score_field must be probability, expected_value, predicted_return, or selection_score")
+
+
+def _sample_spread_bps(sample: MetaLabelSample) -> float | None:
+    candidates = [
+        float(value)
+        for key, value in sample.features.items()
+        if key.endswith("spread_bps") and isinstance(value, int | float) and float(value) > 0
+    ]
+    return min(candidates) if candidates else None
+
+
+def _sample_liquidity_score(sample: MetaLabelSample) -> float:
+    values: list[float] = []
+    for key in (
+        "pm_leading_liquidity_weight_total",
+        "pm_leading_liquidity_weight_mean",
+        "ibkr_top_of_book_size_log",
+        "ibkr_futures_top_of_book_size_log",
+        "dollar_volume_log",
+    ):
+        value = sample.features.get(key)
+        if isinstance(value, int | float):
+            values.append(float(value))
+    return max(values) if values else 0.0
+
+
+def _bucket_sized_notional(
+    *,
+    prediction: FoldPrediction,
+    sample: MetaLabelSample,
+    cap_notional: float,
+    sizing_mode: str,
+    score_field: str,
+    base_notional: float,
+    mid_notional: float,
+    high_notional: float,
+    mid_score: float,
+    high_score: float,
+    max_spread_bps: float,
+    min_liquidity_score: float,
+) -> tuple[float, float, str]:
+    if cap_notional <= 0:
+        return 0.0, 0.0, sizing_mode
+    base = base_notional if base_notional > 0 else min(5_000.0, cap_notional)
+    mid = mid_notional if mid_notional > 0 else min(max(base, (base + cap_notional) / 2), cap_notional)
+    high = high_notional if high_notional > 0 else cap_notional
+    base = min(base, cap_notional)
+    mid = min(max(mid, base), cap_notional)
+    high = min(max(high, mid), cap_notional)
+
+    score = _prediction_score_value(prediction, score_field)
+    spread = _sample_spread_bps(sample)
+    spread_ok = spread is None or max_spread_bps <= 0 or spread <= max_spread_bps
+    liquidity = _sample_liquidity_score(sample)
+    liquidity_ok = min_liquidity_score <= 0 or liquidity >= min_liquidity_score
+    high_quality = score >= high_score and spread_ok and liquidity_ok
+    mid_quality = score >= mid_score
+    if high_quality:
+        selected = high
+    elif mid_quality:
+        selected = mid
+    else:
+        selected = base
+    scale = selected / cap_notional if cap_notional > 0 else 0.0
+    return selected, scale, sizing_mode
+
+
+def _apply_notional_sizing(
+    *,
+    prediction: FoldPrediction,
+    sample: MetaLabelSample,
+    config: AppConfig,
+    cap_notional: float,
+    sizing_mode: str,
+    score_field: str,
+    base_notional: float,
+    mid_notional: float,
+    high_notional: float,
+    mid_score: float,
+    high_score: float,
+    max_spread_bps: float,
+    min_liquidity_score: float,
+    type_threshold: dict[str, object] | None,
+) -> tuple[float, float, str]:
+    if sizing_mode == "fixed":
+        return cap_notional, 1.0, "fixed"
+    if sizing_mode == "confidence":
+        scale = _confidence_notional_scale(
+            prediction,
+            config,
+            sample=sample,
+            type_threshold=type_threshold,
+        )
+        return cap_notional * scale, scale, "confidence"
+    if sizing_mode in {"score_bucket", "liquidity_score_bucket"}:
+        return _bucket_sized_notional(
+            prediction=prediction,
+            sample=sample,
+            cap_notional=cap_notional,
+            sizing_mode=sizing_mode,
+            score_field=score_field,
+            base_notional=base_notional,
+            mid_notional=mid_notional,
+            high_notional=high_notional,
+            mid_score=mid_score,
+            high_score=high_score,
+            max_spread_bps=max_spread_bps if sizing_mode == "liquidity_score_bucket" else 0.0,
+            min_liquidity_score=min_liquidity_score if sizing_mode == "liquidity_score_bucket" else 0.0,
+        )
+    raise ValueError("sizing_mode must be fixed, confidence, score_bucket, or liquidity_score_bucket")
+
+
 def _research_selection_allows_negative_ev(prediction: FoldPrediction) -> bool:
     if prediction.decision_reason == "candidate_type_calibration":
         return True
@@ -336,6 +584,32 @@ def _research_selection_allows_negative_ev(prediction: FoldPrediction) -> bool:
 
 def _open_spot_notional(pending_trades: list[PendingMLBacktestTrade]) -> float:
     return sum(trade.notional for trade in pending_trades if trade.side == Side.BUY.value)
+
+
+def _futures_contract_cost_enabled(config: AppConfig) -> bool:
+    return (
+        config.contract.instrument_model == "futures"
+        and config.cost.futures_fee_per_contract > 0
+        and config.cost.futures_contract_multiplier > 0
+    )
+
+
+def _round_futures_notional(
+    *,
+    requested_notional: float,
+    fill_price: float,
+    fill_fraction: float,
+    contract_multiplier: float,
+) -> float:
+    contract_notional = fill_price * contract_multiplier
+    if contract_notional <= 0:
+        raise ValueError("futures contract notional must be positive")
+    contracts = max(1, floor(requested_notional / contract_notional))
+    return contracts * contract_notional * fill_fraction
+
+
+def _round_trip_commission_from_cost(notional: float, cost) -> float:
+    return notional * cost.commission_bps / 10_000
 
 
 def _summarize(
@@ -458,7 +732,26 @@ def run_ml_backtest(
     allow_negative_ev_research: bool = False,
     allow_research_short_backtest: bool = False,
     confidence_scaled_sizing: bool = False,
+    sizing_mode: str = "fixed",
+    sizing_score_field: str = "probability",
+    sizing_base_notional: float = 0.0,
+    sizing_mid_notional: float = 0.0,
+    sizing_high_notional: float = 0.0,
+    sizing_mid_score: float = 0.45,
+    sizing_high_score: float = 0.90,
+    sizing_max_spread_bps: float = 1.0,
+    sizing_min_liquidity_score: float = 0.0,
+    dynamic_exit_overlay: bool = False,
+    dynamic_exit_checkpoints_minutes: tuple[int, ...] = (15, 30, 60, 120, 240),
+    dynamic_exit_adverse_bps: float = 25.0,
+    dynamic_exit_giveback_bps: float = 35.0,
+    dynamic_exit_min_profit_bps: float = 8.0,
+    dynamic_exit_weak_probability: float = 0.55,
+    dynamic_exit_weak_expected_value_bps: float = 0.0,
+    experiment_max_loss_usd: float = 0.0,
 ) -> tuple[MLBacktestSummary, list[MLBacktestTrade], list[MLBacktestRejection]]:
+    if experiment_max_loss_usd < 0:
+        raise ValueError("experiment_max_loss_usd must be nonnegative")
     ordered_bars = sorted(bars, key=lambda bar: bar.timestamp_utc)
     timestamps = [bar.timestamp_utc for bar in ordered_bars]
     sample_by_event = {sample.event_id: sample for sample in samples}
@@ -468,6 +761,7 @@ def run_ml_backtest(
         maximum_commission_rate=config.cost.maximum_commission_rate,
     )
     slippage_model = SlippageModel(base_slippage_bps=config.cost.base_slippage_bps)
+    effective_sizing_mode = "confidence" if confidence_scaled_sizing and sizing_mode == "fixed" else sizing_mode
 
     equity = starting_equity
     max_equity = starting_equity
@@ -518,7 +812,13 @@ def run_ml_backtest(
                     candidate_type=pending.candidate_type,
                     probability=pending.probability,
                     expected_value=pending.expected_value,
+                    predicted_return=pending.predicted_return,
+                    predicted_downside=pending.predicted_downside,
+                    selection_score=pending.selection_score,
                     notional=pending.notional,
+                    requested_notional=pending.requested_notional,
+                    notional_scale=pending.notional_scale,
+                    sizing_mode=pending.sizing_mode,
                     gross_return=pending.gross_return,
                     net_return=pending.net_return,
                     gross_pnl=pending.gross_pnl,
@@ -535,16 +835,25 @@ def run_ml_backtest(
                     slippage_cost_estimate=pending.slippage_cost_estimate,
                     safety_margin_estimate=pending.safety_margin_estimate,
                     side=pending.side,
+                    exit_overlay_reason=pending.exit_overlay_reason,
                 )
             )
 
     for prediction in sorted(report.predictions, key=_prediction_timestamp):
+        timestamp = _prediction_timestamp(prediction)
+        settle_trades_through(timestamp)
+        if experiment_max_loss_usd > 0 and (starting_equity - equity) >= experiment_max_loss_usd:
+            _record_rejection(
+                rejections,
+                prediction,
+                reason="experiment_max_loss_usd_stop",
+                equity=equity,
+            )
+            break
         sample = sample_by_event.get(prediction.event_id)
         if sample is None:
             _record_rejection(rejections, prediction, reason="missing_sample", equity=equity)
             continue
-        timestamp = _prediction_timestamp(prediction)
-        settle_trades_through(timestamp)
         if not prediction.should_trade:
             _record_rejection(rejections, prediction, reason=prediction.decision_reason, equity=equity)
             continue
@@ -593,7 +902,7 @@ def run_ml_backtest(
             _record_rejection(rejections, prediction, reason="rolling_drawdown_stop", equity=equity)
             break
 
-        trade_notional = _estimate_trade_notional(
+        cap_notional = _estimate_trade_notional(
             equity=equity,
             risk_per_trade=config.risk.risk_per_trade,
             net_stop_loss=sample.net_stop_loss,
@@ -601,23 +910,39 @@ def run_ml_backtest(
             max_notional=config.risk.paper_max_notional,
             cap_by_equity=config.contract.instrument_model != "futures",
         )
-        if confidence_scaled_sizing:
-            scaled_notional = trade_notional * _confidence_notional_scale(
-                prediction,
-                config,
-                sample=sample,
-                type_threshold=type_threshold_by_fold.get((prediction.fold_id, prediction.candidate_type)),
-            )
-            if trade_notional >= config.risk.minimum_fee_efficient_notional:
-                trade_notional = max(config.risk.minimum_fee_efficient_notional, scaled_notional)
-            else:
-                trade_notional = scaled_notional
+        trade_notional, notional_scale, applied_sizing_mode = _apply_notional_sizing(
+            prediction=prediction,
+            sample=sample,
+            config=config,
+            cap_notional=cap_notional,
+            sizing_mode=effective_sizing_mode,
+            score_field=sizing_score_field,
+            base_notional=sizing_base_notional,
+            mid_notional=sizing_mid_notional,
+            high_notional=sizing_high_notional,
+            mid_score=sizing_mid_score,
+            high_score=sizing_high_score,
+            max_spread_bps=sizing_max_spread_bps,
+            min_liquidity_score=sizing_min_liquidity_score,
+            type_threshold=type_threshold_by_fold.get((prediction.fold_id, prediction.candidate_type)),
+        )
+        if applied_sizing_mode == "confidence":
+            if cap_notional >= config.risk.minimum_fee_efficient_notional:
+                trade_notional = max(config.risk.minimum_fee_efficient_notional, trade_notional)
+                notional_scale = trade_notional / max(cap_notional, 1e-9)
+        elif confidence_scaled_sizing:
+            # Backward-compatible guard: an explicit non-confidence sizing mode wins.
+            pass
+        if trade_notional < 0:
+            trade_notional = 0.0
         if config.contract.instrument_model == "spot_crypto" and sample.side == Side.BUY.value:
             available_spot_notional = max(equity - _open_spot_notional(pending_trades), 0.0)
             if available_spot_notional <= 0:
                 _record_rejection(rejections, prediction, reason="insufficient_cash", equity=equity)
                 continue
-            trade_notional = min(trade_notional, available_spot_notional)
+            if trade_notional > available_spot_notional:
+                trade_notional = available_spot_notional
+                notional_scale = trade_notional / max(cap_notional, 1e-9)
         if trade_notional < config.risk.minimum_fee_efficient_notional:
             _record_rejection(
                 rejections,
@@ -660,13 +985,24 @@ def run_ml_backtest(
             _record_rejection(rejections, prediction, reason="missing_fill_timestamp", equity=equity)
             continue
 
-        filled_notional = trade_notional * fill.fill_fraction
+        if _futures_contract_cost_enabled(config):
+            filled_notional = _round_futures_notional(
+                requested_notional=trade_notional,
+                fill_price=fill.price,
+                fill_fraction=fill.fill_fraction,
+                contract_multiplier=config.cost.futures_contract_multiplier,
+            )
+        else:
+            filled_notional = trade_notional * fill.fill_fraction
         cost = estimate_round_trip_cost(
             filled_notional,
             spread_bps=assumed_spread_bps,
             commission_model=commission_model,
             slippage_model=slippage_model,
             safety_margin_bps=config.cost.safety_margin_bps,
+            futures_fee_per_contract=config.cost.futures_fee_per_contract,
+            futures_contract_multiplier=config.cost.futures_contract_multiplier,
+            reference_price=fill.price,
         )
         exit_bars = _bars_for_window(
             ordered_bars,
@@ -686,6 +1022,23 @@ def run_ml_backtest(
         if replayed_exit is None:
             _record_rejection(rejections, prediction, reason="no_exit_bars_after_fill", equity=equity)
             continue
+        if dynamic_exit_overlay:
+            replayed_exit = _apply_dynamic_exit_overlay(
+                sample=sample,
+                prediction=prediction,
+                side=entry_side,
+                fill_price=fill.price,
+                fill_timestamp=fill.timestamp_utc,
+                exit_bars=exit_bars,
+                replayed_exit=replayed_exit,
+                round_trip_cost_bps=cost.total_bps,
+                checkpoints_minutes=dynamic_exit_checkpoints_minutes,
+                adverse_bps=dynamic_exit_adverse_bps,
+                giveback_bps=dynamic_exit_giveback_bps,
+                min_profit_bps=dynamic_exit_min_profit_bps,
+                weak_probability=dynamic_exit_weak_probability,
+                weak_expected_value_bps=dynamic_exit_weak_expected_value_bps,
+            )
         gross_return = replayed_exit.gross_return
         net_return = replayed_exit.net_return
         gross_pnl = filled_notional * gross_return
@@ -693,7 +1046,7 @@ def run_ml_backtest(
         cost_components = _trade_cost_components(
             filled_notional,
             cost,
-            commission_model.round_trip_commission(filled_notional),
+            _round_trip_commission_from_cost(filled_notional, cost),
         )
         pending_trades.append(
             PendingMLBacktestTrade(
@@ -703,7 +1056,13 @@ def run_ml_backtest(
                 candidate_type=prediction.candidate_type,
                 probability=prediction.probability,
                 expected_value=prediction.expected_value,
+                predicted_return=prediction.predicted_return,
+                predicted_downside=prediction.predicted_downside,
+                selection_score=prediction.selection_score,
                 notional=filled_notional,
+                requested_notional=trade_notional,
+                notional_scale=notional_scale,
+                sizing_mode=applied_sizing_mode,
                 gross_return=gross_return,
                 net_return=net_return,
                 gross_pnl=gross_pnl,
@@ -715,6 +1074,7 @@ def run_ml_backtest(
                 outcome_type=replayed_exit.outcome_type,
                 round_trip_cost_bps=cost.total_bps,
                 side=sample.side,
+                exit_overlay_reason=replayed_exit.overlay_reason,
                 **cost_components,
             )
         )
@@ -745,11 +1105,16 @@ def write_ml_backtest_artifact(
             "calibration_method": report.calibration_method,
             "stacker_mode": report.stacker_mode,
             "data_coverage": report.data_coverage,
+            "feature_importance_enabled": any(fold.permutation_importance for fold in report.folds),
         },
         "model_report": {
             "folds": [asdict(fold) for fold in report.folds],
             "predictions": [asdict(prediction) for prediction in report.predictions],
             "feature_names": report.feature_names,
+            "feature_importance_summary": report_feature_importance_summary(report),
+            "shap_importance_summary": report_shap_importance_summary(report),
+            "native_importance_summary": report_native_importance_summary(report),
+            "model_family_summary": report_model_family_summary(report),
         },
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")

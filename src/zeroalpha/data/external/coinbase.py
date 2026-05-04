@@ -35,6 +35,38 @@ class CoinbaseExchangeClient:
         )
         return f"{self.base_url}/products/{product_id}/candles?{params}"
 
+    def product_book_url(self, product_id: str, *, level: int = 2) -> str:
+        params = urllib.parse.urlencode({"level": str(level)})
+        return f"{self.base_url}/products/{product_id}/book?{params}"
+
+    def product_trades_url(self, product_id: str, *, limit: int = 1000) -> str:
+        params = urllib.parse.urlencode({"limit": str(min(max(limit, 1), 1000))})
+        return f"{self.base_url}/products/{product_id}/trades?{params}"
+
+    def fetch_product_book(self, product_id: str, *, level: int = 2, timeout: float = 30.0) -> dict:
+        request = urllib.request.Request(
+            self.product_book_url(product_id, level=level),
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "ZeroAlpha/0.1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def fetch_product_trades(self, product_id: str, *, limit: int = 1000, timeout: float = 30.0) -> list[dict]:
+        request = urllib.request.Request(
+            self.product_trades_url(product_id, limit=limit),
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "ZeroAlpha/0.1",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload if isinstance(payload, list) else []
+
     def fetch_candles(
         self,
         product_id: str,
@@ -53,20 +85,27 @@ class CoinbaseExchangeClient:
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        bars = [
-            Bar(
-                timestamp_utc=parse_unix_timestamp(row[0]),
-                symbol=product_id,
-                bar_size=f"{granularity}s",
-                low=float(row[1]),
-                high=float(row[2]),
-                open=float(row[3]),
-                close=float(row[4]),
-                volume=float(row[5]),
-                source="COINBASE",
+        bars = []
+        for row in payload:
+            bar_start = parse_unix_timestamp(row[0])
+            bar_close = bar_start + timedelta(seconds=granularity)
+            bars.append(
+                Bar(
+                    timestamp_utc=bar_close,
+                    symbol=product_id,
+                    bar_size=f"{granularity}s",
+                    low=float(row[1]),
+                    high=float(row[2]),
+                    open=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                    source="COINBASE",
+                    extra={
+                        "bar_start_timestamp_utc": bar_start.isoformat(),
+                        "bar_close_timestamp_utc": bar_close.isoformat(),
+                    },
+                )
             )
-            for row in payload
-        ]
         return sorted(bars, key=lambda bar: bar.timestamp_utc)
 
     def fetch_candles_range(

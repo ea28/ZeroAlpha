@@ -83,7 +83,87 @@ def test_dataset_includes_ibkr_quote_microstructure_features() -> None:
     assert features["ibkr_quote_size_available"] == 1.0
     assert "ibkr_spread_bps" in features
     assert "ibkr_top_of_book_imbalance" in features
+    assert "ibkr_microprice_edge_bps" in features
+    assert "ibkr_side_microprice_edge_bps" in features
     assert "ibkr_mid_return_1h" in features
+
+
+def test_external_feature_latency_uses_older_quote_snapshot() -> None:
+    bars = [_bar(idx) for idx in range(360)]
+    quotes = [
+        MarketQuote(
+            timestamp_utc=bar.timestamp_utc,
+            received_timestamp_utc=bar.timestamp_utc,
+            symbol="BTC/USD",
+            bid=bar.close - 0.05,
+            ask=bar.close + 0.05,
+            bid_size=1.0,
+            ask_size=2.0,
+        )
+        for bar in bars
+    ]
+
+    samples = build_meta_label_samples(
+        bars,
+        config=AppConfig(),
+        assumed_spread_bps=1.0,
+        research_notional=10_000,
+        market_quotes=quotes,
+        external_feature_latency_seconds=3600.0,
+        candidate_config=CandidateGenerationConfig(
+            mode="dense_research",
+            min_history_bars=240,
+            max_holding_hours=24,
+            dense_stride_bars=48,
+        ),
+    )
+
+    features = samples[0].features
+
+    assert features["external_feature_latency_seconds"] == 3600.0
+    assert features["external_feature_delay_from_entry_seconds"] == 3600.0
+    assert features["ibkr_quote_age_seconds"] == 0.0
+
+
+def test_quote_features_use_received_timestamp_for_causal_availability() -> None:
+    bars = [_bar(idx) for idx in range(360)]
+    signal_time = bars[239].timestamp_utc
+    quotes = [
+        MarketQuote(
+            timestamp_utc=signal_time - timedelta(hours=2),
+            received_timestamp_utc=signal_time - timedelta(hours=1),
+            symbol="BTC/USD",
+            bid=100.0,
+            ask=100.1,
+        ),
+        MarketQuote(
+            timestamp_utc=signal_time - timedelta(hours=1),
+            received_timestamp_utc=signal_time + timedelta(hours=1),
+            symbol="BTC/USD",
+            bid=150.0,
+            ask=150.1,
+        ),
+    ]
+
+    samples = build_meta_label_samples(
+        bars,
+        config=AppConfig(),
+        assumed_spread_bps=1.0,
+        research_notional=10_000,
+        market_quotes=quotes,
+        feature_asof="signal",
+        candidate_config=CandidateGenerationConfig(
+            mode="dense_research",
+            min_history_bars=240,
+            max_holding_hours=24,
+            dense_stride_bars=48,
+        ),
+    )
+
+    features = samples[0].features
+
+    assert features["ibkr_quote_age_seconds"] == 3600.0
+    assert features["ibkr_market_quote_age_seconds"] == 7200.0
 
 
 def test_dataset_includes_ibkr_futures_quote_features_with_separate_prefix() -> None:

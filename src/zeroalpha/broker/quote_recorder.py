@@ -11,6 +11,7 @@ import json
 from zeroalpha.broker.ibkr import IBKRBroker, QualifiedCryptoContract
 from zeroalpha.config import AppConfig
 from zeroalpha.domain import MarketQuote
+from zeroalpha.monitoring.events import RuntimeEventStream
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,12 +50,24 @@ def quote_to_record(quote: MarketQuote, contract: QualifiedCryptoContract) -> Qu
 
 
 class IBKRQuoteRecorder:
-    def __init__(self, config: AppConfig, *, output_path: Path, interval_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        output_path: Path,
+        interval_seconds: float = 5.0,
+        snapshot_timeout_seconds: float = 10.0,
+        events: RuntimeEventStream | None = None,
+    ) -> None:
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
+        if snapshot_timeout_seconds <= 0:
+            raise ValueError("snapshot_timeout_seconds must be positive")
         self.config = config
         self.output_path = output_path
         self.interval_seconds = interval_seconds
+        self.snapshot_timeout_seconds = snapshot_timeout_seconds
+        self.events = events
 
     async def run(
         self,
@@ -68,9 +81,25 @@ class IBKRQuoteRecorder:
         local_symbol: str = "",
     ) -> int:
         broker = IBKRBroker(self.config)
+        if self.events is not None:
+            self.events.emit(
+                "quote_recorder.start",
+                "starting IBKR quote recorder",
+                output=str(self.output_path),
+                interval_seconds=self.interval_seconds,
+                duration_seconds=duration_seconds,
+            )
         await broker.connect(read_only=True)
         count = 0
         try:
+            if self.events is not None:
+                self.events.emit(
+                    "broker.connected",
+                    "connected to IBKR Gateway/TWS",
+                    host=self.config.broker.host,
+                    port=self.config.broker.port,
+                    read_only=True,
+                )
             if security_type or exchange or symbol or currency or last_trade_date_or_contract_month or local_symbol:
                 contract = await broker.qualify_contract(
                     symbol=symbol or self.config.contract.symbol,
@@ -82,6 +111,14 @@ class IBKRQuoteRecorder:
                 )
             else:
                 contract = await broker.qualify_crypto_contract()
+            if self.events is not None:
+                self.events.emit(
+                    "broker.contract_qualified",
+                    "qualified quote-recorder contract",
+                    symbol=f"{contract.symbol}/{contract.currency}",
+                    exchange=contract.exchange,
+                    con_id=contract.con_id,
+                )
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             started = asyncio.get_running_loop().time()
             with self.output_path.open("a", encoding="utf-8") as handle:
@@ -90,12 +127,36 @@ class IBKRQuoteRecorder:
                         elapsed = asyncio.get_running_loop().time() - started
                         if elapsed >= duration_seconds:
                             break
-                    quote = await broker.snapshot_quote(contract)
+                    quote = await broker.snapshot_quote(
+                        contract,
+                        max_wait_seconds=self.snapshot_timeout_seconds,
+                    )
                     record = quote_to_record(quote, contract)
                     handle.write(json.dumps(asdict(record), default=str, sort_keys=True) + "\n")
                     handle.flush()
                     count += 1
+                    if self.events is not None:
+                        self.events.emit(
+                            "market.quote_recorded",
+                            "recorded IBKR quote",
+                            count=count,
+                            symbol=record.symbol,
+                            bid=record.bid,
+                            ask=record.ask,
+                            spread_bps=record.spread_bps,
+                            bid_size=record.bid_size,
+                            ask_size=record.ask_size,
+                            quote_age_ms=record.quote_age_ms,
+                        )
                     await asyncio.sleep(self.interval_seconds)
         finally:
             await broker.disconnect()
+            if self.events is not None:
+                self.events.emit(
+                    "quote_recorder.finished",
+                    "IBKR quote recorder finished",
+                    count=count,
+                    output=str(self.output_path),
+                )
+                self.events.emit("broker.disconnected", "disconnected from IBKR Gateway/TWS")
         return count

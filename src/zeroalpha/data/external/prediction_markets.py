@@ -5,6 +5,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -25,13 +26,23 @@ BTC_PREDICTION_MARKET_DURATIONS: tuple[str, ...] = (
     "5m",
     "15m",
     "30m",
+    "45m",
     "1h",
     "2h",
     "4h",
     "24h",
 )
 
-POLYMARKET_BTC_UPDOWN_DURATIONS: tuple[str, ...] = ("5m", "15m", "1h", "4h")
+POLYMARKET_BTC_UPDOWN_DURATIONS: tuple[str, ...] = (
+    "5m",
+    "15m",
+    "30m",
+    "45m",
+    "1h",
+    "2h",
+    "4h",
+    "24h",
+)
 KALSHI_BTC_DURATION_SERIES: dict[str, tuple[str, ...]] = {
     "5m": ("KXBTC5M",),
     "15m": ("KXBTC15M",),
@@ -64,6 +75,17 @@ class PredictionMarketSnapshot:
     up_ask_size: float | None = None
     down_bid_size: float | None = None
     down_ask_size: float | None = None
+    up_bid_depth_1c: float | None = None
+    up_bid_depth_3c: float | None = None
+    up_bid_depth_5c: float | None = None
+    up_ask_depth_1c: float | None = None
+    up_ask_depth_3c: float | None = None
+    up_ask_depth_5c: float | None = None
+    orderbook_imbalance_1c: float | None = None
+    orderbook_imbalance_3c: float | None = None
+    orderbook_imbalance_5c: float | None = None
+    last_trade_side: str = ""
+    last_trade_size: float | None = None
     last_price: float | None = None
     volume: float | None = None
     volume_24h: float | None = None
@@ -150,6 +172,8 @@ def _json_array(value: Any) -> list[Any]:
 
 def _duration_seconds(duration: str) -> int:
     value = duration.strip().lower()
+    if value.startswith("ladder_"):
+        value = value.removeprefix("ladder_")
     if value.endswith("m"):
         return int(value[:-1]) * 60
     if value.endswith("h"):
@@ -233,6 +257,36 @@ def _best_ask(book: dict[str, Any]) -> tuple[float | None, float | None]:
         return None, None
     price, size = min(valid, key=lambda item: item[0])
     return price, size
+
+
+def _book_levels(book: dict[str, Any], side: str) -> list[tuple[float, float]]:
+    levels = [
+        (_float(level.get("price")), _float(level.get("size")))
+        for level in book.get(side, [])
+        if isinstance(level, dict)
+    ]
+    return [(price, size or 0.0) for price, size in levels if price is not None]
+
+
+def _depth_near_best(
+    levels: list[tuple[float, float]],
+    *,
+    best: float | None,
+    width: float,
+    bid_side: bool,
+) -> float | None:
+    if best is None:
+        return None
+    if bid_side:
+        return sum(size for price, size in levels if price >= best - width)
+    return sum(size for price, size in levels if price <= best + width)
+
+
+def _depth_imbalance(bid_depth: float | None, ask_depth: float | None) -> float | None:
+    if bid_depth is None or ask_depth is None:
+        return None
+    total = bid_depth + ask_depth
+    return (bid_depth - ask_depth) / total if total > 0 else 0.0
 
 
 def _midpoint(bid: float | None, ask: float | None, fallback: float | None = None) -> float | None:
@@ -334,6 +388,38 @@ class PolymarketClobV2Client:
             if isinstance(book, dict) and book.get("asset_id") is not None
         }
 
+    def midpoints(self, token_ids: Sequence[str]) -> dict[str, float]:
+        if not token_ids:
+            return {}
+        body = [{"token_id": token_id} for token_id in token_ids]
+        try:
+            payload = _request_json(_url(self.clob_base_url, "midpoints"), method="POST", payload=body)
+        except HTTPError as exc:
+            if exc.code in {400, 404, 429}:
+                return {}
+            raise
+        except (TimeoutError, URLError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {str(key): value for key, raw in payload.items() if (value := _float(raw)) is not None}
+
+    def spreads(self, token_ids: Sequence[str]) -> dict[str, float]:
+        if not token_ids:
+            return {}
+        body = [{"token_id": token_id} for token_id in token_ids]
+        try:
+            payload = _request_json(_url(self.clob_base_url, "spreads"), method="POST", payload=body)
+        except HTTPError as exc:
+            if exc.code in {400, 404, 429}:
+                return {}
+            raise
+        except (TimeoutError, URLError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {str(key): value for key, raw in payload.items() if (value := _float(raw)) is not None}
+
     def prices_history(
         self,
         token_id: str,
@@ -429,6 +515,8 @@ class PolymarketClobV2Client:
         for market in markets:
             token_ids.extend(str(token) for token in _json_array(market.get("clobTokenIds"))[:2])
         books = self.order_books(token_ids) if include_orderbooks else {}
+        midpoints = self.midpoints(token_ids) if include_orderbooks else {}
+        spreads = self.spreads(token_ids) if include_orderbooks else {}
         history_by_token: dict[str, list[dict[str, float]]] = {}
         unique_token_ids = list(dict.fromkeys(token_ids))
         for idx in range(0, len(unique_token_ids), 20):
@@ -499,11 +587,11 @@ class PolymarketClobV2Client:
                         window_end_utc=window_end,
                         up_mid=up_mid,
                         down_mid=down_mid,
-                        last_price=_float(market.get("lastTradePrice")),
-                        volume=_float(market.get("volume")),
-                        volume_24h=_float(market.get("volume24hr")),
-                        liquidity=_float(market.get("liquidityClob") or market.get("liquidity")),
-                        open_interest=_float(market.get("openInterest")),
+                        last_price=None,
+                        volume=None,
+                        volume_24h=None,
+                        liquidity=None,
+                        open_interest=None,
                         source="clob_v2_prices_history",
                     )
                 )
@@ -514,6 +602,14 @@ class PolymarketClobV2Client:
                 up_ask, up_ask_size = _best_ask(up_book)
                 down_bid, down_bid_size = _best_bid(down_book)
                 down_ask, down_ask_size = _best_ask(down_book)
+                up_bids = _book_levels(up_book, "bids")
+                up_asks = _book_levels(up_book, "asks")
+                up_bid_depth_1c = _depth_near_best(up_bids, best=up_bid, width=0.01, bid_side=True)
+                up_bid_depth_3c = _depth_near_best(up_bids, best=up_bid, width=0.03, bid_side=True)
+                up_bid_depth_5c = _depth_near_best(up_bids, best=up_bid, width=0.05, bid_side=True)
+                up_ask_depth_1c = _depth_near_best(up_asks, best=up_ask, width=0.01, bid_side=False)
+                up_ask_depth_3c = _depth_near_best(up_asks, best=up_ask, width=0.03, bid_side=False)
+                up_ask_depth_5c = _depth_near_best(up_asks, best=up_ask, width=0.05, bid_side=False)
                 book_ts = _float(up_book.get("timestamp")) or _float(down_book.get("timestamp"))
                 timestamp = (
                     parse_unix_timestamp(book_ts / 1000)
@@ -534,21 +630,33 @@ class PolymarketClobV2Client:
                             window_end_utc=window_end,
                             up_bid=up_bid,
                             up_ask=up_ask,
-                            up_mid=_midpoint(up_bid, up_ask, _float(market.get("bestBid"))),
+                            up_mid=_midpoint(up_bid, up_ask, midpoints.get(up_token) or _float(market.get("bestBid"))),
                             down_bid=down_bid,
                             down_ask=down_ask,
-                            down_mid=_midpoint(down_bid, down_ask),
+                            down_mid=_midpoint(down_bid, down_ask, midpoints.get(down_token)),
                             up_bid_size=up_bid_size,
                             up_ask_size=up_ask_size,
                             down_bid_size=down_bid_size,
                             down_ask_size=down_ask_size,
+                            up_bid_depth_1c=up_bid_depth_1c,
+                            up_bid_depth_3c=up_bid_depth_3c,
+                            up_bid_depth_5c=up_bid_depth_5c,
+                            up_ask_depth_1c=up_ask_depth_1c,
+                            up_ask_depth_3c=up_ask_depth_3c,
+                            up_ask_depth_5c=up_ask_depth_5c,
+                            orderbook_imbalance_1c=_depth_imbalance(up_bid_depth_1c, up_ask_depth_1c),
+                            orderbook_imbalance_3c=_depth_imbalance(up_bid_depth_3c, up_ask_depth_3c),
+                            orderbook_imbalance_5c=_depth_imbalance(up_bid_depth_5c, up_ask_depth_5c),
                             last_price=_float(up_book.get("last_trade_price"))
                             or _float(market.get("lastTradePrice")),
+                            last_trade_size=_float(up_book.get("last_trade_size")),
                             volume=_float(market.get("volume")),
                             volume_24h=_float(market.get("volume24hr")),
                             liquidity=_float(market.get("liquidityClob") or market.get("liquidity")),
                             open_interest=_float(market.get("openInterest")),
-                            source="clob_v2_orderbook",
+                            source="clob_v2_orderbook_midpoint_spread"
+                            if spreads.get(up_token) is not None
+                            else "clob_v2_orderbook",
                         )
                     )
         return snapshots
@@ -583,7 +691,7 @@ class KalshiPublicDataClient:
             try:
                 payload = _request_json(_url(self.base_url, "markets", params))
             except HTTPError as exc:
-                if exc.code == 429:
+                if exc.code in {400, 404, 429}:
                     break
                 raise
             except (TimeoutError, URLError):
@@ -622,6 +730,50 @@ class KalshiPublicDataClient:
         rows = payload.get("candlesticks", []) if isinstance(payload, dict) else []
         return [row for row in rows if isinstance(row, dict)]
 
+    def multiple_market_orderbooks(self, tickers: Sequence[str]) -> dict[str, dict[str, Any]]:
+        tickers = [ticker for ticker in dict.fromkeys(tickers) if ticker]
+        if not tickers:
+            return {}
+        params = {"market_tickers": ",".join(tickers)}
+        try:
+            payload = _request_json(_url(self.base_url, "markets/orderbooks", params))
+        except HTTPError as exc:
+            if exc.code in {400, 401, 404, 429}:
+                return {}
+            raise
+        except (TimeoutError, URLError):
+            return {}
+        rows = payload.get("orderbooks", []) if isinstance(payload, dict) else []
+        return {
+            str(row.get("ticker")): row
+            for row in rows
+            if isinstance(row, dict) and row.get("ticker")
+        }
+
+    def market_trades(
+        self,
+        ticker: str,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"ticker": ticker, "limit": min(max(limit, 1), 1000)}
+        if start is not None:
+            params["min_ts"] = int(ensure_utc(start).timestamp())
+        if end is not None:
+            params["max_ts"] = int(ensure_utc(end).timestamp())
+        try:
+            payload = _request_json(_url(self.base_url, "markets/trades", params))
+        except HTTPError as exc:
+            if exc.code in {400, 401, 404, 429}:
+                return []
+            raise
+        except (TimeoutError, URLError):
+            return []
+        rows = payload.get("trades", []) if isinstance(payload, dict) else []
+        return [row for row in rows if isinstance(row, dict)]
+
     def snapshots_from_btc_series(
         self,
         *,
@@ -648,11 +800,7 @@ class KalshiPublicDataClient:
             "max_markets": max_markets,
         }
         for series_ticker in requested_series:
-            statuses = (
-                ("open", "closed", "settled")
-                if series_ticker in {"KXBTC5M", "KXBTC15M"}
-                else ("open",)
-            )
+            statuses: tuple[str | None, ...] = (None, "open", "finalized", "settled")
             markets: list[dict[str, Any]] = []
             for status in statuses:
                 markets.extend(
@@ -665,9 +813,23 @@ class KalshiPublicDataClient:
                 )
                 if len(markets) >= max_markets:
                     break
-            markets = markets[:max_markets]
-            coverage["series"][series_ticker] = {"markets": len(markets), "statuses": list(statuses)}
+            deduped: dict[str, dict[str, Any]] = {}
             for market in markets:
+                ticker = str(market.get("ticker") or "")
+                deduped[ticker or str(len(deduped))] = market
+            markets = list(deduped.values())
+            markets = markets[:max_markets]
+            orderbooks = self.multiple_market_orderbooks(
+                [str(market.get("ticker") or "") for market in markets]
+            )
+            coverage["series"][series_ticker] = {
+                "markets": len(markets),
+                "statuses": ["all" if status is None else status for status in statuses],
+                "orderbooks": len(orderbooks),
+            }
+            for market in markets:
+                ticker = str(market.get("ticker") or "")
+                orderbook = orderbooks.get(ticker)
                 if series_ticker in {"KXBTC5M", "KXBTC15M"}:
                     duration = "5m" if series_ticker == "KXBTC5M" else "15m"
                     snapshots.extend(
@@ -677,12 +839,23 @@ class KalshiPublicDataClient:
                             start,
                             end,
                             duration=duration,
+                            orderbook=orderbook,
                         )
                     )
                 else:
-                    snapshot = self._snapshot_from_market_ladder(series_ticker, market)
-                    if snapshot is not None:
-                        snapshots.append(snapshot)
+                    for duration in (
+                        duration
+                        for duration in requested_durations
+                        if series_ticker in KALSHI_BTC_DURATION_SERIES.get(duration, ())
+                    ):
+                        snapshot = self._snapshot_from_market_ladder(
+                            series_ticker,
+                            market,
+                            duration=duration,
+                            orderbook=orderbook,
+                        )
+                        if snapshot is not None:
+                            snapshots.append(snapshot)
         return snapshots, coverage
 
     def _snapshots_from_directional_market(
@@ -693,6 +866,7 @@ class KalshiPublicDataClient:
         end: datetime,
         *,
         duration: str,
+        orderbook: dict[str, Any] | None = None,
     ) -> list[PredictionMarketSnapshot]:
         ticker = str(market.get("ticker", ""))
         close_time = _parse_iso(market.get("close_time"))
@@ -716,6 +890,7 @@ class KalshiPublicDataClient:
             price = _candlestick_close(row.get("price"))
             yes_bid = _candlestick_close(row.get("yes_bid"))
             yes_ask = _candlestick_close(row.get("yes_ask"))
+            book_fields: dict[str, float] = {}
             up_mid = price if price is not None else _midpoint(yes_bid, yes_ask)
             snapshots.append(
                 PredictionMarketSnapshot(
@@ -732,6 +907,17 @@ class KalshiPublicDataClient:
                     up_ask=yes_ask,
                     up_mid=up_mid,
                     down_mid=1.0 - up_mid if up_mid is not None else None,
+                    up_bid_size=book_fields.get("up_bid_size"),
+                    up_ask_size=book_fields.get("up_ask_size"),
+                    up_bid_depth_1c=book_fields.get("up_bid_depth_1c"),
+                    up_bid_depth_3c=book_fields.get("up_bid_depth_3c"),
+                    up_bid_depth_5c=book_fields.get("up_bid_depth_5c"),
+                    up_ask_depth_1c=book_fields.get("up_ask_depth_1c"),
+                    up_ask_depth_3c=book_fields.get("up_ask_depth_3c"),
+                    up_ask_depth_5c=book_fields.get("up_ask_depth_5c"),
+                    orderbook_imbalance_1c=book_fields.get("orderbook_imbalance_1c"),
+                    orderbook_imbalance_3c=book_fields.get("orderbook_imbalance_3c"),
+                    orderbook_imbalance_5c=book_fields.get("orderbook_imbalance_5c"),
                     last_price=price,
                     volume=_float(row.get("volume_fp") or row.get("volume")),
                     volume_24h=_float(market.get("volume_24h_fp")),
@@ -741,7 +927,11 @@ class KalshiPublicDataClient:
                 )
             )
         if not snapshots:
-            snapshot = self._snapshot_from_directional_market_quote(market, duration=duration)
+            snapshot = self._snapshot_from_directional_market_quote(
+                market,
+                duration=duration,
+                orderbook=orderbook,
+            )
             return [snapshot] if snapshot is not None else []
         return snapshots
 
@@ -750,12 +940,16 @@ class KalshiPublicDataClient:
         market: dict[str, Any],
         *,
         duration: str,
+        orderbook: dict[str, Any] | None = None,
     ) -> PredictionMarketSnapshot | None:
         timestamp = _parse_iso(market.get("updated_time")) or ensure_utc(datetime.now(tz=UTC))
         close_time = _parse_iso(market.get("close_time"))
         open_time = _parse_iso(market.get("open_time"))
         yes_bid = _float(market.get("yes_bid_dollars"))
         yes_ask = _float(market.get("yes_ask_dollars"))
+        book_fields = _kalshi_orderbook_fields(orderbook)
+        yes_bid = book_fields.get("up_bid", yes_bid) if book_fields else yes_bid
+        yes_ask = book_fields.get("up_ask", yes_ask) if book_fields else yes_ask
         last = _float(market.get("last_price_dollars"))
         up_mid = _midpoint(yes_bid, yes_ask, last)
         return PredictionMarketSnapshot(
@@ -774,6 +968,17 @@ class KalshiPublicDataClient:
             down_bid=_float(market.get("no_bid_dollars")),
             down_ask=_float(market.get("no_ask_dollars")),
             down_mid=1.0 - up_mid if up_mid is not None else None,
+            up_bid_size=book_fields.get("up_bid_size"),
+            up_ask_size=book_fields.get("up_ask_size"),
+            up_bid_depth_1c=book_fields.get("up_bid_depth_1c"),
+            up_bid_depth_3c=book_fields.get("up_bid_depth_3c"),
+            up_bid_depth_5c=book_fields.get("up_bid_depth_5c"),
+            up_ask_depth_1c=book_fields.get("up_ask_depth_1c"),
+            up_ask_depth_3c=book_fields.get("up_ask_depth_3c"),
+            up_ask_depth_5c=book_fields.get("up_ask_depth_5c"),
+            orderbook_imbalance_1c=book_fields.get("orderbook_imbalance_1c"),
+            orderbook_imbalance_3c=book_fields.get("orderbook_imbalance_3c"),
+            orderbook_imbalance_5c=book_fields.get("orderbook_imbalance_5c"),
             last_price=last,
             volume=_float(market.get("volume_fp")),
             volume_24h=_float(market.get("volume_24h_fp")),
@@ -786,18 +991,23 @@ class KalshiPublicDataClient:
         self,
         series_ticker: str,
         market: dict[str, Any],
+        *,
+        duration: str,
+        orderbook: dict[str, Any] | None = None,
     ) -> PredictionMarketSnapshot | None:
         close_time = _parse_iso(market.get("close_time"))
         open_time = _parse_iso(market.get("open_time"))
         timestamp = _parse_iso(market.get("updated_time")) or ensure_utc(datetime.now(tz=UTC))
         yes_bid = _float(market.get("yes_bid_dollars"))
         yes_ask = _float(market.get("yes_ask_dollars"))
+        book_fields = _kalshi_orderbook_fields(orderbook)
+        yes_bid = book_fields.get("up_bid", yes_bid) if book_fields else yes_bid
+        yes_ask = book_fields.get("up_ask", yes_ask) if book_fields else yes_ask
         last = _float(market.get("last_price_dollars"))
         mid = _midpoint(yes_bid, yes_ask, last)
-        duration = "1h" if series_ticker in {"KXBTC", "KXBTCD"} else "unknown"
         return PredictionMarketSnapshot(
             provider="kalshi",
-            duration=duration,
+            duration=f"ladder_{duration}",
             timestamp_utc=timestamp,
             market_id=str(market.get("ticker", "")),
             market_slug=str(market.get("ticker", "")),
@@ -811,6 +1021,17 @@ class KalshiPublicDataClient:
             down_bid=_float(market.get("no_bid_dollars")),
             down_ask=_float(market.get("no_ask_dollars")),
             down_mid=1.0 - mid if mid is not None else None,
+            up_bid_size=book_fields.get("up_bid_size"),
+            up_ask_size=book_fields.get("up_ask_size"),
+            up_bid_depth_1c=book_fields.get("up_bid_depth_1c"),
+            up_bid_depth_3c=book_fields.get("up_bid_depth_3c"),
+            up_bid_depth_5c=book_fields.get("up_bid_depth_5c"),
+            up_ask_depth_1c=book_fields.get("up_ask_depth_1c"),
+            up_ask_depth_3c=book_fields.get("up_ask_depth_3c"),
+            up_ask_depth_5c=book_fields.get("up_ask_depth_5c"),
+            orderbook_imbalance_1c=book_fields.get("orderbook_imbalance_1c"),
+            orderbook_imbalance_3c=book_fields.get("orderbook_imbalance_3c"),
+            orderbook_imbalance_5c=book_fields.get("orderbook_imbalance_5c"),
             last_price=last,
             volume=_float(market.get("volume_fp")),
             volume_24h=_float(market.get("volume_24h_fp")),
@@ -836,6 +1057,61 @@ def _candlestick_close(value: Any) -> float | None:
     return None
 
 
+def _kalshi_levels(orderbook: dict[str, Any] | None, side: str) -> list[tuple[float, float]]:
+    if not isinstance(orderbook, dict):
+        return []
+    container = orderbook.get("orderbook_fp") if isinstance(orderbook.get("orderbook_fp"), dict) else orderbook
+    raw_levels = container.get(f"{side}_dollars") if isinstance(container, dict) else None
+    if raw_levels is None and isinstance(container, dict):
+        raw_levels = container.get(side)
+    levels: list[tuple[float, float]] = []
+    if not isinstance(raw_levels, list):
+        return levels
+    for raw in raw_levels:
+        if isinstance(raw, list | tuple) and len(raw) >= 2:
+            price = _float(raw[0])
+            size = _float(raw[1])
+        elif isinstance(raw, dict):
+            price = _float(raw.get("price") or raw.get("price_dollars"))
+            size = _float(raw.get("size") or raw.get("quantity") or raw.get("contracts"))
+        else:
+            continue
+        if price is not None:
+            levels.append((price, size or 0.0))
+    return levels
+
+
+def _kalshi_orderbook_fields(orderbook: dict[str, Any] | None) -> dict[str, float]:
+    yes_levels = _kalshi_levels(orderbook, "yes")
+    no_levels = _kalshi_levels(orderbook, "no")
+    if not yes_levels and not no_levels:
+        return {}
+    yes_bid, yes_bid_size = max(yes_levels, default=(None, None), key=lambda item: item[0])
+    no_bid, no_bid_size = max(no_levels, default=(None, None), key=lambda item: item[0])
+    yes_ask = 1.0 - no_bid if no_bid is not None else None
+    yes_ask_size = no_bid_size
+    fields: dict[str, float] = {}
+    for key, value in {
+        "up_bid": yes_bid,
+        "up_bid_size": yes_bid_size,
+        "up_ask": yes_ask,
+        "up_ask_size": yes_ask_size,
+    }.items():
+        if value is not None:
+            fields[key] = float(value)
+    for width, suffix in ((0.01, "1c"), (0.03, "3c"), (0.05, "5c")):
+        bid_depth = _depth_near_best(yes_levels, best=yes_bid, width=width, bid_side=True)
+        ask_depth = _depth_near_best(no_levels, best=no_bid, width=width, bid_side=True)
+        for key, value in {
+            f"up_bid_depth_{suffix}": bid_depth,
+            f"up_ask_depth_{suffix}": ask_depth,
+            f"orderbook_imbalance_{suffix}": _depth_imbalance(bid_depth, ask_depth),
+        }.items():
+            if value is not None:
+                fields[key] = float(value)
+    return fields
+
+
 def write_prediction_market_snapshots(path: Path, snapshots: Sequence[PredictionMarketSnapshot]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -853,6 +1129,14 @@ def read_prediction_market_snapshots(path: Path) -> list[PredictionMarketSnapsho
     return snapshots
 
 
+def _cache_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def load_prediction_market_snapshots(
     *,
     start: datetime,
@@ -866,6 +1150,8 @@ def load_prediction_market_snapshots(
     start = ensure_utc(start)
     end = ensure_utc(end)
     durations = tuple(dict.fromkeys(duration.strip().lower() for duration in durations if duration.strip()))
+    polymarket_unsupported = [duration for duration in durations if duration not in POLYMARKET_BTC_UPDOWN_DURATIONS]
+    kalshi_unsupported = [duration for duration in durations if duration not in KALSHI_BTC_DURATION_SERIES]
     duration_key = "-".join(durations) or "none"
     cache_path = (
         cache_dir
@@ -880,18 +1166,30 @@ def load_prediction_market_snapshots(
         return PredictionMarketLoadResult(
             snapshots=snapshots,
             coverage={
-                "cache": {"path": str(cache_path), "hit": True},
+                "cache": {
+                    "path": str(cache_path),
+                    "hit": True,
+                    "sha256": _cache_file_sha256(cache_path),
+                },
                 "snapshots": len(snapshots),
                 "durations": list(durations),
                 "polymarket": {
                     "api": "gamma_discovery_plus_clob_v2_market_data",
                     "snapshots": sum(provider_duration_counts.get("polymarket", {}).values()),
                     "duration_snapshots": provider_duration_counts.get("polymarket", {}),
+                    "supported_durations": [
+                        duration for duration in durations if duration in POLYMARKET_BTC_UPDOWN_DURATIONS
+                    ],
+                    "unsupported_durations": polymarket_unsupported,
                 },
                 "kalshi": {
                     "api": "trade_api_v2_public_market_data",
                     "snapshots": sum(provider_duration_counts.get("kalshi", {}).values()),
                     "duration_snapshots": provider_duration_counts.get("kalshi", {}),
+                    "supported_durations": [
+                        duration for duration in durations if duration in KALSHI_BTC_DURATION_SERIES
+                    ],
+                    "unsupported_durations": kalshi_unsupported,
                 },
             },
         )
@@ -932,17 +1230,27 @@ def load_prediction_market_snapshots(
     return PredictionMarketLoadResult(
         snapshots=snapshots,
         coverage={
-            "cache": {"path": str(cache_path), "hit": False},
+            "cache": {
+                "path": str(cache_path),
+                "hit": False,
+                "sha256": _cache_file_sha256(cache_path),
+            },
             "durations": list(durations),
             "snapshots": len(snapshots),
             "polymarket": {
                 **poly_coverage,
+                "supported_durations": [
+                    duration for duration in durations if duration in POLYMARKET_BTC_UPDOWN_DURATIONS
+                ],
                 "markets": len(poly_markets),
                 "snapshots": len(poly_snapshots),
                 "api": "gamma_discovery_plus_clob_v2_market_data",
             },
             "kalshi": {
                 **kalshi_coverage,
+                "supported_durations": [
+                    duration for duration in durations if duration in KALSHI_BTC_DURATION_SERIES
+                ],
                 "snapshots": len(kalshi_snapshots),
                 "api": "trade_api_v2_public_market_data",
             },

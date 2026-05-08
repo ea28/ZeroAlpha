@@ -5,12 +5,13 @@ from __future__ import annotations
 from bisect import bisect_left, bisect_right
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from math import floor, sqrt
+from math import floor, isfinite, log, sqrt
 from pathlib import Path
 from statistics import mean, pstdev
 import json
 
-from zeroalpha.backtest.fills import simulate_limit_fill
+from zeroalpha.bars import bar_start_timestamp_utc
+from zeroalpha.backtest.fills import SimulatedFill, simulate_limit_fill
 from zeroalpha.backtest.simple import (
     _estimate_trade_notional,
     _median,
@@ -24,6 +25,7 @@ from zeroalpha.models.dataset import MetaLabelSample
 from zeroalpha.models.ensemble import (
     FoldPrediction,
     MetaLabelWalkForwardReport,
+    _passes_selection_and_ev_gate,
     report_feature_importance_summary,
     report_model_family_summary,
     report_native_importance_summary,
@@ -62,6 +64,8 @@ class MLBacktestTrade:
     spread_cost_estimate: float
     slippage_cost_estimate: float
     safety_margin_estimate: float
+    max_adverse_excursion: float = 0.0
+    max_favorable_excursion: float = 0.0
     side: str = ""
     exit_overlay_reason: str = ""
 
@@ -87,17 +91,28 @@ class MLBacktestSummary:
     candidate_predictions: int
     model_approved_signals: int
     trades: int
+    configured_span_days: float
     prediction_span_days: float
     active_trade_span_days: float
+    trades_per_configured_day: float
     trades_per_prediction_day: float
     trades_per_active_day: float
+    pnl_per_configured_day: float
+    pnl_per_prediction_day: float
     hit_rate: float
     average_net_return: float
     median_net_return: float
     gross_pnl: float
     net_pnl: float
     sharpe: float
+    daily_sharpe: float
+    trade_level_sharpe: float
+    deflated_sharpe: float
+    multiple_testing_trials: int
+    multiple_testing_haircut: float
     profit_factor: float
+    max_intratrade_drawdown: float
+    average_max_adverse_excursion: float
     total_commission_estimate: float
     total_spread_cost_estimate: float
     total_slippage_cost_estimate: float
@@ -150,6 +165,8 @@ class PendingMLBacktestTrade:
     spread_cost_estimate: float
     slippage_cost_estimate: float
     safety_margin_estimate: float
+    max_adverse_excursion: float = 0.0
+    max_favorable_excursion: float = 0.0
     side: str = ""
     exit_overlay_reason: str = ""
 
@@ -192,6 +209,52 @@ def _record_rejection(
     )
 
 
+def _sample_min_exit_timestamp(sample: MetaLabelSample, fill_timestamp: datetime) -> datetime:
+    value = sample.features.get(
+        "event_min_holding_seconds",
+        sample.features.get("min_holding_seconds", 0.0),
+    )
+    try:
+        min_holding_seconds = float(value)
+    except (TypeError, ValueError):
+        min_holding_seconds = 0.0
+    if not isfinite(min_holding_seconds) or min_holding_seconds <= 0:
+        return fill_timestamp
+    return fill_timestamp + timedelta(seconds=min_holding_seconds)
+
+
+def _execution_entry_price(entry_bars: list[Bar], entry_timestamp: datetime, fallback: float) -> float:
+    for bar in sorted(entry_bars, key=lambda row: row.timestamp_utc):
+        if bar_start_timestamp_utc(bar) >= entry_timestamp and bar.open > 0:
+            return bar.open
+    return fallback
+
+
+def _simulate_market_entry_fill(
+    *,
+    entry_bars: list[Bar],
+    entry_timestamp: datetime,
+    fallback_price: float,
+) -> SimulatedFill:
+    for bar in sorted(entry_bars, key=lambda row: row.timestamp_utc):
+        bar_start = bar_start_timestamp_utc(bar)
+        if bar_start >= entry_timestamp and bar.open > 0:
+            return SimulatedFill(
+                True,
+                bar.open,
+                "market_entry_open",
+                timestamp_utc=bar_start,
+            )
+    if fallback_price > 0:
+        return SimulatedFill(
+            True,
+            fallback_price,
+            "market_entry_fallback",
+            timestamp_utc=entry_timestamp,
+        )
+    return SimulatedFill(False, None, "no_entry_bars")
+
+
 def _replay_exit_from_fill(
     *,
     sample: MetaLabelSample,
@@ -213,11 +276,16 @@ def _replay_exit_from_fill(
     exit_bar = ordered[-1]
     outcome = "vertical_replay"
     exit_price = exit_bar.close
+    min_exit_timestamp = _sample_min_exit_timestamp(sample, fill_timestamp)
 
     if side == Side.SELL:
         lower = fill_price * (1 - sample.net_profit_target - cost_fraction)
         upper = fill_price * (1 + sample.net_stop_loss - cost_fraction)
         for bar in ordered:
+            if bar_start_timestamp_utc(bar) <= fill_timestamp:
+                continue
+            if bar_start_timestamp_utc(bar) < min_exit_timestamp:
+                continue
             hit_profit = bar.low <= lower
             hit_stop = bar.high >= upper
             if hit_profit and hit_stop:
@@ -244,6 +312,10 @@ def _replay_exit_from_fill(
         upper = fill_price * (1 + sample.net_profit_target + cost_fraction)
         lower = fill_price * (1 + cost_fraction - sample.net_stop_loss)
         for bar in ordered:
+            if bar_start_timestamp_utc(bar) <= fill_timestamp:
+                continue
+            if bar_start_timestamp_utc(bar) < min_exit_timestamp:
+                continue
             hit_profit = bar.high >= upper
             hit_stop = bar.low <= lower
             if hit_profit and hit_stop:
@@ -291,14 +363,38 @@ def _bar_side_extreme_return(side: Side, *, entry_price: float, bar: Bar) -> tup
     return favorable, adverse
 
 
+def _trade_excursions(
+    *,
+    side: Side,
+    entry_price: float,
+    exit_bars: list[Bar],
+    exit_timestamp: datetime,
+) -> tuple[float, float]:
+    if entry_price <= 0:
+        return 0.0, 0.0
+    adverse_excursion = 0.0
+    favorable_excursion = 0.0
+    for bar in sorted(exit_bars, key=lambda row: row.timestamp_utc):
+        if bar.timestamp_utc > exit_timestamp:
+            break
+        favorable, adverse = _bar_side_extreme_return(
+            side,
+            entry_price=entry_price,
+            bar=bar,
+        )
+        favorable_excursion = max(favorable_excursion, favorable)
+        adverse_excursion = max(adverse_excursion, -adverse)
+    return adverse_excursion, favorable_excursion
+
+
 def _checkpoint_bar(
     ordered: list[Bar],
     *,
     fill_timestamp: datetime,
     replayed_exit_timestamp: datetime,
-    checkpoint_minutes: int,
+    checkpoint_seconds: int,
 ) -> tuple[int, Bar] | None:
-    target = fill_timestamp + timedelta(minutes=checkpoint_minutes)
+    target = fill_timestamp + timedelta(seconds=checkpoint_seconds)
     if target >= replayed_exit_timestamp:
         return None
     for idx, bar in enumerate(ordered):
@@ -307,6 +403,22 @@ def _checkpoint_bar(
                 return None
             return idx, bar
     return None
+
+
+def _checkpoint_label(checkpoint_seconds: int) -> str:
+    if checkpoint_seconds >= 60 and checkpoint_seconds % 60 == 0:
+        return f"{checkpoint_seconds // 60}m"
+    return f"{checkpoint_seconds}s"
+
+
+def _checkpoint_seconds(
+    *,
+    checkpoints_minutes: tuple[int, ...],
+    checkpoints_seconds: tuple[int, ...],
+) -> tuple[int, ...]:
+    seconds = {value * 60 for value in checkpoints_minutes if value > 0}
+    seconds.update(value for value in checkpoints_seconds if value > 0)
+    return tuple(sorted(seconds))
 
 
 def _apply_dynamic_exit_overlay(
@@ -320,18 +432,24 @@ def _apply_dynamic_exit_overlay(
     replayed_exit: ReplayedExit,
     round_trip_cost_bps: float,
     checkpoints_minutes: tuple[int, ...],
+    checkpoints_seconds: tuple[int, ...],
     adverse_bps: float,
     giveback_bps: float,
     min_profit_bps: float,
     weak_probability: float,
     weak_expected_value_bps: float,
 ) -> ReplayedExit:
-    if not checkpoints_minutes:
+    checkpoint_values = _checkpoint_seconds(
+        checkpoints_minutes=checkpoints_minutes,
+        checkpoints_seconds=checkpoints_seconds,
+    )
+    if not checkpoint_values:
         return replayed_exit
+    min_exit_timestamp = _sample_min_exit_timestamp(sample, fill_timestamp)
     ordered = [
         bar
         for bar in sorted(exit_bars, key=lambda row: row.timestamp_utc)
-        if fill_timestamp <= bar.timestamp_utc <= replayed_exit.timestamp_utc
+        if min_exit_timestamp <= bar.timestamp_utc <= replayed_exit.timestamp_utc
     ]
     if not ordered:
         return replayed_exit
@@ -342,12 +460,13 @@ def _apply_dynamic_exit_overlay(
         or prediction.expected_value * 10_000 <= weak_expected_value_bps
         or prediction.predicted_return < 0
     )
-    for checkpoint in sorted({value for value in checkpoints_minutes if value > 0}):
+    for checkpoint in checkpoint_values:
+        label = _checkpoint_label(checkpoint)
         row = _checkpoint_bar(
             ordered,
             fill_timestamp=fill_timestamp,
             replayed_exit_timestamp=replayed_exit.timestamp_utc,
-            checkpoint_minutes=checkpoint,
+            checkpoint_seconds=checkpoint,
         )
         if row is None:
             continue
@@ -358,13 +477,19 @@ def _apply_dynamic_exit_overlay(
         current_gross_return = _side_gross_return(side, entry_price=fill_price, exit_price=bar.close)
         current_bps = current_gross_return * 10_000
         giveback = max_favorable_bps - current_bps
+        bar_return_bps = _side_gross_return(side, entry_price=bar.open, exit_price=bar.close) * 10_000
+        bar_range_bps = 10_000 * max(bar.high - bar.low, 0.0) / bar.close if bar.close > 0 else 0.0
         reason = ""
         if current_bps <= -adverse_bps and weak_signal:
-            reason = f"adverse_{checkpoint}m"
+            reason = f"adverse_{label}"
+        elif bar_return_bps <= -max(adverse_bps * 0.50, 5.0) and weak_signal:
+            reason = f"micro_reversal_{label}"
+        elif bar_range_bps >= max(adverse_bps * 2.0, giveback_bps) and weak_signal:
+            reason = f"volatility_shock_{label}"
         elif giveback >= giveback_bps and current_bps >= min_profit_bps:
-            reason = f"giveback_{checkpoint}m"
-        elif checkpoint >= 120 and weak_signal and current_bps <= 0:
-            reason = f"weak_no_progress_{checkpoint}m"
+            reason = f"giveback_{label}"
+        elif checkpoint >= 120 * 60 and weak_signal and current_bps <= 0:
+            reason = f"weak_no_progress_{label}"
         if not reason:
             continue
         net_return = current_gross_return - round_trip_cost_bps / 10_000
@@ -412,6 +537,39 @@ def _annualized_daily_sharpe(
     if volatility == 0:
         return 0.0
     return mean(returns) / volatility * sqrt(365)
+
+
+def _annualized_trade_level_sharpe(
+    *,
+    trades: list[MLBacktestTrade],
+    span_days: float,
+) -> float:
+    returns = [trade.net_return for trade in trades]
+    if len(returns) < 2 or span_days <= 0:
+        return 0.0
+    volatility = pstdev(returns)
+    if volatility == 0:
+        return 0.0
+    trades_per_year = len(returns) / span_days * 365
+    return mean(returns) / volatility * sqrt(max(trades_per_year, 0.0))
+
+
+def _multiple_testing_trials(data_coverage: dict[str, object]) -> int:
+    value = data_coverage.get("multiple_testing_trials")
+    if not isinstance(value, int | float):
+        diagnostics = data_coverage.get("multiple_testing")
+        if isinstance(diagnostics, dict):
+            value = diagnostics.get("trials")
+    if not isinstance(value, int | float) or not isfinite(float(value)):
+        return 1
+    return max(1, int(value))
+
+
+def _deflated_sharpe_approximation(sharpe: float, trials: int) -> tuple[float, float]:
+    if trials <= 1:
+        return sharpe, 0.0
+    haircut = sqrt(2.0 * log(float(trials)))
+    return sharpe - haircut, haircut
 
 
 def _candidate_type_notional_scale(type_threshold: dict[str, object] | None) -> float | None:
@@ -463,7 +621,12 @@ def _prediction_score_value(prediction: FoldPrediction, field: str) -> float:
         return prediction.predicted_return
     if field == "selection_score":
         return prediction.selection_score
-    raise ValueError("sizing_score_field must be probability, expected_value, predicted_return, or selection_score")
+    if field == "trade_score":
+        return prediction.trade_score
+    raise ValueError(
+        "sizing_score_field must be probability, expected_value, predicted_return, "
+        "selection_score, or trade_score"
+    )
 
 
 def _sample_spread_bps(sample: MetaLabelSample) -> float | None:
@@ -497,6 +660,7 @@ def _bucket_sized_notional(
     cap_notional: float,
     sizing_mode: str,
     score_field: str,
+    score_direction: str,
     base_notional: float,
     mid_notional: float,
     high_notional: float,
@@ -514,7 +678,10 @@ def _bucket_sized_notional(
     mid = min(max(mid, base), cap_notional)
     high = min(max(high, mid), cap_notional)
 
-    score = _prediction_score_value(prediction, score_field)
+    if score_direction not in {"high", "low"}:
+        raise ValueError("sizing_score_direction must be high or low")
+    raw_score = _prediction_score_value(prediction, score_field)
+    score = raw_score if score_direction == "high" else -raw_score
     spread = _sample_spread_bps(sample)
     spread_ok = spread is None or max_spread_bps <= 0 or spread <= max_spread_bps
     liquidity = _sample_liquidity_score(sample)
@@ -539,6 +706,7 @@ def _apply_notional_sizing(
     cap_notional: float,
     sizing_mode: str,
     score_field: str,
+    score_direction: str,
     base_notional: float,
     mid_notional: float,
     high_notional: float,
@@ -565,6 +733,7 @@ def _apply_notional_sizing(
             cap_notional=cap_notional,
             sizing_mode=sizing_mode,
             score_field=score_field,
+            score_direction=score_direction,
             base_notional=base_notional,
             mid_notional=mid_notional,
             high_notional=high_notional,
@@ -574,6 +743,20 @@ def _apply_notional_sizing(
             min_liquidity_score=min_liquidity_score if sizing_mode == "liquidity_score_bucket" else 0.0,
         )
     raise ValueError("sizing_mode must be fixed, confidence, score_bucket, or liquidity_score_bucket")
+
+
+def _requested_notional_for_sizing_cap(
+    *,
+    requested_notional: float,
+    sizing_mode: str,
+    base_notional: float,
+    mid_notional: float,
+    high_notional: float,
+) -> float:
+    if sizing_mode not in {"score_bucket", "liquidity_score_bucket"}:
+        return requested_notional
+    bucket_cap = max(base_notional, mid_notional, high_notional, 0.0)
+    return max(requested_notional, bucket_cap)
 
 
 def _research_selection_allows_negative_ev(prediction: FoldPrediction) -> bool:
@@ -612,6 +795,24 @@ def _round_trip_commission_from_cost(notional: float, cost) -> float:
     return notional * cost.commission_bps / 10_000
 
 
+def _coverage_span_days(coverage: object) -> float:
+    if not isinstance(coverage, dict):
+        return 0.0
+    span = coverage.get("span_days")
+    if isinstance(span, (int, float)) and isfinite(float(span)) and float(span) > 0:
+        return float(span)
+    quality_start = coverage.get("start")
+    quality_end = coverage.get("end")
+    if not isinstance(quality_start, str) or not isinstance(quality_end, str):
+        return 0.0
+    try:
+        start = datetime.fromisoformat(quality_start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(quality_end.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return max((end - start).total_seconds() / 86_400, 0.0)
+
+
 def _summarize(
     *,
     report: MetaLabelWalkForwardReport,
@@ -631,6 +832,12 @@ def _summarize(
     returns = [trade.net_return for trade in trades]
     wins = [trade.pnl for trade in trades if trade.pnl > 0]
     losses = [-trade.pnl for trade in trades if trade.pnl < 0]
+    adverse_excursions = [trade.max_adverse_excursion for trade in trades]
+    intratrade_drawdowns = [
+        (trade.max_adverse_excursion * trade.notional) / start_equity
+        for trade in trades
+        if start_equity > 0
+    ]
     reject_reasons: dict[str, int] = {}
     for rejection in rejections:
         reject_reasons[rejection.reason] = reject_reasons.get(rejection.reason, 0) + 1
@@ -669,6 +876,14 @@ def _summarize(
     fold_briers = [fold.brier_score for fold in report.folds]
     fold_log_losses = [fold.log_loss for fold in report.folds if fold.log_loss is not None]
     prediction_times = [_prediction_timestamp(prediction) for prediction in report.predictions]
+    configured_span_days = _coverage_span_days(report.data_coverage.get("requested_window"))
+    if configured_span_days <= 0:
+        configured_span_days = _coverage_span_days(report.data_coverage.get("primary"))
+    if configured_span_days <= 0 and prediction_times:
+        configured_span_days = max(
+            (max(prediction_times) - min(prediction_times)).total_seconds() / 86_400,
+            0.0,
+        )
     if len(prediction_times) >= 2:
         prediction_span_days = max(
             (max(prediction_times) - min(prediction_times)).total_seconds() / 86_400,
@@ -682,6 +897,17 @@ def _summarize(
         active_trade_span_days = max((active_end - active_start).total_seconds() / 86_400, 1 / 24)
     else:
         active_trade_span_days = 0.0
+    net_pnl = sum(trade.pnl for trade in trades)
+    daily_sharpe = _annualized_daily_sharpe(report=report, trades=trades, start_equity=start_equity)
+    trade_level_sharpe = _annualized_trade_level_sharpe(
+        trades=trades,
+        span_days=prediction_span_days,
+    )
+    multiple_testing_trials = _multiple_testing_trials(report.data_coverage)
+    deflated_sharpe, multiple_testing_haircut = _deflated_sharpe_approximation(
+        daily_sharpe,
+        multiple_testing_trials,
+    )
     return MLBacktestSummary(
         start_equity=start_equity,
         end_equity=end_equity,
@@ -690,17 +916,28 @@ def _summarize(
         candidate_predictions=len(report.predictions),
         model_approved_signals=sum(1 for prediction in report.predictions if prediction.should_trade),
         trades=len(trades),
+        configured_span_days=configured_span_days,
         prediction_span_days=prediction_span_days,
         active_trade_span_days=active_trade_span_days,
+        trades_per_configured_day=(len(trades) / configured_span_days if configured_span_days else 0.0),
         trades_per_prediction_day=(len(trades) / prediction_span_days if prediction_span_days else 0.0),
         trades_per_active_day=(len(trades) / active_trade_span_days if active_trade_span_days else 0.0),
+        pnl_per_configured_day=(net_pnl / configured_span_days if configured_span_days else 0.0),
+        pnl_per_prediction_day=(net_pnl / prediction_span_days if prediction_span_days else 0.0),
         hit_rate=mean([1 if trade.pnl > 0 else 0 for trade in trades]) if trades else 0.0,
         average_net_return=mean(returns) if returns else 0.0,
         median_net_return=_median(returns),
         gross_pnl=sum(trade.gross_pnl for trade in trades),
-        net_pnl=sum(trade.pnl for trade in trades),
-        sharpe=_annualized_daily_sharpe(report=report, trades=trades, start_equity=start_equity),
+        net_pnl=net_pnl,
+        sharpe=daily_sharpe,
+        daily_sharpe=daily_sharpe,
+        trade_level_sharpe=trade_level_sharpe,
+        deflated_sharpe=deflated_sharpe,
+        multiple_testing_trials=multiple_testing_trials,
+        multiple_testing_haircut=multiple_testing_haircut,
         profit_factor=(sum(wins) / sum(losses)) if losses else float("inf") if wins else 0.0,
+        max_intratrade_drawdown=max(intratrade_drawdowns, default=0.0),
+        average_max_adverse_excursion=mean(adverse_excursions) if adverse_excursions else 0.0,
         total_commission_estimate=sum(trade.commission_estimate for trade in trades),
         total_spread_cost_estimate=sum(trade.spread_cost_estimate for trade in trades),
         total_slippage_cost_estimate=sum(trade.slippage_cost_estimate for trade in trades),
@@ -734,6 +971,7 @@ def run_ml_backtest(
     confidence_scaled_sizing: bool = False,
     sizing_mode: str = "fixed",
     sizing_score_field: str = "probability",
+    sizing_score_direction: str = "high",
     sizing_base_notional: float = 0.0,
     sizing_mid_notional: float = 0.0,
     sizing_high_notional: float = 0.0,
@@ -743,15 +981,21 @@ def run_ml_backtest(
     sizing_min_liquidity_score: float = 0.0,
     dynamic_exit_overlay: bool = False,
     dynamic_exit_checkpoints_minutes: tuple[int, ...] = (15, 30, 60, 120, 240),
+    dynamic_exit_checkpoints_seconds: tuple[int, ...] = (),
     dynamic_exit_adverse_bps: float = 25.0,
     dynamic_exit_giveback_bps: float = 35.0,
     dynamic_exit_min_profit_bps: float = 8.0,
     dynamic_exit_weak_probability: float = 0.55,
     dynamic_exit_weak_expected_value_bps: float = 0.0,
     experiment_max_loss_usd: float = 0.0,
+    min_expected_gross_edge_bps: float = 0.0,
+    selection_score_mode: str = "expected_utility",
+    entry_order_model: str = "limit",
 ) -> tuple[MLBacktestSummary, list[MLBacktestTrade], list[MLBacktestRejection]]:
     if experiment_max_loss_usd < 0:
         raise ValueError("experiment_max_loss_usd must be nonnegative")
+    if entry_order_model not in {"limit", "market"}:
+        raise ValueError("entry_order_model must be limit or market")
     ordered_bars = sorted(bars, key=lambda bar: bar.timestamp_utc)
     timestamps = [bar.timestamp_utc for bar in ordered_bars]
     sample_by_event = {sample.event_id: sample for sample in samples}
@@ -799,7 +1043,10 @@ def run_ml_backtest(
                 consecutive_losses += 1
             else:
                 consecutive_losses = 0
-            if consecutive_losses >= config.risk.consecutive_loss_limit:
+            if (
+                config.risk.consecutive_loss_limit > 0
+                and consecutive_losses >= config.risk.consecutive_loss_limit
+            ):
                 cooldown_until = pending.exit_timestamp_utc + timedelta(
                     hours=config.risk.cooldown_hours_after_stopouts
                 )
@@ -834,6 +1081,8 @@ def run_ml_backtest(
                     spread_cost_estimate=pending.spread_cost_estimate,
                     slippage_cost_estimate=pending.slippage_cost_estimate,
                     safety_margin_estimate=pending.safety_margin_estimate,
+                    max_adverse_excursion=pending.max_adverse_excursion,
+                    max_favorable_excursion=pending.max_favorable_excursion,
                     side=pending.side,
                     exit_overlay_reason=pending.exit_overlay_reason,
                 )
@@ -857,10 +1106,25 @@ def run_ml_backtest(
         if not prediction.should_trade:
             _record_rejection(rejections, prediction, reason=prediction.decision_reason, equity=equity)
             continue
-        if enforce_production_gate and prediction.probability < config.model.minimum_probability:
+        probability_gate_required = selection_score_mode != "return_first"
+        if (
+            enforce_production_gate
+            and probability_gate_required
+            and prediction.probability < config.model.minimum_probability
+        ):
             _record_rejection(rejections, prediction, reason="probability_below_threshold", equity=equity)
             continue
-        if enforce_production_gate and prediction.expected_value < config.model.minimum_expected_value:
+        production_ev_gate_ok = (
+            _passes_selection_and_ev_gate(
+                selection_score_mode=selection_score_mode,
+                selection_score=prediction.selection_score,
+                expected_value=prediction.expected_value,
+                minimum_expected_value=config.model.minimum_expected_value,
+            )
+            if selection_score_mode == "return_first"
+            else prediction.expected_value >= config.model.minimum_expected_value
+        )
+        if enforce_production_gate and not production_ev_gate_ok:
             _record_rejection(rejections, prediction, reason="expected_value_below_threshold", equity=equity)
             continue
         if (
@@ -879,6 +1143,17 @@ def run_ml_backtest(
         ):
             _record_rejection(rejections, prediction, reason="spot_short_not_executable", equity=equity)
             continue
+        if min_expected_gross_edge_bps > 0:
+            predicted_net_edge_bps = max(prediction.expected_value, prediction.predicted_return) * 10_000
+            predicted_gross_edge_bps = predicted_net_edge_bps + sample.round_trip_cost_bps
+            if predicted_gross_edge_bps < min_expected_gross_edge_bps:
+                _record_rejection(
+                    rejections,
+                    prediction,
+                    reason="expected_gross_edge_below_cost_floor",
+                    equity=equity,
+                )
+                continue
         if assumed_spread_bps > config.risk.max_spread_bps:
             _record_rejection(rejections, prediction, reason="spread_too_wide", equity=equity)
             continue
@@ -902,11 +1177,18 @@ def run_ml_backtest(
             _record_rejection(rejections, prediction, reason="rolling_drawdown_stop", equity=equity)
             break
 
+        cap_requested_notional = _requested_notional_for_sizing_cap(
+            requested_notional=requested_notional,
+            sizing_mode=effective_sizing_mode,
+            base_notional=sizing_base_notional,
+            mid_notional=sizing_mid_notional,
+            high_notional=sizing_high_notional,
+        )
         cap_notional = _estimate_trade_notional(
             equity=equity,
             risk_per_trade=config.risk.risk_per_trade,
             net_stop_loss=sample.net_stop_loss,
-            requested_notional=requested_notional,
+            requested_notional=cap_requested_notional,
             max_notional=config.risk.paper_max_notional,
             cap_by_equity=config.contract.instrument_model != "futures",
         )
@@ -917,6 +1199,7 @@ def run_ml_backtest(
             cap_notional=cap_notional,
             sizing_mode=effective_sizing_mode,
             score_field=sizing_score_field,
+            score_direction=sizing_score_direction,
             base_notional=sizing_base_notional,
             mid_notional=sizing_mid_notional,
             high_notional=sizing_high_notional,
@@ -936,7 +1219,11 @@ def run_ml_backtest(
         if trade_notional < 0:
             trade_notional = 0.0
         if config.contract.instrument_model == "spot_crypto" and sample.side == Side.BUY.value:
-            available_spot_notional = max(equity - _open_spot_notional(pending_trades), 0.0)
+            spot_exposure_cap = min(equity, config.risk.paper_max_notional)
+            available_spot_notional = max(
+                spot_exposure_cap - _open_spot_notional(pending_trades),
+                0.0,
+            )
             if available_spot_notional <= 0:
                 _record_rejection(rejections, prediction, reason="insufficient_cash", equity=equity)
                 continue
@@ -963,21 +1250,34 @@ def run_ml_backtest(
             end=entry_deadline,
         )
         entry_side = Side.SELL if sample.side == Side.SELL.value else Side.BUY
-        limit_adjustment = entry_limit_offset_bps / 10_000
-        limit_price = (
-            sample.label_detail.entry_price * (1 + limit_adjustment)
-            if entry_side == Side.SELL
-            else sample.label_detail.entry_price * (1 - limit_adjustment)
-        )
-        fill = simulate_limit_fill(
-            entry_side,
-            limit_price,
+        entry_reference_price = _execution_entry_price(
             entry_bars,
-            latency_seconds=config.execution.simulated_latency_seconds,
-            require_trade_through_bps=config.execution.limit_trade_through_bps,
-            fill_probability=config.execution.limit_fill_probability,
-            fill_fraction=config.execution.partial_fill_fraction,
+            sample.label_detail.entry_timestamp_utc,
+            sample.label_detail.entry_price,
         )
+        if entry_order_model == "market":
+            fill = _simulate_market_entry_fill(
+                entry_bars=entry_bars,
+                entry_timestamp=sample.label_detail.entry_timestamp_utc,
+                fallback_price=entry_reference_price,
+            )
+        else:
+            limit_adjustment = entry_limit_offset_bps / 10_000
+            limit_price = (
+                entry_reference_price * (1 + limit_adjustment)
+                if entry_side == Side.SELL
+                else entry_reference_price * (1 - limit_adjustment)
+            )
+            fill = simulate_limit_fill(
+                entry_side,
+                limit_price,
+                entry_bars,
+                activation_timestamp=sample.label_detail.entry_timestamp_utc,
+                latency_seconds=config.execution.simulated_latency_seconds,
+                require_trade_through_bps=config.execution.limit_trade_through_bps,
+                fill_probability=config.execution.limit_fill_probability,
+                fill_fraction=config.execution.partial_fill_fraction,
+            )
         if not fill.filled or fill.price is None:
             _record_rejection(rejections, prediction, reason="missed_entry_fill", equity=equity)
             continue
@@ -1033,6 +1333,7 @@ def run_ml_backtest(
                 replayed_exit=replayed_exit,
                 round_trip_cost_bps=cost.total_bps,
                 checkpoints_minutes=dynamic_exit_checkpoints_minutes,
+                checkpoints_seconds=dynamic_exit_checkpoints_seconds,
                 adverse_bps=dynamic_exit_adverse_bps,
                 giveback_bps=dynamic_exit_giveback_bps,
                 min_profit_bps=dynamic_exit_min_profit_bps,
@@ -1047,6 +1348,12 @@ def run_ml_backtest(
             filled_notional,
             cost,
             _round_trip_commission_from_cost(filled_notional, cost),
+        )
+        max_adverse_excursion, max_favorable_excursion = _trade_excursions(
+            side=entry_side,
+            entry_price=fill.price,
+            exit_bars=exit_bars,
+            exit_timestamp=replayed_exit.timestamp_utc,
         )
         pending_trades.append(
             PendingMLBacktestTrade(
@@ -1073,6 +1380,8 @@ def run_ml_backtest(
                 exit_timestamp_utc=replayed_exit.timestamp_utc,
                 outcome_type=replayed_exit.outcome_type,
                 round_trip_cost_bps=cost.total_bps,
+                max_adverse_excursion=max_adverse_excursion,
+                max_favorable_excursion=max_favorable_excursion,
                 side=sample.side,
                 exit_overlay_reason=replayed_exit.overlay_reason,
                 **cost_components,

@@ -110,8 +110,16 @@ Research feeds:
 - Kalshi Trade API v2: BTC directional 5m/15m markets when available,
   orderbooks, trades, candlesticks, and separated ladder/threshold series.
 - IBKR Gateway/TWS: execution truth, account/portfolio/PnL, commissions,
-  executions, top-of-book quotes, historical bars, market depth, and
-  tick-by-tick snapshots where permissions allow.
+  executions, top-of-book quotes, market depth, historical bars, and
+  tick-by-tick data where permissions allow. IBKR historical bars support
+  `1 secs`; IBKR's built-in real-time bars are only 5-second bars, so
+  trade-run verifies a `1 secs` historical bootstrap and then maintains live
+  1-second model bars from persistent top-of-book plus tick-by-tick updates.
+  For `AGGTRADES`/`TRADES` parity, the live tick stream must be `Last` or
+  `AllLast`; `BidAsk` is only top-of-book quote data. One second is treated as
+  the minimum data/exit granularity, not as a fixed holding period. Use
+  `--adaptive-horizon` to assign each signal its own volatility-scaled vertical
+  barrier from 1 second up to the configured cap.
 
 Prediction-market durations attempted by default:
 
@@ -169,6 +177,24 @@ HPO is nested inside walk-forward folds with `--hpo`. The objective can be
 `sharpe`, `net_pnl`, or `calmar`; current research optimizes PnL first, Sharpe
 second, and trade count third.
 
+Target-frequency settings are an upper turnover objective, not permission to
+fill a quota with losing calibration. By default the selector uses
+`expected_utility`, so probability, empirical payoff, predicted return, and
+downside all have to agree enough for a trade. Use
+`--allow-negative-ev-frequency-probe` only for explicit diagnostic runs.
+For aggressive intraday runs, prefer `--adaptive-selection-score-floor`; the
+learned floor is saved into production artifacts so IBKR trade-run applies the
+same weak-signal filter that the walk-forward backtest used.
+For high-fee short-horizon spot crypto, keep the default
+`minimum_expected_value` at `0.0` unless intentionally testing a stricter edge
+floor; a static floor larger than the net target can make every signal
+untradable.
+
+When `broker trade-run` uses `--use-model-exit-geometry`, synthetic exits use
+the model's gross price barriers (`gross_profit_move` and
+`gross_stop_distance`), not the net after-cost label targets. This keeps live
+paper exits aligned with the triple-barrier labels and ML backtest replay.
+
 ## Command Reference
 
 Local checks:
@@ -206,8 +232,14 @@ Research:
   --adaptive-threshold \
   --candidate-type-thresholds \
   --empirical-payoff-ev \
+  --selection-score expected_utility \
   --target-frequency-mode online \
   --capacity-release-mode planned \
+  --adaptive-horizon \
+  --min-holding-seconds 1 \
+  --adaptive-horizon-target-move-bps 50 \
+  --dynamic-exit-overlay \
+  --dynamic-exit-checkpoints-seconds 5,15,30,60,120,300 \
   --permutation-importance \
   --shap-importance \
   --output artifacts/backtests/ml_btcusdt_1h.json
@@ -218,6 +250,7 @@ Research:
   --candidate-mode active \
   --target-trades-per-day 4 \
   --target-frequency-mode online \
+  --selection-score expected_utility \
   --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
   --permutation-importance \
   --shap-importance \
@@ -231,6 +264,71 @@ Research:
   --models logistic,histgb,extratrees,lightgbm
 ```
 
+For 1-second IBKR spot research, keep execution modeled as spot crypto. Futures
+bars such as CME MBT can be passed through `--context-bars-jsonl` as predictors,
+but do not switch `--instrument-model futures` unless intentionally researching a
+separate futures-execution strategy.
+
+Local IBKR 1-second replay experiment suite:
+
+```bash
+.venv/bin/python scripts/ibkr_1s_experiment_suite.py --dry-run --limit 10 --python .venv/bin/python
+
+.venv/bin/python scripts/ibkr_1s_experiment_suite.py --run --python .venv/bin/python \
+  --name champion_repro_extratrees_return_first_1250x8 \
+  --name hpo_extratrees_quota_t6 \
+  --name data_context_full_ibkr_bidask_futures \
+  --name candidate_stride8_fold225_75_112 \
+  --name dynamic_exit_balanced_seconds
+```
+
+The suite writes a manifest plus ranked summaries under
+`artifacts/backtests/ibkr_1s_experiments_20260504/next_experiment_suite/`.
+All experiments keep spot crypto execution, the `$10K` aggregate spend cap,
+IBKR-style `0.18%` per-side commission with a `$1.75` minimum, and futures data
+only as optional features.
+
+Strict live-valid `$10K` BTC spot research:
+
+```bash
+.venv/bin/python -m zeroalpha.models.ibkr_experiments \
+  --output-dir artifacts/backtests/live_valid_strict_10k \
+  --category live_valid_strict_10k \
+  --limit 10 \
+  --dry-run
+
+.venv/bin/python -m zeroalpha.models.ibkr_experiments \
+  --output-dir artifacts/backtests/live_valid_strict_10k \
+  --category live_valid_strict_10k \
+  --run \
+  --force
+```
+
+This strict suite is intentionally data-first and fail-closed. A promoted run
+must use BTC/USD spot crypto execution, market-entry fill modeling, a `$10K`
+aggregate exposure cap, `0.18%` per-side commission with the `$1.75` minimum,
+tick-backed IBKR `1 secs` label/execution replay, online cash-aware selection,
+and serialized execution/sizing/horizon/setup/data contracts. The readiness gate
+requires at least seven calendar days of tick-backed 1-second replay and at least
+two walk-forward folds; fourteen or more days is preferred before comparing
+against the current strict live-valid baseline.
+
+The current repository includes only the short May 2026 1-second replay window
+used for smoke tests. With `--strict-live-valid-1s`, that six-hour window is
+expected to reject promotion with `window_too_short` and
+`too_few_walk_forward_folds`. That is a safety feature, not a failed strategy
+result. Collect or ingest multi-day IBKR tick-by-tick-backed bars before trusting
+the strict 1-second HPO matrix.
+
+The strict model path now supports explicit setup-family specialists
+(`mean_reversion_exhaustion`, `momentum_continuation`,
+`liquidity_vacuum_breakout`, and `chop_no_trade`), microstructure features,
+multi-head ranking targets for net return/MAE/MFE/time-to-exit/early adverse
+move, `capital_efficiency` selection, dynamic exits from 5 seconds through 1
+hour, and a hard gross-edge-over-cost floor. Futures, Binance, and prediction
+market feeds may be used only as causal features; execution remains long-only
+IBKR BTC spot.
+
 Train and save a production scoring artifact:
 
 ```bash
@@ -241,7 +339,9 @@ Train and save a production scoring artifact:
   --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
   --stacker weighted \
   --hpo \
+  --target-trades-per-day 3 \
   --target-frequency-mode online \
+  --selection-score expected_utility \
   --capacity-release-mode planned \
   --permutation-importance \
   --shap-importance \
@@ -297,9 +397,20 @@ Autonomous paper trading example requested for this release:
   --max-loss-usd 250 \
   --max-order-notional-usd 5000 \
   --duration-seconds 600 \
-  --signal-interval 60 \
+  --signal-interval 1 \
+  --live-data-mode streaming \
+  --require-live-1s-data \
+  --tick-by-tick-type Last \
+  --history-duration "1800 S" \
+  --history-bar-size "1 secs" \
   --history-what-to-show AGGTRADES \
-  --max-signal-bar-age-seconds 300 \
+  --max-signal-bar-age-seconds 2.5 \
+  --account-refresh-interval-seconds 30 \
+  --adaptive-horizon \
+  --min-holding-seconds 1 \
+  --adaptive-horizon-target-move-bps 50 \
+  --use-model-exit-geometry \
+  --decision-threshold 0.005 \
   --stream-format json \
   --event-log data/raw/ibkr/trade_run_events.jsonl \
   --state-log data/raw/ibkr/trade_run_state.jsonl \
@@ -318,9 +429,19 @@ session, live port, explicit account, and both live confirmation strings:
   --max-loss-usd 250 \
   --max-order-notional-usd 1000 \
   --duration-seconds 600 \
-  --signal-interval 60 \
+  --signal-interval 1 \
+  --live-data-mode streaming \
+  --require-live-1s-data \
+  --tick-by-tick-type Last \
+  --history-duration "1800 S" \
+  --history-bar-size "1 secs" \
   --history-what-to-show AGGTRADES \
-  --max-signal-bar-age-seconds 300 \
+  --max-signal-bar-age-seconds 2.5 \
+  --account-refresh-interval-seconds 30 \
+  --adaptive-horizon \
+  --min-holding-seconds 1 \
+  --adaptive-horizon-target-move-bps 50 \
+  --use-model-exit-geometry \
   --stream-format json \
   --event-log data/raw/ibkr/live_trade_run_events.jsonl \
   --state-log data/raw/ibkr/live_trade_run_state.jsonl \
@@ -341,6 +462,12 @@ Before paper trade-run:
 - A fresh model artifact and manifest exist.
 - `kill-switch` is disabled before starting and can be enabled to stop the bot.
 - `--max-loss-usd`, `--capital-usd`, and `--max-order-notional-usd` are set.
+- The run emits `market.one_second_data_verified` with `ok=true`,
+  `bar_size_seconds=1`, and recent gaps near 1.0 second before any model score.
+- `--max-missing-model-feature-fraction` is left at its fail-closed default of
+  `0`, unless the run is explicitly a diagnostic partial-feature experiment.
+- For aggressive paper experiments with the current production artifact, set an
+  explicit `--decision-threshold`; leave it at `0` to use the artifact threshold.
 - Runtime events are streamed and written to JSONL.
 
 Before live-gated trade-run:

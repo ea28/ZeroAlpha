@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from uuid import NAMESPACE_URL, uuid5
 
 from zeroalpha.candidates.rules import (
@@ -38,6 +39,11 @@ class CandidateGenerationConfig:
     dense_stride_bars: int = 1
     side_mode: str = "long"
     allow_short_research: bool = False
+    adaptive_horizon: bool = False
+    min_holding_seconds: float = 1.0
+    adaptive_horizon_granularity_seconds: float | None = None
+    adaptive_horizon_max_seconds: float | None = None
+    adaptive_horizon_target_move_bps: float = 50.0
 
 
 def _bar_returns(bars: list[Bar]) -> list[float]:
@@ -47,6 +53,141 @@ def _bar_returns(bars: list[Bar]) -> list[float]:
         for idx in range(1, len(ordered))
         if ordered[idx - 1].close > 0
     ]
+
+
+def _bar_interval_seconds(bars: list[Bar]) -> float:
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
+    deltas = [
+        (ordered[idx].timestamp_utc - ordered[idx - 1].timestamp_utc).total_seconds()
+        for idx in range(1, len(ordered))
+    ]
+    positive = sorted(delta for delta in deltas if delta > 0)
+    if not positive:
+        return 3600.0
+    mid = len(positive) // 2
+    return positive[mid] if len(positive) % 2 else (positive[mid - 1] + positive[mid]) / 2
+
+
+def _recent_volatility_bps(bars: list[Bar], *, lookback: int = 300) -> float:
+    returns = _bar_returns(sorted(bars, key=lambda bar: bar.timestamp_utc)[-lookback - 1 :])
+    if len(returns) < 2:
+        return 0.0
+    average = sum(returns) / len(returns)
+    variance = sum((value - average) ** 2 for value in returns) / len(returns)
+    return math.sqrt(max(variance, 0.0)) * 10_000
+
+
+def _recent_intrabar_range_bps(bars: list[Bar], *, lookback: int = 300) -> float:
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)[-lookback:]
+    values = [
+        10_000 * (bar.high - bar.low) / bar.close
+        for bar in ordered
+        if bar.close > 0 and bar.high >= bar.low
+    ]
+    values = sorted(value for value in values if value > 0)
+    if not values:
+        return 0.0
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def _finite_metadata_float(metadata: dict[str, object], key: str, default: float) -> float:
+    try:
+        value = float(metadata.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _horizon_family_multiplier(family: str) -> float:
+    if family in {"dense_breakout_momentum", "dense_volatility_expansion", "liquidity_vacuum_breakout"}:
+        return 0.55
+    if family in {"dense_trend_continuation", "breakout", "momentum", "momentum_continuation"}:
+        return 0.85
+    if family in {"dense_support_reclaim", "dense_pullback_reclaim", "mean_reversion_exhaustion"}:
+        return 1.35
+    if family in {"dense_baseline", "range_day", "mean_reversion", "chop_no_trade"}:
+        return 1.80
+    return 1.0
+
+
+def _adaptive_horizon_seconds(
+    bars: list[Bar],
+    *,
+    candidate: CandidateEvent,
+    config: CandidateGenerationConfig,
+) -> tuple[float, dict[str, float | str]]:
+    interval_seconds = max(_bar_interval_seconds(bars), 1.0)
+    granularity_seconds = max(
+        float(config.adaptive_horizon_granularity_seconds or interval_seconds),
+        1.0,
+    )
+    min_seconds = max(float(config.min_holding_seconds), granularity_seconds)
+    candidate_cap_seconds = (
+        float(candidate.max_holding_seconds)
+        if candidate.max_holding_seconds is not None
+        else float(candidate.max_holding_hours) * 3600
+    )
+    config_cap_seconds = (
+        float(config.adaptive_horizon_max_seconds)
+        if config.adaptive_horizon_max_seconds is not None
+        else (
+            float(config.max_holding_seconds)
+            if config.max_holding_seconds is not None
+            else float(config.max_holding_hours) * 3600
+        )
+    )
+    max_seconds = max(min_seconds, min(candidate_cap_seconds, config_cap_seconds))
+    per_bar_vol_bps = _recent_volatility_bps(bars)
+    target_move_bps = max(float(config.adaptive_horizon_target_move_bps), 1e-6)
+    family = str(
+        candidate.metadata.get("specialist_setup_family")
+        or candidate.metadata.get("event_specialist_setup_family")
+        or candidate.metadata.get("setup_family")
+        or candidate.metadata.get("event_setup_family")
+        or candidate.metadata.get("dense_setup_family")
+        or ""
+    )
+    multiplier = _horizon_family_multiplier(family)
+    signal_bps = abs(candidate.signal_strength) * 10_000
+    range_expansion = _finite_metadata_float(candidate.metadata, "dense_range_expansion_24", 1.0)
+    volume_ratio = _finite_metadata_float(candidate.metadata, "dense_volume_ratio_24", 1.0)
+    volume_available = bool(candidate.metadata.get("dense_volume_available", True))
+    if signal_bps >= target_move_bps * 0.50:
+        multiplier *= 0.55
+    elif signal_bps >= target_move_bps * 0.25:
+        multiplier *= 0.75
+    if range_expansion >= 1.5 or (volume_available and volume_ratio >= 2.0):
+        multiplier *= 0.70
+    elif 0 < range_expansion < 0.75 and volume_available and volume_ratio < 0.75:
+        multiplier *= 1.20
+    intrabar_range_bps = _recent_intrabar_range_bps(bars)
+    movement_bps = max(per_bar_vol_bps, intrabar_range_bps * 0.50)
+    if movement_bps <= 1e-9:
+        raw_seconds = max_seconds
+    else:
+        # Use a linear hit-time proxy for sparse 1-second IBKR bars. A squared
+        # diffusion estimate turns quiet/missing-volume crypto bars into multi-hour
+        # caps and suppresses trading rather than adapting.
+        bars_to_target_move = target_move_bps / movement_bps
+        raw_seconds = bars_to_target_move * interval_seconds * multiplier
+    horizon_seconds = min(max(raw_seconds, min_seconds), max_seconds)
+    horizon_seconds = max(
+        min_seconds,
+        math.ceil(horizon_seconds / granularity_seconds) * granularity_seconds,
+    )
+    return horizon_seconds, {
+        "adaptive_horizon_seconds": horizon_seconds,
+        "adaptive_horizon_interval_seconds": interval_seconds,
+        "adaptive_horizon_granularity_seconds": granularity_seconds,
+        "adaptive_horizon_per_bar_vol_bps": per_bar_vol_bps,
+        "adaptive_horizon_intrabar_range_bps": intrabar_range_bps,
+        "adaptive_horizon_movement_bps": movement_bps,
+        "adaptive_horizon_target_move_bps": target_move_bps,
+        "adaptive_horizon_multiplier": multiplier,
+        "adaptive_horizon_family": family or "unknown",
+        "adaptive_horizon_source": "volatility_scaled_setup_horizon",
+    }
 
 
 def _safe_average(values: list[float]) -> float:
@@ -70,7 +211,8 @@ def _dense_setup_metadata(bars: list[Bar]) -> dict[str, float | str | bool]:
     range_width = previous_high - previous_low
     range_position = (latest.close - previous_low) / range_width if range_width > 0 else 0.5
     previous_volume = _safe_average([bar.volume for bar in previous_24])
-    volume_ratio = latest.volume / previous_volume if previous_volume > 0 else 0.0
+    volume_available = latest.volume > 0 and previous_volume > 0
+    volume_ratio = latest.volume / previous_volume if volume_available else 1.0
     current_range = (latest.high - latest.low) / latest.close if latest.close > 0 else 0.0
     previous_ranges = [
         (bar.high - bar.low) / bar.close
@@ -89,26 +231,42 @@ def _dense_setup_metadata(bars: list[Bar]) -> dict[str, float | str | bool]:
 
     if latest.close > previous_high and volume_ratio >= 1.05:
         family = "dense_breakout_momentum"
+        specialist_family = "liquidity_vacuum_breakout"
+        score_direction = "high"
     elif return_4 > 0 and return_16 > 0 and range_position >= 0.55:
         family = "dense_trend_continuation"
+        specialist_family = "momentum_continuation"
+        score_direction = "high"
     elif range_position <= 0.25 and lower_wick_share > upper_wick_share:
         family = "dense_support_reclaim"
+        specialist_family = "mean_reversion_exhaustion"
+        score_direction = "high"
     elif range_position >= 0.75 and prior_return < 0:
         family = "dense_pullback_reclaim"
+        specialist_family = "mean_reversion_exhaustion"
+        score_direction = "high"
     elif range_compression <= 0.75 and range_expansion >= 1.15:
         family = "dense_volatility_expansion"
+        specialist_family = "liquidity_vacuum_breakout"
+        score_direction = "high"
     else:
         family = "dense_baseline"
+        specialist_family = "chop_no_trade"
+        score_direction = "none"
 
     return {
         "dense_research": True,
         "setup_family": family,
         "dense_setup_family": family,
+        "legacy_setup_family": family,
+        "specialist_setup_family": specialist_family,
+        "setup_score_direction": score_direction,
         "prior_bar_return": prior_return,
         "dense_return_4": return_4,
         "dense_return_16": return_16,
         "dense_range_position_24": range_position,
         "dense_volume_ratio_24": volume_ratio,
+        "dense_volume_available": volume_available,
         "dense_range_expansion_24": range_expansion,
         "dense_range_compression_24": range_compression,
         "dense_lower_wick_share": lower_wick_share,
@@ -166,6 +324,33 @@ def _with_horizon_override(
     return replace(candidate, max_holding_seconds=max_holding_seconds)
 
 
+def _with_configured_horizon(
+    candidate: CandidateEvent | None,
+    *,
+    bars: list[Bar],
+    config: CandidateGenerationConfig,
+) -> CandidateEvent | None:
+    if candidate is None:
+        return None
+    metadata = {
+        **candidate.metadata,
+        "min_holding_seconds": float(config.min_holding_seconds),
+    }
+    if config.adaptive_horizon:
+        horizon_seconds, adaptive_metadata = _adaptive_horizon_seconds(
+            bars,
+            candidate=candidate,
+            config=config,
+        )
+        return replace(
+            candidate,
+            max_holding_seconds=horizon_seconds,
+            metadata={**metadata, **adaptive_metadata},
+        )
+    candidate = replace(candidate, metadata=metadata)
+    return _with_horizon_override(candidate, max_holding_seconds=config.max_holding_seconds)
+
+
 def candidates_for_history(
     bars: list[Bar],
     *,
@@ -176,20 +361,28 @@ def candidates_for_history(
     if config.mode == "dense_research":
         dense_candidates: list[CandidateEvent] = []
         if config.side_mode in {"long", "long_short"}:
-            candidate = dense_research_candidate(
-                bars,
-                max_holding_hours=config.max_holding_hours,
-                max_holding_seconds=config.max_holding_seconds,
-                side=Side.BUY,
+            candidate = _with_configured_horizon(
+                dense_research_candidate(
+                    bars,
+                    max_holding_hours=config.max_holding_hours,
+                    max_holding_seconds=(None if config.adaptive_horizon else config.max_holding_seconds),
+                    side=Side.BUY,
+                ),
+                bars=bars,
+                config=config,
             )
             if candidate is not None:
                 dense_candidates.append(candidate)
         if config.side_mode in {"short", "long_short"}:
-            candidate = dense_research_candidate(
-                bars,
-                max_holding_hours=config.max_holding_hours,
-                max_holding_seconds=config.max_holding_seconds,
-                side=Side.SELL,
+            candidate = _with_configured_horizon(
+                dense_research_candidate(
+                    bars,
+                    max_holding_hours=config.max_holding_hours,
+                    max_holding_seconds=(None if config.adaptive_horizon else config.max_holding_seconds),
+                    side=Side.SELL,
+                ),
+                bars=bars,
+                config=config,
             )
             if candidate is not None:
                 dense_candidates.append(candidate)
@@ -224,20 +417,22 @@ def candidates_for_history(
                     max_holding_hours=min(active_horizon, 3),
                 ),
             ):
-                candidate = _with_horizon_override(
+                candidate = _with_configured_horizon(
                     candidate,
-                    max_holding_seconds=config.max_holding_seconds,
+                    bars=bars,
+                    config=config,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
         if config.side_mode in {"short", "long_short"}:
-            candidate = _with_horizon_override(
+            candidate = _with_configured_horizon(
                 active_short_breakdown_candidate(
                     bars,
                     lookback=max(8, min(config.lookback, 32)),
                     max_holding_hours=min(active_horizon, 4),
                 ),
-                max_holding_seconds=config.max_holding_seconds,
+                bars=bars,
+                config=config,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -290,9 +485,10 @@ def candidates_for_history(
                 ]
             )
         for candidate in long_candidates:
-            candidate = _with_horizon_override(
+            candidate = _with_configured_horizon(
                 candidate,
-                max_holding_seconds=config.max_holding_seconds,
+                bars=bars,
+                config=config,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -313,9 +509,10 @@ def candidates_for_history(
                 max_holding_hours=min(48, config.max_holding_hours),
             ),
         ):
-            candidate = _with_horizon_override(
+            candidate = _with_configured_horizon(
                 candidate,
-                max_holding_seconds=config.max_holding_seconds,
+                bars=bars,
+                config=config,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -361,13 +558,7 @@ def candidates_for_index(
     return candidates_for_history(bars[start : idx + 1], config=config)
 
 
-def generate_candidate_events(
-    bars: list[Bar],
-    *,
-    config: CandidateGenerationConfig | None = None,
-) -> list[CandidateEvent]:
-    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
-    cfg = config or CandidateGenerationConfig()
+def validate_candidate_generation_config(cfg: CandidateGenerationConfig) -> None:
     if cfg.mode not in {"rules", "aggressive_rules", "dense_research", "active_research"}:
         raise ValueError(
             "candidate generation mode must be rules, aggressive_rules, dense_research, or active_research"
@@ -381,6 +572,34 @@ def generate_candidate_events(
         )
     if cfg.dense_stride_bars <= 0:
         raise ValueError("dense_stride_bars must be positive")
+    if cfg.min_holding_seconds <= 0:
+        raise ValueError("min_holding_seconds must be positive")
+    effective_max_holding_seconds = (
+        cfg.max_holding_seconds
+        if cfg.max_holding_seconds is not None
+        else cfg.max_holding_hours * 3600
+    )
+    if effective_max_holding_seconds < cfg.min_holding_seconds:
+        raise ValueError("max_holding_seconds/max_holding_hours must be at least min_holding_seconds")
+    if (
+        cfg.adaptive_horizon_granularity_seconds is not None
+        and cfg.adaptive_horizon_granularity_seconds <= 0
+    ):
+        raise ValueError("adaptive_horizon_granularity_seconds must be positive")
+    if cfg.adaptive_horizon_max_seconds is not None and cfg.adaptive_horizon_max_seconds <= 0:
+        raise ValueError("adaptive_horizon_max_seconds must be positive")
+    if cfg.adaptive_horizon_target_move_bps <= 0:
+        raise ValueError("adaptive_horizon_target_move_bps must be positive")
+
+
+def generate_candidate_events(
+    bars: list[Bar],
+    *,
+    config: CandidateGenerationConfig | None = None,
+) -> list[CandidateEvent]:
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
+    cfg = config or CandidateGenerationConfig()
+    validate_candidate_generation_config(cfg)
     events: list[CandidateEvent] = []
     first_idx = max(cfg.min_history_bars - 1, 0)
     seen_event_ids: set[str] = set()

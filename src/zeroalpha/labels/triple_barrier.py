@@ -2,7 +2,22 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+import math
+
+from zeroalpha.bars import bar_start_timestamp_utc
 from zeroalpha.domain import Bar, CandidateEvent, Side, TripleBarrierLabel
+from zeroalpha.timeutils import ensure_utc
+
+
+def _event_min_holding_seconds(event: CandidateEvent) -> float:
+    try:
+        min_holding_seconds = float(event.metadata.get("min_holding_seconds", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(min_holding_seconds) or min_holding_seconds <= 0:
+        return 0.0
+    return min_holding_seconds
 
 
 def label_long_event(
@@ -10,6 +25,7 @@ def label_long_event(
     future_bars: list[Bar],
     *,
     entry_price: float,
+    entry_timestamp_utc: datetime | None = None,
     round_trip_cost_bps: float,
     net_profit_target: float | None = None,
     net_stop_loss: float | None = None,
@@ -49,7 +65,11 @@ def label_long_event(
     exit_bar = ordered[-1]
     outcome = "vertical"
     exit_price = exit_bar.close
+    entry_timestamp = ensure_utc(entry_timestamp_utc) if entry_timestamp_utc else ordered[0].timestamp_utc
+    min_exit_timestamp = entry_timestamp + timedelta(seconds=_event_min_holding_seconds(event))
     for bar in ordered:
+        if bar_start_timestamp_utc(bar) < min_exit_timestamp:
+            continue
         hit_upper = bar.high >= upper
         hit_lower = bar.low <= lower
         if hit_upper and hit_lower:
@@ -77,7 +97,7 @@ def label_long_event(
     label = 1 if outcome.startswith("upper") and net_return >= net_profit_target - 1e-12 else 0
     return TripleBarrierLabel(
         event_id=event.event_id,
-        entry_timestamp_utc=ordered[0].timestamp_utc,
+        entry_timestamp_utc=entry_timestamp,
         entry_price=entry_price,
         upper_barrier_price=upper,
         lower_barrier_price=lower,
@@ -97,6 +117,7 @@ def label_short_event(
     future_bars: list[Bar],
     *,
     entry_price: float,
+    entry_timestamp_utc: datetime | None = None,
     round_trip_cost_bps: float,
     net_profit_target: float,
     net_stop_loss: float,
@@ -128,7 +149,11 @@ def label_short_event(
     exit_bar = ordered[-1]
     outcome = "vertical"
     exit_price = exit_bar.close
+    entry_timestamp = ensure_utc(entry_timestamp_utc) if entry_timestamp_utc else ordered[0].timestamp_utc
+    min_exit_timestamp = entry_timestamp + timedelta(seconds=_event_min_holding_seconds(event))
     for bar in ordered:
+        if bar_start_timestamp_utc(bar) < min_exit_timestamp:
+            continue
         hit_lower = bar.low <= lower
         hit_upper = bar.high >= upper
         if hit_lower and hit_upper:
@@ -156,7 +181,7 @@ def label_short_event(
     label = 1 if outcome.startswith("lower") and net_return >= net_profit_target - 1e-12 else 0
     return TripleBarrierLabel(
         event_id=event.event_id,
-        entry_timestamp_utc=ordered[0].timestamp_utc,
+        entry_timestamp_utc=entry_timestamp,
         entry_price=entry_price,
         upper_barrier_price=upper,
         lower_barrier_price=lower,
@@ -176,6 +201,7 @@ def label_event(
     future_bars: list[Bar],
     *,
     entry_price: float,
+    entry_timestamp_utc: datetime | None = None,
     round_trip_cost_bps: float,
     net_profit_target: float,
     net_stop_loss: float,
@@ -186,6 +212,7 @@ def label_event(
             event,
             future_bars,
             entry_price=entry_price,
+            entry_timestamp_utc=entry_timestamp_utc,
             round_trip_cost_bps=round_trip_cost_bps,
             net_profit_target=net_profit_target,
             net_stop_loss=net_stop_loss,
@@ -195,6 +222,7 @@ def label_event(
         event,
         future_bars,
         entry_price=entry_price,
+        entry_timestamp_utc=entry_timestamp_utc,
         round_trip_cost_bps=round_trip_cost_bps,
         net_profit_target=net_profit_target,
         net_stop_loss=net_stop_loss,

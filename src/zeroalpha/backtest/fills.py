@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from hashlib import blake2b
 
+from zeroalpha.bars import bar_start_timestamp_utc
 from zeroalpha.domain import Bar, Side
+from zeroalpha.timeutils import ensure_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,7 @@ def simulate_limit_fill(
     limit_price: float,
     bars: list[Bar],
     *,
+    activation_timestamp: datetime | None = None,
     latency_seconds: float = 0.0,
     require_trade_through_bps: float = 0.0,
     fill_probability: float = 1.0,
@@ -47,10 +50,18 @@ def simulate_limit_fill(
     ordered = sorted(bars, key=lambda row: row.timestamp_utc)
     if not ordered:
         return SimulatedFill(False, None, "no_entry_bars")
-    active_after = ordered[0].timestamp_utc.timestamp() + latency_seconds
+    active_timestamp = (
+        ensure_utc(activation_timestamp)
+        if activation_timestamp is not None
+        else ordered[0].timestamp_utc
+    )
+    active_after = active_timestamp.timestamp() + latency_seconds
     trade_through = require_trade_through_bps / 10_000
     for bar in ordered:
+        bar_start = bar_start_timestamp_utc(bar)
         if bar.timestamp_utc.timestamp() < active_after:
+            continue
+        if bar_start.timestamp() < active_after:
             continue
         touched = (
             bar.low <= limit_price * (1 - trade_through)
@@ -61,7 +72,7 @@ def simulate_limit_fill(
             continue
         score = _deterministic_score(side.value, limit_price, bar.timestamp_utc.isoformat())
         if score > fill_probability:
-            return SimulatedFill(False, None, "queue_not_filled", timestamp_utc=bar.timestamp_utc)
+            return SimulatedFill(False, None, "queue_not_filled", timestamp_utc=bar_start)
         reason = "limit_trade_through" if require_trade_through_bps > 0 else "limit_touched"
         if fill_fraction < 1:
             reason = f"partial_{reason}"
@@ -69,7 +80,7 @@ def simulate_limit_fill(
             True,
             limit_price,
             reason,
-            timestamp_utc=bar.timestamp_utc,
+            timestamp_utc=bar_start,
             fill_fraction=fill_fraction,
         )
     return SimulatedFill(False, None, "missed_fill")

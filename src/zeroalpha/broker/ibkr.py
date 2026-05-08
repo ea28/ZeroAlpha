@@ -10,6 +10,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import math
+import time
 from typing import Any
 
 from zeroalpha.config import AppConfig, ConfigError
@@ -138,6 +139,12 @@ MARKET_DATA_TYPE_IDS = {
     "delayed": 3,
     "delayed_frozen": 4,
     "delayed-frozen": 4,
+}
+MARKET_DATA_TYPE_NAMES = {
+    1: "live",
+    2: "frozen",
+    3: "delayed",
+    4: "delayed-frozen",
 }
 
 
@@ -415,35 +422,69 @@ class IBKRBroker:
         *,
         max_wait_seconds: float = 10.0,
     ) -> MarketQuote:
+        ticker = self.subscribe_quote(contract)
+        try:
+            return await self.quote_from_ticker(
+                contract,
+                ticker,
+                max_wait_seconds=max_wait_seconds,
+                poll_interval_seconds=0.25,
+            )
+        finally:
+            self.cancel_quote(contract)
+
+    def subscribe_quote(self, contract: QualifiedCryptoContract) -> Any:
         if not self._ib:
             raise BrokerConnectionError("connect before requesting quotes")
+        return self._ib.reqMktData(contract.raw, "", False, False)
+
+    def cancel_quote(self, contract: QualifiedCryptoContract) -> None:
+        if not self._ib:
+            return
+        self._ib.cancelMktData(contract.raw)
+
+    async def quote_from_ticker(
+        self,
+        contract: QualifiedCryptoContract,
+        ticker: Any,
+        *,
+        max_wait_seconds: float = 1.0,
+        poll_interval_seconds: float = 0.05,
+    ) -> MarketQuote:
+        if not self._ib:
+            raise BrokerConnectionError("connect before reading ticker quotes")
         if max_wait_seconds <= 0:
             raise ValueError("max_wait_seconds must be positive")
-        ticker = self._ib.reqMktData(contract.raw, "", False, False)
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be positive")
+        deadline = time.monotonic() + max_wait_seconds
         bid = ask = None
-        for _ in range(max(1, math.ceil(max_wait_seconds / 0.25))):
-            await asyncio.sleep(0.25)
-            bid = getattr(ticker, "bid", None)
-            ask = getattr(ticker, "ask", None)
-            if bid is not None and ask is not None and float(bid) > 0 and float(ask) >= float(bid):
+        while True:
+            bid = _finite_optional_float(getattr(ticker, "bid", None))
+            ask = _finite_optional_float(getattr(ticker, "ask", None))
+            if bid is not None and ask is not None and bid > 0 and ask >= bid:
                 break
-        else:
-            self._ib.cancelMktData(contract.raw)
-            raise BrokerConnectionError("did not receive a usable bid/ask quote")
-        bid = float(ticker.bid)
-        ask = float(ticker.ask)
-        self._ib.cancelMktData(contract.raw)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrokerConnectionError("did not receive a usable bid/ask quote")
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
         now = utc_now()
+        ticker_time = getattr(ticker, "time", None)
+        market_timestamp = ensure_utc(ticker_time) if isinstance(ticker_time, datetime) else now
+        market_data_type = MARKET_DATA_TYPE_NAMES.get(
+            int(getattr(ticker, "marketDataType", 0) or 0),
+            self.config.broker.market_data_type,
+        )
         return MarketQuote(
-            timestamp_utc=now,
+            timestamp_utc=market_timestamp,
             received_timestamp_utc=now,
             symbol=f"{contract.symbol}/{contract.currency}",
             bid=bid,
             ask=ask,
             source="IBKR",
-            bid_size=getattr(ticker, "bidSize", None),
-            ask_size=getattr(ticker, "askSize", None),
-            market_data_type=self.config.broker.market_data_type,
+            bid_size=_finite_optional_float(getattr(ticker, "bidSize", None)),
+            ask_size=_finite_optional_float(getattr(ticker, "askSize", None)),
+            market_data_type=market_data_type,
         )
 
     async def historical_bars(
@@ -551,11 +592,11 @@ class IBKRBroker:
     ) -> list[dict[str, Any]]:
         if not self._ib:
             raise BrokerConnectionError("connect before requesting tick-by-tick data")
-        ticker = self._ib.reqTickByTickData(
-            contract.raw,
-            tickType=tick_type,
-            numberOfTicks=max(0, number_of_ticks),
-            ignoreSize=False,
+        ticker = self.subscribe_tick_by_tick(
+            contract,
+            tick_type=tick_type,
+            number_of_ticks=number_of_ticks,
+            ignore_size=False,
         )
         await asyncio.sleep(max_wait_seconds)
         rows: list[dict[str, Any]] = []
@@ -572,8 +613,35 @@ class IBKRBroker:
                     "ask_size": _optional_float(getattr(tick, "askSize", None)),
                 }
             )
-        self._ib.cancelTickByTickData(contract.raw, tick_type)
+        self.cancel_tick_by_tick(contract, tick_type=tick_type)
         return rows
+
+    def subscribe_tick_by_tick(
+        self,
+        contract: QualifiedCryptoContract,
+        *,
+        tick_type: str = "BidAsk",
+        number_of_ticks: int = 0,
+        ignore_size: bool = False,
+    ) -> Any:
+        if not self._ib:
+            raise BrokerConnectionError("connect before requesting tick-by-tick data")
+        return self._ib.reqTickByTickData(
+            contract.raw,
+            tickType=tick_type,
+            numberOfTicks=max(0, number_of_ticks),
+            ignoreSize=ignore_size,
+        )
+
+    def cancel_tick_by_tick(
+        self,
+        contract: QualifiedCryptoContract,
+        *,
+        tick_type: str = "BidAsk",
+    ) -> None:
+        if not self._ib:
+            return
+        self._ib.cancelTickByTickData(contract.raw, tick_type)
 
     def _order_from_intent(
         self,

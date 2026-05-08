@@ -105,7 +105,7 @@ class LabelConfig:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     minimum_probability: float = 0.60
-    minimum_expected_value: float = 0.0075
+    minimum_expected_value: float = 0.0
     calibration_method: str = "sigmoid"
     feature_set_version: str = "v1"
     label_version: str = "v1"
@@ -163,8 +163,6 @@ class AppConfig:
             raise ConfigError("at least one crypto exchange candidate is required")
         if self.risk.max_open_positions < 1:
             raise ConfigError("risk max_open_positions must be positive")
-        if self.contract.instrument_model == "spot_crypto" and self.risk.max_open_positions != 1:
-            raise ConfigError("spot crypto mode supports max_open_positions = 1")
         if self.cost.tier_rate <= 0 or self.cost.minimum_commission < 0:
             raise ConfigError("invalid cost settings")
         if self.cost.futures_fee_per_contract < 0 or self.cost.futures_contract_multiplier < 0:
@@ -190,7 +188,7 @@ class AppConfig:
             raise ConfigError("dynamic label controls must be nonnegative")
         if self.risk.minimum_fee_efficient_notional <= 0:
             raise ConfigError("minimum fee-efficient notional must be positive")
-        if self.risk.consecutive_loss_limit <= 0 or self.risk.cooldown_hours_after_stopouts < 0:
+        if self.risk.consecutive_loss_limit < 0 or self.risk.cooldown_hours_after_stopouts < 0:
             raise ConfigError("invalid cooldown settings")
         if self.execution.simulated_latency_seconds < 0:
             raise ConfigError("execution simulated_latency_seconds must be nonnegative")

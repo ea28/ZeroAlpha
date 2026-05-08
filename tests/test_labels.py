@@ -21,6 +21,94 @@ def _bar(i: int, high: float, low: float, close: float) -> Bar:
     )
 
 
+def _second_bar(second: int, *, high: float, low: float, close: float) -> Bar:
+    start = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=second - 1)
+    end = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=second)
+    return Bar(
+        timestamp_utc=end,
+        symbol="BTCUSDT",
+        bar_size="1 secs",
+        open=100,
+        high=high,
+        low=low,
+        close=close,
+        volume=1,
+        source="TEST",
+        extra={
+            "bar_start_timestamp_utc": start.isoformat(),
+            "bar_close_timestamp_utc": end.isoformat(),
+        },
+    )
+
+
+def test_triple_barrier_respects_minimum_holding_seconds_from_entry() -> None:
+    event = CandidateEvent(
+        event_id="e1",
+        timestamp_utc=datetime(2026, 1, 1, tzinfo=UTC),
+        symbol="BTCUSDT",
+        candidate_type="test",
+        side=Side.BUY,
+        bar_size="1s",
+        signal_strength=1,
+        reference_price=100,
+        max_holding_hours=1,
+        max_holding_seconds=10,
+        metadata={"min_holding_seconds": 5.0},
+    )
+
+    label = label_long_event(
+        event,
+        [
+            _second_bar(1, high=103, low=99.5, close=102),
+            _second_bar(5, high=103, low=99.5, close=102),
+            _second_bar(6, high=100.5, low=98, close=98.5),
+        ],
+        entry_price=100,
+        entry_timestamp_utc=datetime(2026, 1, 1, tzinfo=UTC),
+        net_profit_target=0.01,
+        net_stop_loss=0.01,
+        round_trip_cost_bps=0,
+        conservative_same_bar=True,
+    )
+
+    assert label.exit_timestamp_utc == datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=6)
+    assert label.outcome_type == "lower"
+
+
+def test_triple_barrier_minimum_hold_requires_full_eligible_bar() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    event = CandidateEvent(
+        event_id="e1",
+        timestamp_utc=start,
+        symbol="BTCUSDT",
+        candidate_type="test",
+        side=Side.BUY,
+        bar_size="1s",
+        signal_strength=1,
+        reference_price=100,
+        max_holding_hours=1,
+        max_holding_seconds=10,
+        metadata={"min_holding_seconds": 5.0},
+    )
+
+    label = label_long_event(
+        event,
+        [
+            _second_bar(5, high=103, low=99.5, close=102),
+            _second_bar(6, high=100.5, low=98, close=98.5),
+        ],
+        entry_price=100,
+        entry_timestamp_utc=start,
+        net_profit_target=0.01,
+        net_stop_loss=0.01,
+        round_trip_cost_bps=0,
+        conservative_same_bar=True,
+    )
+
+    assert label.exit_timestamp_utc == start + timedelta(seconds=6)
+    assert label.outcome_type == "lower"
+
+
 def test_triple_barrier_conservative_same_bar() -> None:
     event = CandidateEvent(
         event_id="e1",

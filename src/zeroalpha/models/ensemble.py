@@ -30,7 +30,11 @@ from zeroalpha.models.interpretability import (
 )
 from zeroalpha.models.dataset import MetaLabelSample
 from zeroalpha.models.training import ModelDependencyError
-from zeroalpha.validation.purged import walk_forward_folds
+from zeroalpha.validation.purged import purge_overlapping_train, walk_forward_folds
+
+
+_SELECTION_GATE_EPSILON = 1e-7
+_LOW_NEGATIVE_EV_PROBE_THRESHOLD = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +88,6 @@ class FeatureEncoder:
 class ProbabilityCalibrator:
     method: str
     model: Any | None = None
-    constant_probability: float | None = None
 
     @classmethod
     def fit(cls, probabilities: Any, labels: Any, *, method: str) -> "ProbabilityCalibrator":
@@ -98,7 +101,7 @@ class ProbabilityCalibrator:
         if method not in {"sigmoid", "isotonic"}:
             raise ValueError("calibration method must be sigmoid or isotonic")
         if len(set(y.tolist())) < 2:
-            return cls(method=method, constant_probability=float(y.mean()))
+            return cls(method=f"{method}_identity_one_class")
         probability_spread = float(np.nanmax(p_flat) - np.nanmin(p_flat))
         if not math.isfinite(probability_spread) or probability_spread < 0.02:
             return cls(method=f"{method}_identity_low_spread")
@@ -118,10 +121,8 @@ class ProbabilityCalibrator:
         import numpy as np
 
         p = np.asarray(probabilities, dtype=float).reshape(-1, 1)
-        if self.constant_probability is not None:
-            return np.full(p.shape[0], self.constant_probability)
         if self.model is None:
-            return p.ravel()
+            return np.clip(p.ravel(), 0.0, 1.0)
         if self.method == "isotonic":
             calibrated = self.model.predict(p.ravel())
         else:
@@ -160,7 +161,12 @@ class FoldPrediction:
     side: str = ""
     predicted_return: float = 0.0
     predicted_downside: float = 0.0
+    predicted_mae: float = 0.0
+    predicted_mfe: float = 0.0
+    predicted_time_to_exit_seconds: float = 0.0
+    predicted_early_adverse_probability: float = 0.0
     selection_score: float = 0.0
+    trade_score: float = 0.0
     setup_family: str = ""
     market_regime: str = ""
 
@@ -172,6 +178,46 @@ class ThresholdSweepRow:
     hit_rate: float
     net_pnl: float
     average_trade_return: float
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionExecutionPolicy:
+    starting_equity: float = 0.0
+    requested_notional: float = 0.0
+    sizing_mode: str = "fixed"
+    sizing_score_field: str = "probability"
+    sizing_score_direction: str = "high"
+    sizing_base_notional: float = 0.0
+    sizing_mid_notional: float = 0.0
+    sizing_high_notional: float = 0.0
+    sizing_mid_score: float = 0.45
+    sizing_high_score: float = 0.90
+    sizing_max_spread_bps: float = 1.0
+    sizing_min_liquidity_score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectionCandidate:
+    sample: MetaLabelSample
+    probability: float
+    expected_value: float
+    type_utility: float
+    selection_score: float
+    group_key: str
+    predicted_return: float
+    predicted_downside: float
+    predicted_mae: float = 0.0
+    predicted_mfe: float = 0.0
+    predicted_time_to_exit_seconds: float = 0.0
+    predicted_early_adverse_probability: float = 0.0
+    type_threshold: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetFrequencySelection:
+    event_ids: set[str]
+    notional_by_event: dict[str, float]
+    open_positions: tuple[tuple[Any, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +504,23 @@ def _hist_gradient_boosting_classifier(params: dict[str, Any] | None = None) -> 
     return HistGradientBoostingClassifier(**{**defaults, **(params or {})})
 
 
+def _gradient_boosting_classifier(params: dict[str, Any] | None = None) -> Any:
+    from sklearn.ensemble import GradientBoostingClassifier
+
+    defaults = {
+        "learning_rate": 0.03,
+        "n_estimators": 180,
+        "max_depth": 2,
+        "min_samples_leaf": 24,
+        "subsample": 0.80,
+        "max_features": 0.70,
+        "random_state": 42,
+        "n_iter_no_change": 12,
+        "validation_fraction": 0.15,
+    }
+    return GradientBoostingClassifier(**{**defaults, **(params or {})})
+
+
 def _random_forest_classifier(params: dict[str, Any] | None = None) -> Any:
     from sklearn.ensemble import RandomForestClassifier
 
@@ -518,6 +581,7 @@ def _model_factories() -> dict[str, Callable[[], Any]]:
         "catboost": _catboost_classifier,
         "xgboost": _xgboost_classifier,
         "histgb": _hist_gradient_boosting_classifier,
+        "gboost": _gradient_boosting_classifier,
         "randomforest": _random_forest_classifier,
         "extratrees": _extra_trees_classifier,
         "tabpfn": _tabpfn_classifier,
@@ -535,6 +599,8 @@ def _build_model(name: str, params: dict[str, Any] | None = None) -> Any:
         return _xgboost_classifier(params)
     if name == "histgb":
         return _hist_gradient_boosting_classifier(params)
+    if name == "gboost":
+        return _gradient_boosting_classifier(params)
     if name == "randomforest":
         return _random_forest_classifier(params)
     if name == "extratrees":
@@ -556,7 +622,9 @@ def _return_regressor() -> Any:
 
 
 def _sample_group(sample: MetaLabelSample) -> str:
-    group = _sample_setup_family(sample)
+    group = _sample_specialist_setup_family(sample)
+    if group == "unknown":
+        group = _sample_setup_family(sample)
     if group == "unknown":
         candidate_type = sample.candidate_type
         if "breakout" in candidate_type or "breakdown" in candidate_type:
@@ -578,6 +646,42 @@ def _sample_setup_family(sample: MetaLabelSample) -> str:
         if isinstance(family, str) and family:
             return family
     return "unknown"
+
+
+def _sample_specialist_setup_family(sample: MetaLabelSample) -> str:
+    for key in (
+        "event_specialist_setup_family",
+        "specialist_setup_family",
+        "event_setup_specialist_family",
+        "setup_specialist_family",
+    ):
+        family = sample.features.get(key)
+        if isinstance(family, str) and family:
+            return family
+    return "unknown"
+
+
+def _sample_setup_family_values(sample: MetaLabelSample) -> set[str]:
+    return {
+        value
+        for value in (
+            _sample_setup_family(sample),
+            _sample_specialist_setup_family(sample),
+        )
+        if value and value != "unknown"
+    }
+
+
+def _sample_matches_setup_filter(
+    sample: MetaLabelSample,
+    *,
+    allowed: set[str],
+    excluded: set[str],
+) -> bool:
+    values = _sample_setup_family_values(sample)
+    if not values:
+        values = {_sample_setup_family(sample)}
+    return (not allowed or bool(values & allowed)) and not bool(values & excluded)
 
 
 def _sample_regime(sample: MetaLabelSample) -> str:
@@ -669,6 +773,220 @@ def _fit_return_regression_predictions(
     return threshold_predictions, test_predictions, diagnostics
 
 
+@dataclass(frozen=True, slots=True)
+class _MultiHeadRegressionPredictions:
+    threshold_returns: Any
+    test_returns: Any
+    threshold_mae: Any
+    test_mae: Any
+    threshold_mfe: Any
+    test_mfe: Any
+    threshold_time_to_exit_seconds: Any
+    test_time_to_exit_seconds: Any
+    threshold_early_adverse_probability: Any
+    test_early_adverse_probability: Any
+    diagnostics: dict[str, dict[str, float]]
+
+
+def _fit_regression_head_predictions(
+    *,
+    x_train: Any,
+    train_samples: list[MetaLabelSample],
+    x_threshold_selection: Any,
+    threshold_samples: list[MetaLabelSample],
+    x_test: Any,
+    test_samples: list[MetaLabelSample],
+    target_name: str,
+    target_values: Callable[[MetaLabelSample], float],
+    specialist_models: bool,
+    min_group_samples: int = 50,
+) -> tuple[Any, Any, dict[str, dict[str, float]]]:
+    import numpy as np
+
+    if len(train_samples) < 20:
+        baseline = float(np.mean([target_values(sample) for sample in train_samples])) if train_samples else 0.0
+        return (
+            np.full(len(threshold_samples), baseline),
+            np.full(len(test_samples), baseline),
+            {target_name: {"samples": float(len(train_samples)), "mode": "baseline", "mean": baseline}},
+        )
+    y_train = np.asarray([target_values(sample) for sample in train_samples], dtype=float)
+    global_model = _return_regressor()
+    global_model.fit(x_train, y_train, sample_weight=_economic_sample_weights(train_samples))
+    threshold_predictions = np.asarray(global_model.predict(x_threshold_selection), dtype=float)
+    test_predictions = np.asarray(global_model.predict(x_test), dtype=float)
+    diagnostics: dict[str, dict[str, float]] = {
+        target_name: {
+            "samples": float(len(train_samples)),
+            "mean": float(np.mean(y_train)),
+            "mode": "regression",
+        }
+    }
+    if not specialist_models:
+        return threshold_predictions, test_predictions, diagnostics
+
+    groups: dict[str, list[int]] = {}
+    for idx, sample in enumerate(train_samples):
+        groups.setdefault(_sample_group(sample), []).append(idx)
+    for group, indices in sorted(groups.items()):
+        key = f"{target_name}|{group}"
+        if group == "global" or len(indices) < min_group_samples:
+            diagnostics[key] = {
+                "samples": float(len(indices)),
+                "mean": float(np.mean(y_train[indices])) if indices else 0.0,
+                "mode": "global_fallback",
+            }
+            continue
+        group_model = _return_regressor()
+        group_samples = [train_samples[i] for i in indices]
+        group_model.fit(x_train[indices], y_train[indices], sample_weight=_economic_sample_weights(group_samples))
+        threshold_mask = [idx for idx, sample in enumerate(threshold_samples) if _sample_group(sample) == group]
+        test_mask = [idx for idx, sample in enumerate(test_samples) if _sample_group(sample) == group]
+        if threshold_mask:
+            threshold_predictions[threshold_mask] = group_model.predict(x_threshold_selection[threshold_mask])
+        if test_mask:
+            test_predictions[test_mask] = group_model.predict(x_test[test_mask])
+        diagnostics[key] = {
+            "samples": float(len(indices)),
+            "mean": float(np.mean(y_train[indices])),
+            "mode": "specialist_regression",
+        }
+    return threshold_predictions, test_predictions, diagnostics
+
+
+def _fit_early_adverse_head_predictions(
+    *,
+    x_train: Any,
+    train_samples: list[MetaLabelSample],
+    x_threshold_selection: Any,
+    threshold_samples: list[MetaLabelSample],
+    x_test: Any,
+    test_samples: list[MetaLabelSample],
+) -> tuple[Any, Any, dict[str, dict[str, float]]]:
+    import numpy as np
+
+    labels = np.asarray([int(sample.early_adverse_label) for sample in train_samples], dtype=int)
+    baseline = float(np.mean(labels)) if len(labels) else 0.0
+    diagnostics = {
+        "early_adverse_probability": {
+            "samples": float(len(train_samples)),
+            "mean": baseline,
+            "mode": "baseline",
+        }
+    }
+    if len(train_samples) < 40 or len(set(labels.tolist())) < 2:
+        return (
+            np.full(len(threshold_samples), baseline),
+            np.full(len(test_samples), baseline),
+            diagnostics,
+        )
+    estimator = _hist_gradient_boosting_classifier(
+        {
+            "max_iter": 80,
+            "max_leaf_nodes": 7,
+            "learning_rate": 0.05,
+            "l2_regularization": 0.20,
+        }
+    )
+    try:
+        _fit_estimator(estimator, x_train, labels, sample_weight=_classification_sample_weights(train_samples))
+        diagnostics["early_adverse_probability"]["mode"] = "classifier"
+        return (
+            _predict_probability(estimator, x_threshold_selection),
+            _predict_probability(estimator, x_test),
+            diagnostics,
+        )
+    except Exception:
+        return (
+            np.full(len(threshold_samples), baseline),
+            np.full(len(test_samples), baseline),
+            diagnostics,
+        )
+
+
+def _fit_multihead_regression_predictions(
+    *,
+    x_train: Any,
+    train_samples: list[MetaLabelSample],
+    x_threshold_selection: Any,
+    threshold_samples: list[MetaLabelSample],
+    x_test: Any,
+    test_samples: list[MetaLabelSample],
+    specialist_models: bool,
+) -> _MultiHeadRegressionPredictions:
+    import numpy as np
+
+    threshold_returns, test_returns, return_diagnostics = _fit_return_regression_predictions(
+        x_train=x_train,
+        train_samples=train_samples,
+        x_threshold_selection=x_threshold_selection,
+        threshold_samples=threshold_samples,
+        x_test=x_test,
+        test_samples=test_samples,
+        specialist_models=specialist_models,
+    )
+    threshold_mae, test_mae, mae_diagnostics = _fit_regression_head_predictions(
+        x_train=x_train,
+        train_samples=train_samples,
+        x_threshold_selection=x_threshold_selection,
+        threshold_samples=threshold_samples,
+        x_test=x_test,
+        test_samples=test_samples,
+        target_name="mae",
+        target_values=lambda sample: max(float(sample.max_adverse_excursion), 0.0),
+        specialist_models=specialist_models,
+    )
+    threshold_mfe, test_mfe, mfe_diagnostics = _fit_regression_head_predictions(
+        x_train=x_train,
+        train_samples=train_samples,
+        x_threshold_selection=x_threshold_selection,
+        threshold_samples=threshold_samples,
+        x_test=x_test,
+        test_samples=test_samples,
+        target_name="mfe",
+        target_values=lambda sample: max(float(sample.max_favorable_excursion), 0.0),
+        specialist_models=specialist_models,
+    )
+    threshold_time, test_time, time_diagnostics = _fit_regression_head_predictions(
+        x_train=x_train,
+        train_samples=train_samples,
+        x_threshold_selection=x_threshold_selection,
+        threshold_samples=threshold_samples,
+        x_test=x_test,
+        test_samples=test_samples,
+        target_name="time_to_exit_seconds",
+        target_values=lambda sample: max(float(sample.time_to_exit_seconds), 0.0),
+        specialist_models=specialist_models,
+    )
+    threshold_early, test_early, early_diagnostics = _fit_early_adverse_head_predictions(
+        x_train=x_train,
+        train_samples=train_samples,
+        x_threshold_selection=x_threshold_selection,
+        threshold_samples=threshold_samples,
+        x_test=x_test,
+        test_samples=test_samples,
+    )
+    diagnostics: dict[str, dict[str, float]] = {}
+    diagnostics.update(return_diagnostics)
+    diagnostics.update(mae_diagnostics)
+    diagnostics.update(mfe_diagnostics)
+    diagnostics.update(time_diagnostics)
+    diagnostics.update(early_diagnostics)
+    return _MultiHeadRegressionPredictions(
+        threshold_returns=np.asarray(threshold_returns, dtype=float),
+        test_returns=np.asarray(test_returns, dtype=float),
+        threshold_mae=np.maximum(np.asarray(threshold_mae, dtype=float), 0.0),
+        test_mae=np.maximum(np.asarray(test_mae, dtype=float), 0.0),
+        threshold_mfe=np.maximum(np.asarray(threshold_mfe, dtype=float), 0.0),
+        test_mfe=np.maximum(np.asarray(test_mfe, dtype=float), 0.0),
+        threshold_time_to_exit_seconds=np.maximum(np.asarray(threshold_time, dtype=float), 0.0),
+        test_time_to_exit_seconds=np.maximum(np.asarray(test_time, dtype=float), 0.0),
+        threshold_early_adverse_probability=np.clip(np.asarray(threshold_early, dtype=float), 0.0, 1.0),
+        test_early_adverse_probability=np.clip(np.asarray(test_early, dtype=float), 0.0, 1.0),
+        diagnostics=diagnostics,
+    )
+
+
 def _downside_estimates_by_group(samples: list[MetaLabelSample], *, min_samples: int) -> dict[str, float]:
     grouped: dict[str, list[float]] = {}
     for sample in samples:
@@ -691,6 +1009,10 @@ def _selection_score(
     expected_value: float,
     predicted_return: float,
     predicted_downside: float,
+    predicted_mae: float = 0.0,
+    predicted_mfe: float = 0.0,
+    predicted_time_to_exit_seconds: float = 0.0,
+    predicted_early_adverse_probability: float = 0.0,
     mode: str,
 ) -> float:
     if mode == "probability":
@@ -703,11 +1025,19 @@ def _selection_score(
         return predicted_return + 0.25 * expected_value - 0.25 * predicted_downside
     if mode == "risk_adjusted_return":
         return predicted_return / max(predicted_downside, 1e-6) + 0.25 * expected_value
+    if mode == "return_first":
+        return predicted_return + 0.10 * expected_value - 0.25 * predicted_downside
     if mode == "blended_rank":
         return probability + 25.0 * predicted_return + 25.0 * expected_value - 10.0 * predicted_downside
+    if mode == "capital_efficiency":
+        risk = max(predicted_mae, predicted_downside, 1e-6)
+        hours = max(predicted_time_to_exit_seconds / 3600, 1 / 3600)
+        edge = predicted_return + 0.25 * expected_value + 0.10 * predicted_mfe
+        return edge / (risk * hours**0.5) - predicted_early_adverse_probability
     raise ValueError(
         "selection_score must be probability, expected_value, predicted_return, "
-        "expected_utility, risk_adjusted_return, or blended_rank"
+        "expected_utility, risk_adjusted_return, return_first, blended_rank, "
+        "or capital_efficiency"
     )
 
 
@@ -860,14 +1190,25 @@ def _online_threshold_frequency_returns(
     target_trades_per_day: float,
     config: AppConfig,
     selection_score_mode: str = "probability",
+    target_frequency_mode: str = "online",
     selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
     adaptive_selection_score_floor: bool = False,
     allow_negative_ev: bool = True,
+    empirical_payoff_ev: bool = False,
+    payoff_estimates: dict[str, dict[str, Any]] | None = None,
+    predicted_returns: Any | None = None,
+    predicted_downsides: Any | None = None,
+    predicted_maes: Any | None = None,
+    predicted_mfes: Any | None = None,
+    predicted_time_to_exit_seconds: Any | None = None,
+    predicted_early_adverse_probabilities: Any | None = None,
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
 ) -> list[float]:
     if target_trades_per_day <= 0 or not samples:
@@ -876,7 +1217,11 @@ def _online_threshold_frequency_returns(
     sample_by_event = {sample.event_id: sample for sample in samples}
     best_returns: list[float] = []
     best_score: tuple[float, ...] | None = None
-    thresholds = tuple(round(idx * 0.05, 2) for idx in range(0, 20))
+    thresholds = (
+        (0.0,)
+        if target_frequency_mode == "quota"
+        else tuple(round(idx * 0.05, 2) for idx in range(0, 20))
+    )
     for threshold in thresholds:
         score_floor = selection_score_floor
         if adaptive_selection_score_floor and score_floor is None:
@@ -888,16 +1233,22 @@ def _online_threshold_frequency_returns(
                 config=config,
                 allow_negative_ev=allow_negative_ev,
                 selection_score_mode=selection_score_mode,
-                target_frequency_mode="online",
+                target_frequency_mode=target_frequency_mode,
+                selection_score_ceiling=selection_score_ceiling,
+                empirical_payoff_ev=empirical_payoff_ev,
+                payoff_estimates=payoff_estimates,
+                predicted_returns=predicted_returns,
+                predicted_downsides=predicted_downsides,
                 min_signal_spacing_hours=min_signal_spacing_hours,
                 max_signals_per_group_per_day=max_signals_per_group_per_day,
                 max_signals_per_timestamp=max_signals_per_timestamp,
                 respect_open_positions=respect_open_positions,
                 capacity_release_mode=capacity_release_mode,
+                selection_execution_policy=selection_execution_policy,
                 optimize_metric=optimize_metric,
             )
             score_floor = floor_row.threshold if floor_row is not None else None
-        selected_ids = _select_target_frequency_event_ids(
+        selection = _select_target_frequency_events(
             test_samples=samples,
             probabilities=scores,
             target_trades_per_day=target_trades_per_day,
@@ -905,21 +1256,35 @@ def _online_threshold_frequency_returns(
             config=config,
             allow_negative_ev=allow_negative_ev,
             selection_score_mode=selection_score_mode,
-            target_frequency_mode="online",
+            target_frequency_mode=target_frequency_mode,
             selection_score_floor=score_floor,
+            selection_score_ceiling=selection_score_ceiling,
+            empirical_payoff_ev=empirical_payoff_ev,
+            payoff_estimates=payoff_estimates,
+            predicted_returns=predicted_returns,
+            predicted_downsides=predicted_downsides,
             min_signal_spacing_hours=min_signal_spacing_hours,
             max_signals_per_group_per_day=max_signals_per_group_per_day,
             max_signals_per_timestamp=max_signals_per_timestamp,
             respect_open_positions=respect_open_positions,
             capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
         )
-        returns = [sample_by_event[event_id].net_return for event_id in selected_ids]
-        if not returns:
+        selected_samples = [sample_by_event[event_id] for event_id in selection.event_ids]
+        objective_values = (
+            _selection_objective_values(
+                selected_samples,
+                notional_by_event=selection.notional_by_event,
+            )
+            if _selection_execution_enabled(selection_execution_policy)
+            else [sample.net_return for sample in selected_samples]
+        )
+        if not objective_values:
             continue
-        score = _returns_objective_key(returns, optimize_metric=optimize_metric)
+        score = _returns_objective_key(objective_values, optimize_metric=optimize_metric)
         if best_score is None or score > best_score:
             best_score = score
-            best_returns = returns
+            best_returns = objective_values
     return best_returns
 
 
@@ -1060,6 +1425,32 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
                 ]
             )
         return grid
+    if name == "gboost":
+        grid = [
+            {},
+            {"learning_rate": 0.02, "n_estimators": 220, "max_depth": 2, "min_samples_leaf": 30, "subsample": 0.85, "max_features": 0.70},
+            {"learning_rate": 0.04, "n_estimators": 140, "max_depth": 2, "min_samples_leaf": 20, "subsample": 0.75, "max_features": 0.60},
+            {"learning_rate": 0.025, "n_estimators": 260, "max_depth": 3, "min_samples_leaf": 35, "subsample": 0.80, "max_features": 0.50},
+            {"learning_rate": 0.06, "n_estimators": 100, "max_depth": 1, "min_samples_leaf": 18, "subsample": 0.90, "max_features": 0.80},
+        ]
+        if profile in deep_profiles:
+            grid.extend(
+                [
+                    {"learning_rate": 0.015, "n_estimators": 360, "max_depth": 2, "min_samples_leaf": 45, "min_samples_split": 80, "subsample": 0.75, "max_features": 0.55},
+                    {"learning_rate": 0.025, "n_estimators": 300, "max_depth": 3, "min_samples_leaf": 55, "min_samples_split": 100, "subsample": 0.70, "max_features": 0.45},
+                    {"learning_rate": 0.045, "n_estimators": 180, "max_depth": 1, "min_samples_leaf": 25, "min_samples_split": 50, "subsample": 0.85, "max_features": 0.65},
+                ]
+            )
+        if profile in wide_profiles:
+            grid.extend(
+                [
+                    {"learning_rate": 0.01, "n_estimators": 520, "max_depth": 1, "min_samples_leaf": 70, "min_samples_split": 140, "subsample": 0.70, "max_features": 0.45},
+                    {"learning_rate": 0.018, "n_estimators": 420, "max_depth": 2, "min_samples_leaf": 90, "min_samples_split": 160, "subsample": 0.65, "max_features": 0.35},
+                    {"learning_rate": 0.035, "n_estimators": 240, "max_depth": 3, "min_samples_leaf": 45, "min_samples_split": 90, "subsample": 0.85, "max_features": 0.50},
+                    {"learning_rate": 0.008, "n_estimators": 700, "max_depth": 2, "min_samples_leaf": 120, "min_samples_split": 220, "subsample": 0.60, "max_features": 0.30},
+                ]
+            )
+        return grid
     if name == "randomforest":
         grid = [
             {},
@@ -1073,6 +1464,8 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
                 [
                     {"n_estimators": 600, "max_depth": 5, "min_samples_leaf": 24, "max_features": 0.45, "max_samples": 0.85, "bootstrap": True},
                     {"n_estimators": 900, "max_depth": 8, "min_samples_leaf": 16, "max_features": 0.30, "max_samples": 0.70, "bootstrap": True},
+                    {"n_estimators": 700, "criterion": "entropy", "max_depth": 5, "min_samples_leaf": 18, "min_samples_split": 40, "max_features": 0.50, "max_samples": 0.80, "bootstrap": True},
+                    {"n_estimators": 900, "criterion": "log_loss", "max_depth": 6, "min_samples_leaf": 10, "min_samples_split": 24, "max_features": "sqrt", "max_samples": 0.75, "bootstrap": True, "ccp_alpha": 0.0005},
                 ]
             )
         if profile in wide_profiles:
@@ -1080,6 +1473,10 @@ def _hpo_grid(name: str, *, profile: str = "standard") -> list[dict[str, Any]]:
                 [
                     {"n_estimators": 800, "max_depth": 3, "min_samples_leaf": 35, "max_features": 0.60, "max_samples": 0.90, "bootstrap": True},
                     {"n_estimators": 1000, "max_depth": 10, "min_samples_leaf": 10, "max_features": 0.20, "max_samples": 0.65, "bootstrap": True},
+                    {"n_estimators": 900, "criterion": "entropy", "max_depth": 2, "min_samples_leaf": 45, "min_samples_split": 80, "max_features": 0.80, "max_samples": 0.95, "bootstrap": True},
+                    {"n_estimators": 1100, "criterion": "log_loss", "max_depth": 8, "min_samples_leaf": 6, "min_samples_split": 16, "max_features": 0.25, "max_samples": 0.55, "bootstrap": True, "class_weight": "balanced"},
+                    {"n_estimators": 1000, "criterion": "entropy", "max_leaf_nodes": 24, "min_samples_leaf": 8, "min_samples_split": 20, "max_features": 0.35, "max_samples": 0.70, "bootstrap": True, "ccp_alpha": 0.001},
+                    {"n_estimators": 1200, "max_depth": None, "min_samples_leaf": 4, "min_samples_split": 12, "max_features": 0.15, "max_samples": 0.60, "bootstrap": True, "class_weight": None},
                 ]
             )
         return grid
@@ -1127,6 +1524,83 @@ def _limit_hpo_grid(grid: list[dict[str, Any]], hpo_trials: int) -> list[dict[st
     return [grid[index] for index in sorted(indices)]
 
 
+def _hpo_embargo(config: AppConfig) -> timedelta:
+    if config.labels.max_holding_seconds is not None:
+        return timedelta(seconds=config.labels.max_holding_seconds)
+    return timedelta(hours=config.labels.max_holding_hours)
+
+
+def _purged_hpo_inner_training_indices(
+    training_samples: list[MetaLabelSample],
+    *,
+    split_at: int,
+    config: AppConfig,
+) -> list[int]:
+    validation_samples = training_samples[split_at:]
+    if not validation_samples:
+        return []
+    validation_start = validation_samples[0].timestamp_utc
+    validation_end = max(sample.t1 for sample in validation_samples)
+    return purge_overlapping_train(
+        training_samples,
+        list(range(split_at)),
+        validation_start,
+        validation_end,
+        _hpo_embargo(config),
+    )
+
+
+def _hpo_validation_selection_inputs(
+    *,
+    selection_score_mode: str,
+    inner_x_train: Any,
+    inner_training_samples: list[MetaLabelSample],
+    inner_x_validation: Any,
+    validation_samples: list[MetaLabelSample],
+    empirical_payoff_ev: bool,
+    specialist_models: bool,
+) -> tuple[Any | None, Any | None, dict[str, dict[str, Any]]]:
+    payoff_estimates = (
+        _payoff_estimates_by_type_and_side(
+            inner_training_samples,
+            min_samples=max(5, min(30, len(inner_training_samples) // 4)),
+        )
+        if empirical_payoff_ev
+        else {}
+    )
+    if selection_score_mode not in {
+        "predicted_return",
+        "expected_utility",
+        "risk_adjusted_return",
+        "return_first",
+        "blended_rank",
+        "capital_efficiency",
+    }:
+        return None, None, payoff_estimates
+    if len(inner_training_samples) < 20 or not validation_samples:
+        return None, None, payoff_estimates
+
+    threshold_predictions, _, _ = _fit_return_regression_predictions(
+        x_train=inner_x_train,
+        train_samples=inner_training_samples,
+        x_threshold_selection=inner_x_validation,
+        threshold_samples=validation_samples,
+        x_test=inner_x_validation,
+        test_samples=validation_samples,
+        specialist_models=specialist_models,
+        min_group_samples=max(20, min(50, len(inner_training_samples) // 4)),
+    )
+    downside_estimates = _downside_estimates_by_group(
+        inner_training_samples,
+        min_samples=max(5, min(30, len(inner_training_samples) // 4)),
+    )
+    predicted_downsides = [
+        _predicted_downside(sample, downside_estimates)
+        for sample in validation_samples
+    ]
+    return threshold_predictions, predicted_downsides, payoff_estimates
+
+
 def _select_hyperparameters(
     *,
     name: str,
@@ -1141,15 +1615,27 @@ def _select_hyperparameters(
     allow_negative_ev_target_frequency: bool = False,
     selection_score_mode: str = "probability",
     selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
     adaptive_selection_score_floor: bool = False,
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
+    empirical_payoff_ev: bool = False,
+    specialist_models: bool = False,
 ) -> dict[str, Any]:
-    if name not in {"lightgbm", "catboost", "xgboost", "histgb", "randomforest", "extratrees"}:
+    if name not in {
+        "lightgbm",
+        "catboost",
+        "xgboost",
+        "histgb",
+        "gboost",
+        "randomforest",
+        "extratrees",
+    }:
         return {}
     from sklearn.metrics import brier_score_loss
 
@@ -1158,20 +1644,36 @@ def _select_hyperparameters(
     split_at = max(30, int(len(y_train) * 0.80))
     if split_at >= len(y_train):
         return {}
-    inner_x_train = x_train[:split_at]
-    inner_y_train = y_train[:split_at]
     inner_x_validation = x_train[split_at:]
     inner_y_validation = y_train[split_at:]
     validation_samples = training_samples[split_at:]
-    inner_weights = _classification_sample_weights(training_samples[:split_at])
+    purged_inner_indices = _purged_hpo_inner_training_indices(
+        training_samples,
+        split_at=split_at,
+        config=config,
+    )
+    if not purged_inner_indices:
+        return {}
+    inner_x_train = x_train[purged_inner_indices]
+    inner_y_train = y_train[purged_inner_indices]
+    inner_training_samples = [training_samples[idx] for idx in purged_inner_indices]
+    inner_weights = _classification_sample_weights(inner_training_samples)
     validation_weights = _classification_sample_weights(validation_samples)
     if len(set(inner_y_train.tolist())) < 2 or len(set(inner_y_validation.tolist())) < 2:
         return {}
 
     best_params: dict[str, Any] = {}
     best_score: tuple[float, ...] | None = None
-    hpo_selection_score_mode = (
-        selection_score_mode if selection_score_mode in {"probability", "expected_value"} else "probability"
+    hpo_predicted_returns, hpo_predicted_downsides, hpo_payoff_estimates = (
+        _hpo_validation_selection_inputs(
+            selection_score_mode=selection_score_mode,
+            inner_x_train=inner_x_train,
+            inner_training_samples=inner_training_samples,
+            inner_x_validation=inner_x_validation,
+            validation_samples=validation_samples,
+            empirical_payoff_ev=empirical_payoff_ev,
+            specialist_models=specialist_models,
+        )
     )
     for params in _limit_hpo_grid(_hpo_grid(name, profile=hpo_profile), hpo_trials):
         balanced_params = {**_class_balance_params(name, inner_y_train), **params}
@@ -1189,28 +1691,52 @@ def _select_hyperparameters(
                 scores=raw,
                 target_trades_per_day=float(target_trades_per_day or 0.0),
                 config=config,
-                selection_score_mode=hpo_selection_score_mode,
+                selection_score_mode=selection_score_mode,
+                target_frequency_mode=target_frequency_mode,
                 selection_score_floor=selection_score_floor,
+                selection_score_ceiling=selection_score_ceiling,
                 adaptive_selection_score_floor=adaptive_selection_score_floor,
                 allow_negative_ev=allow_negative_ev_target_frequency,
+                empirical_payoff_ev=empirical_payoff_ev,
+                payoff_estimates=hpo_payoff_estimates,
+                predicted_returns=hpo_predicted_returns,
+                predicted_downsides=hpo_predicted_downsides,
                 min_signal_spacing_hours=min_signal_spacing_hours,
                 max_signals_per_group_per_day=max_signals_per_group_per_day,
                 max_signals_per_timestamp=max_signals_per_timestamp,
                 respect_open_positions=respect_open_positions,
                 capacity_release_mode=capacity_release_mode,
+                selection_execution_policy=selection_execution_policy,
                 optimize_metric=optimize_metric,
             )
-            if hpo_profile == "capacity" and target_frequency_mode == "online" and target_trades_per_day
+            if hpo_profile == "capacity"
+            and target_frequency_mode in {"online", "quota"}
+            and target_trades_per_day
             else []
         )
         quota_returns = (
-            _quota_frequency_returns(
+            _online_threshold_frequency_returns(
                 samples=validation_samples,
                 scores=raw,
                 target_trades_per_day=float(target_trades_per_day or 0.0),
+                config=config,
+                selection_score_mode=selection_score_mode,
+                target_frequency_mode=target_frequency_mode,
+                selection_score_floor=selection_score_floor,
+                selection_score_ceiling=selection_score_ceiling,
+                adaptive_selection_score_floor=adaptive_selection_score_floor,
+                allow_negative_ev=allow_negative_ev_target_frequency,
+                empirical_payoff_ev=empirical_payoff_ev,
+                payoff_estimates=hpo_payoff_estimates,
+                predicted_returns=hpo_predicted_returns,
+                predicted_downsides=hpo_predicted_downsides,
                 min_signal_spacing_hours=min_signal_spacing_hours,
                 max_signals_per_group_per_day=max_signals_per_group_per_day,
                 max_signals_per_timestamp=max_signals_per_timestamp,
+                respect_open_positions=respect_open_positions,
+                capacity_release_mode=capacity_release_mode,
+                selection_execution_policy=selection_execution_policy,
+                optimize_metric=optimize_metric,
             )
             if hpo_profile == "quota" and target_frequency_mode == "quota" and target_trades_per_day
             else []
@@ -1478,13 +2004,17 @@ def _fit_base_prediction_sets(
     allow_negative_ev_target_frequency: bool = False,
     selection_score_mode: str = "probability",
     selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
     adaptive_selection_score_floor: bool = False,
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
     max_signals_per_timestamp: int = 0,
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
+    empirical_payoff_ev: bool = False,
+    specialist_models: bool = False,
 ) -> tuple[list[BaseFoldPredictionSet], dict[str, str]]:
     prediction_sets: list[BaseFoldPredictionSet] = []
     skipped: dict[str, str] = {}
@@ -1550,13 +2080,17 @@ def _fit_base_prediction_sets(
                         allow_negative_ev_target_frequency=allow_negative_ev_target_frequency,
                         selection_score_mode=selection_score_mode,
                         selection_score_floor=selection_score_floor,
+                        selection_score_ceiling=selection_score_ceiling,
                         adaptive_selection_score_floor=adaptive_selection_score_floor,
                         min_signal_spacing_hours=min_signal_spacing_hours,
                         max_signals_per_group_per_day=max_signals_per_group_per_day,
                         max_signals_per_timestamp=max_signals_per_timestamp,
                         respect_open_positions=respect_open_positions,
                         capacity_release_mode=capacity_release_mode,
+                        selection_execution_policy=selection_execution_policy,
                         optimize_metric=optimize_metric,
+                        empirical_payoff_ev=empirical_payoff_ev,
+                        specialist_models=specialist_models,
                     )
                 if name in {"lightgbm", "catboost", "xgboost", "randomforest", "extratrees"}:
                     selected_params = {**_class_balance_params(name, model_y_train), **selected_params}
@@ -1796,7 +2330,7 @@ def _payoff_estimate(
     label_zero_returns = [sample.net_return for sample in samples if sample.label == 0]
     wins = [value for value in label_one_returns if value > 0]
     losses = [-value for value in label_zero_returns if value < 0]
-    if len(samples) < min_samples or not label_one_returns or not label_zero_returns:
+    if len(samples) < min_samples or not label_one_returns:
         return {
             "count": float(len(samples)),
             "wins": float(len(wins)),
@@ -1805,6 +2339,8 @@ def _payoff_estimate(
             "average_loss": 0.0,
             "average_label_one_return": 0.0,
             "average_label_zero_return": 0.0,
+            "has_label_one_returns": bool(label_one_returns),
+            "has_label_zero_returns": bool(label_zero_returns),
             "source": "static_fallback",
         }
     return {
@@ -1814,8 +2350,14 @@ def _payoff_estimate(
         "average_win": float(sum(wins) / len(wins)) if wins else 0.0,
         "average_loss": float(sum(losses) / len(losses)) if losses else 0.0,
         "average_label_one_return": float(sum(label_one_returns) / len(label_one_returns)),
-        "average_label_zero_return": float(sum(label_zero_returns) / len(label_zero_returns)),
-        "source": "calibration",
+        "average_label_zero_return": (
+            float(sum(label_zero_returns) / len(label_zero_returns))
+            if label_zero_returns
+            else 0.0
+        ),
+        "has_label_one_returns": bool(label_one_returns),
+        "has_label_zero_returns": bool(label_zero_returns),
+        "source": "calibration" if label_zero_returns else "partial_calibration",
     }
 
 
@@ -1842,11 +2384,21 @@ def _expected_value(
 ) -> float:
     if empirical_payoff_ev:
         estimate = payoff_estimates.get(_payoff_key(sample))
-        if estimate and estimate.get("source") == "calibration":
+        if estimate and estimate.get("source") in {"calibration", "partial_calibration"}:
             if "average_label_one_return" in estimate and "average_label_zero_return" in estimate:
+                label_one_return = (
+                    float(estimate["average_label_one_return"])
+                    if estimate.get("has_label_one_returns", True)
+                    else sample.net_profit_target
+                )
+                label_zero_return = (
+                    float(estimate["average_label_zero_return"])
+                    if estimate.get("has_label_zero_returns", True)
+                    else -sample.net_stop_loss
+                )
                 return (
-                    probability * float(estimate["average_label_one_return"])
-                    + (1.0 - probability) * float(estimate["average_label_zero_return"])
+                    probability * label_one_return
+                    + (1.0 - probability) * label_zero_return
                 )
             return (
                 probability * float(estimate["average_win"])
@@ -1867,6 +2419,7 @@ def _type_threshold_allows_ev(
         type_threshold
         and type_threshold.get("source") == "candidate_type_calibration"
         and float(type_threshold.get("average_trade_return", 0.0)) > 0
+        and expected_value > 0
     )
 
 
@@ -1883,9 +2436,24 @@ def _passes_selection_and_ev_gate(
         expected_value=expected_value,
         minimum_expected_value=minimum_expected_value,
     )
-    if selection_score_mode in {"predicted_return", "expected_utility", "risk_adjusted_return"}:
+    if selection_score_mode == "return_first":
+        return selection_score > minimum_expected_value
+    if selection_score_mode in {
+        "predicted_return",
+        "expected_utility",
+        "risk_adjusted_return",
+        "capital_efficiency",
+    }:
         return selection_score > 0 and ev_ok
     return ev_ok
+
+
+def _passes_selection_score_ceiling(
+    *,
+    selection_score: float,
+    selection_score_ceiling: float | None,
+) -> bool:
+    return selection_score_ceiling is None or selection_score <= selection_score_ceiling + _SELECTION_GATE_EPSILON
 
 
 def _select_threshold_from_calibration(
@@ -2045,27 +2613,170 @@ def _select_threshold_for_target_frequency(
     probabilities: Any,
     thresholds: tuple[float, ...],
     target_trades_per_day: float,
+    config: AppConfig | None = None,
+    selection_score_mode: str = "probability",
+    target_frequency_mode: str = "online",
+    selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
+    selection_score_multiplier: float = 1.0,
+    candidate_type_thresholds: dict[str, dict[str, Any]] | None = None,
+    empirical_payoff_ev: bool = False,
+    payoff_estimates: dict[str, dict[str, Any]] | None = None,
+    predicted_returns: Any | None = None,
+    predicted_downsides: Any | None = None,
+    predicted_maes: Any | None = None,
+    predicted_mfes: Any | None = None,
+    predicted_time_to_exit_seconds: Any | None = None,
+    predicted_early_adverse_probabilities: Any | None = None,
+    require_calibrated_selection: bool = False,
+    min_signal_spacing_hours: float = 0.0,
+    max_signals_per_group_per_day: int = 0,
+    max_signals_per_timestamp: int = 0,
+    selection_setup_families: tuple[str, ...] = (),
+    selection_exclude_setup_families: tuple[str, ...] = (),
+    respect_open_positions: bool = False,
+    capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
+    allow_negative_ev: bool = False,
 ) -> ThresholdSweepRow | None:
     if target_trades_per_day <= 0:
         return None
     days = _days_spanned(calibration_samples)
-    rows = _threshold_sweep(
-        test_samples=calibration_samples,
-        probabilities=probabilities,
-        thresholds=thresholds,
-    )
-    viable = [row for row in rows if row.traded_signals / days >= target_trades_per_day]
-    if viable:
-        if optimize_metric != "sharpe":
-            return max(viable, key=lambda row: _threshold_objective_key(row, optimize_metric=optimize_metric))
-        return max(viable, key=lambda row: (row.threshold, row.average_trade_return, row.net_pnl))
+    if config is None:
+        rows = _threshold_sweep(
+            test_samples=calibration_samples,
+            probabilities=probabilities,
+            thresholds=thresholds,
+        )
+    else:
+        sample_by_event = {sample.event_id: sample for sample in calibration_samples}
+        rows = []
+        for threshold in thresholds:
+            selection = _select_target_frequency_events(
+                test_samples=calibration_samples,
+                probabilities=probabilities,
+                predicted_returns=predicted_returns,
+                predicted_downsides=predicted_downsides,
+                predicted_maes=predicted_maes,
+                predicted_mfes=predicted_mfes,
+                predicted_time_to_exit_seconds=predicted_time_to_exit_seconds,
+                predicted_early_adverse_probabilities=predicted_early_adverse_probabilities,
+                target_trades_per_day=target_trades_per_day,
+                selected_threshold=threshold,
+                config=config,
+                allow_negative_ev=allow_negative_ev,
+                selection_score_mode=selection_score_mode,
+                target_frequency_mode=target_frequency_mode,
+                selection_score_floor=selection_score_floor,
+                selection_score_ceiling=selection_score_ceiling,
+                selection_score_multiplier=selection_score_multiplier,
+                candidate_type_thresholds=candidate_type_thresholds,
+                empirical_payoff_ev=empirical_payoff_ev,
+                payoff_estimates=payoff_estimates,
+                require_calibrated_selection=require_calibrated_selection,
+                min_signal_spacing_hours=min_signal_spacing_hours,
+                max_signals_per_group_per_day=max_signals_per_group_per_day,
+                max_signals_per_timestamp=max_signals_per_timestamp,
+                selection_setup_families=selection_setup_families,
+                selection_exclude_setup_families=selection_exclude_setup_families,
+                respect_open_positions=respect_open_positions,
+                capacity_release_mode=capacity_release_mode,
+                selection_execution_policy=selection_execution_policy,
+            )
+            rows.append(
+                _threshold_row_from_selection(
+                    threshold=threshold,
+                    selected_samples=[
+                        sample_by_event[event_id]
+                        for event_id in selection.event_ids
+                    ],
+                    notional_by_event=selection.notional_by_event,
+                )
+            )
+    if allow_negative_ev:
+        target_met = [row for row in rows if row.traded_signals / days >= target_trades_per_day]
+        if target_met:
+            selected = (
+                max(
+                    target_met,
+                    key=lambda row: _threshold_objective_key(row, optimize_metric=optimize_metric),
+                )
+                if optimize_metric != "sharpe"
+                else max(target_met, key=lambda row: (row.threshold, row.average_trade_return, row.net_pnl))
+            )
+            return _soften_low_negative_ev_probe_threshold(
+                selected,
+                allow_negative_ev=allow_negative_ev,
+            )
+        populated = [row for row in rows if row.traded_signals > 0]
+        if not populated:
+            return None
+        return _soften_low_negative_ev_probe_threshold(
+            _closest_to_target_row(
+                populated,
+                days=days,
+                target_trades_per_day=target_trades_per_day,
+                optimize_metric=optimize_metric,
+            ),
+            allow_negative_ev=allow_negative_ev,
+        )
+
+    target_met = [row for row in rows if row.traded_signals / days >= target_trades_per_day]
+    positive_target_met = [
+        row for row in target_met if row.net_pnl > 0 and row.average_trade_return > 0
+    ]
+    if positive_target_met:
+        return _soften_low_negative_ev_probe_threshold(
+            max(
+                positive_target_met,
+                key=lambda row: _threshold_objective_key(row, optimize_metric=optimize_metric),
+            ),
+            allow_negative_ev=allow_negative_ev,
+        )
     populated = [row for row in rows if row.traded_signals > 0]
     if not populated:
         return None
-    return min(
-        populated,
-        key=lambda row: (abs(row.traded_signals / days - target_trades_per_day), -row.threshold),
+    positive_populated = [
+        row for row in populated if row.net_pnl > 0 and row.average_trade_return > 0
+    ]
+    if positive_populated:
+        return _soften_low_negative_ev_probe_threshold(
+            _closest_to_target_row(
+                positive_populated,
+                days=days,
+                target_trades_per_day=target_trades_per_day,
+                optimize_metric=optimize_metric,
+            ),
+            allow_negative_ev=allow_negative_ev,
+        )
+    return None
+
+
+def _soften_low_negative_ev_probe_threshold(
+    row: ThresholdSweepRow,
+    *,
+    allow_negative_ev: bool,
+) -> ThresholdSweepRow:
+    if allow_negative_ev and 0.0 < row.threshold <= _LOW_NEGATIVE_EV_PROBE_THRESHOLD:
+        return replace(row, threshold=0.0)
+    return row
+
+
+def _closest_to_target_row(
+    rows: list[ThresholdSweepRow],
+    *,
+    days: float,
+    target_trades_per_day: float,
+    optimize_metric: str,
+) -> ThresholdSweepRow:
+    return max(
+        rows,
+        key=lambda row: (
+            -abs(row.traded_signals / days - target_trades_per_day),
+            row.traded_signals / days >= target_trades_per_day,
+            _threshold_objective_key(row, optimize_metric=optimize_metric),
+        ),
     )
 
 
@@ -2084,7 +2795,211 @@ def _sample_capacity_until(sample: MetaLabelSample, *, release_mode: str) -> Any
     return sample.label_detail.vertical_barrier_timestamp_utc
 
 
-def _select_target_frequency_event_ids(
+def _selection_execution_enabled(policy: SelectionExecutionPolicy | None) -> bool:
+    return bool(
+        policy
+        and policy.starting_equity > 0
+        and policy.requested_notional > 0
+    )
+
+
+def _selection_requested_notional_for_cap(policy: SelectionExecutionPolicy) -> float:
+    if policy.sizing_mode not in {"score_bucket", "liquidity_score_bucket"}:
+        return policy.requested_notional
+    return max(
+        policy.requested_notional,
+        policy.sizing_base_notional,
+        policy.sizing_mid_notional,
+        policy.sizing_high_notional,
+        0.0,
+    )
+
+
+def _selection_sample_spread_bps(sample: MetaLabelSample) -> float | None:
+    spreads = [
+        float(value)
+        for key, value in sample.features.items()
+        if key.endswith("spread_bps")
+        and isinstance(value, int | float)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    ]
+    return min(spreads) if spreads else None
+
+
+def _selection_sample_liquidity_score(sample: MetaLabelSample) -> float:
+    values: list[float] = []
+    for key in (
+        "pm_leading_liquidity_weight_total",
+        "pm_leading_liquidity_weight_mean",
+        "ibkr_top_of_book_size_log",
+        "ibkr_futures_top_of_book_size_log",
+        "dollar_volume_log",
+    ):
+        value = sample.features.get(key)
+        if isinstance(value, int | float) and math.isfinite(float(value)):
+            values.append(float(value))
+    return max(values) if values else 0.0
+
+
+def _selection_score_field_value(candidate: _SelectionCandidate, field: str) -> float:
+    if field == "probability":
+        return candidate.probability
+    if field == "expected_value":
+        return candidate.expected_value
+    if field == "predicted_return":
+        return candidate.predicted_return
+    if field == "selection_score":
+        return candidate.selection_score
+    if field == "trade_score":
+        risk = max(candidate.predicted_mae, candidate.predicted_downside, 1e-6)
+        hours = max(candidate.predicted_time_to_exit_seconds / 3600, 1 / 3600)
+        edge = candidate.predicted_return + 0.25 * candidate.expected_value + 0.10 * candidate.predicted_mfe
+        return edge / (risk * hours**0.5) - candidate.predicted_early_adverse_probability
+    return candidate.probability
+
+
+def _selection_candidate_type_notional_scale(type_threshold: dict[str, Any] | None) -> float | None:
+    if not type_threshold or type_threshold.get("source") != "candidate_type_calibration":
+        return None
+    average_return = float(type_threshold.get("average_trade_return", 0.0) or 0.0)
+    utility_floor = float(type_threshold.get("utility_floor", 0.0) or 0.0)
+    hit_rate = float(type_threshold.get("hit_rate", 0.0) or 0.0)
+    traded_signals = int(type_threshold.get("traded_signals", 0) or 0)
+    if utility_floor <= 0 or traded_signals <= 0:
+        return None
+    if average_return >= utility_floor and hit_rate >= 0.50:
+        return 1.0
+    if average_return > 0:
+        return max(0.25, min(1.0, average_return / utility_floor))
+    return None
+
+
+def _selection_confidence_notional_scale(
+    candidate: _SelectionCandidate,
+    config: AppConfig,
+) -> float:
+    type_scale = _selection_candidate_type_notional_scale(candidate.type_threshold)
+    if type_scale is not None:
+        return type_scale
+    if candidate.expected_value <= 0:
+        return 0.25
+    probability_threshold = max(config.model.minimum_probability, 1e-9)
+    probability_room = max(1.0 - probability_threshold, 1e-9)
+    probability_scale = max(0.0, (candidate.probability - probability_threshold) / probability_room)
+    geometry_floor = max(
+        min(candidate.sample.net_profit_target, candidate.sample.net_stop_loss) * 0.25,
+        1e-6,
+    )
+    ev_floor = max(config.model.minimum_expected_value, geometry_floor)
+    ev_scale = max(0.0, candidate.expected_value / ev_floor)
+    confidence = min(1.0, probability_scale, ev_scale)
+    return max(0.25, min(1.0, 0.25 + 0.75 * confidence))
+
+
+def _selection_estimated_notional(
+    candidate: _SelectionCandidate,
+    *,
+    config: AppConfig,
+    policy: SelectionExecutionPolicy | None,
+) -> float:
+    if not _selection_execution_enabled(policy):
+        return max(float(candidate.sample.notional), 0.0)
+    assert policy is not None
+    if policy.sizing_mode not in {"fixed", "confidence", "score_bucket", "liquidity_score_bucket"}:
+        return max(float(candidate.sample.notional), 0.0)
+    if policy.sizing_score_direction not in {"high", "low"}:
+        return max(float(candidate.sample.notional), 0.0)
+    equity = max(float(policy.starting_equity), 0.0)
+    if equity <= 0:
+        return 0.0
+    requested_notional = _selection_requested_notional_for_cap(policy)
+    risk_based = equity * config.risk.risk_per_trade / max(candidate.sample.net_stop_loss, 1e-9)
+    cap_candidates = [
+        risk_based,
+        requested_notional,
+        config.risk.paper_max_notional,
+    ]
+    if config.contract.instrument_model != "futures":
+        cap_candidates.append(equity)
+    cap_notional = max(0.0, min(cap_candidates))
+    if policy.sizing_mode == "fixed":
+        return cap_notional
+    if policy.sizing_mode == "confidence":
+        return cap_notional * _selection_confidence_notional_scale(candidate, config)
+
+    base = policy.sizing_base_notional if policy.sizing_base_notional > 0 else min(5_000.0, cap_notional)
+    mid = (
+        policy.sizing_mid_notional
+        if policy.sizing_mid_notional > 0
+        else min(max(base, (base + cap_notional) / 2), cap_notional)
+    )
+    high = policy.sizing_high_notional if policy.sizing_high_notional > 0 else cap_notional
+    base = min(base, cap_notional)
+    mid = min(max(mid, base), cap_notional)
+    high = min(max(high, mid), cap_notional)
+    score = _selection_score_field_value(candidate, policy.sizing_score_field)
+    if policy.sizing_score_direction == "low":
+        score = -score
+    spread = _selection_sample_spread_bps(candidate.sample)
+    spread_ok = (
+        spread is None
+        or policy.sizing_max_spread_bps <= 0
+        or spread <= policy.sizing_max_spread_bps
+    )
+    liquidity_ok = (
+        policy.sizing_min_liquidity_score <= 0
+        or _selection_sample_liquidity_score(candidate.sample) >= policy.sizing_min_liquidity_score
+    )
+    high_quality = score >= policy.sizing_high_score and (
+        policy.sizing_mode == "score_bucket" or (spread_ok and liquidity_ok)
+    )
+    if high_quality:
+        return high
+    if score >= policy.sizing_mid_score:
+        return mid
+    return base
+
+
+def _selection_objective_values(
+    selected_samples: list[MetaLabelSample],
+    *,
+    notional_by_event: dict[str, float],
+) -> list[float]:
+    return [
+        float(notional_by_event.get(sample.event_id, sample.notional)) * sample.net_return
+        for sample in selected_samples
+    ]
+
+
+def _threshold_row_from_selection(
+    *,
+    threshold: float,
+    selected_samples: list[MetaLabelSample],
+    notional_by_event: dict[str, float],
+) -> ThresholdSweepRow:
+    if not selected_samples:
+        return ThresholdSweepRow(
+            threshold=threshold,
+            traded_signals=0,
+            hit_rate=0.0,
+            net_pnl=0.0,
+            average_trade_return=0.0,
+        )
+    pnl_values = _selection_objective_values(
+        selected_samples,
+        notional_by_event=notional_by_event,
+    )
+    return ThresholdSweepRow(
+        threshold=threshold,
+        traded_signals=len(selected_samples),
+        hit_rate=sum(sample.label for sample in selected_samples) / len(selected_samples),
+        net_pnl=sum(pnl_values),
+        average_trade_return=sum(sample.net_return for sample in selected_samples) / len(selected_samples),
+    )
+
+
+def _select_target_frequency_events(
     *,
     test_samples: list[MetaLabelSample],
     probabilities: Any,
@@ -2095,11 +3010,17 @@ def _select_target_frequency_event_ids(
     selection_score_mode: str = "expected_value",
     target_frequency_mode: str = "strict",
     selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
+    selection_score_multiplier: float = 1.0,
     candidate_type_thresholds: dict[str, dict[str, Any]] | None = None,
     empirical_payoff_ev: bool = False,
     payoff_estimates: dict[str, dict[str, Any]] | None = None,
     predicted_returns: Any | None = None,
     predicted_downsides: Any | None = None,
+    predicted_maes: Any | None = None,
+    predicted_mfes: Any | None = None,
+    predicted_time_to_exit_seconds: Any | None = None,
+    predicted_early_adverse_probabilities: Any | None = None,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
@@ -2108,9 +3029,11 @@ def _select_target_frequency_event_ids(
     selection_exclude_setup_families: tuple[str, ...] = (),
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
-) -> set[str]:
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
+    initial_open_positions: tuple[tuple[Any, float], ...] = (),
+) -> _TargetFrequencySelection:
     if target_trades_per_day <= 0:
-        return set()
+        return _TargetFrequencySelection(set(), {})
     if target_frequency_mode not in {"strict", "quota", "online"}:
         raise ValueError("target_frequency_mode must be strict, quota, or online")
     if capacity_release_mode not in {"planned", "actual"}:
@@ -2119,23 +3042,49 @@ def _select_target_frequency_event_ids(
         predicted_returns = [0.0 for _ in test_samples]
     if predicted_downsides is None:
         predicted_downsides = [0.0 for _ in test_samples]
+    if predicted_maes is None:
+        predicted_maes = [0.0 for _ in test_samples]
+    if predicted_mfes is None:
+        predicted_mfes = [0.0 for _ in test_samples]
+    if predicted_time_to_exit_seconds is None:
+        predicted_time_to_exit_seconds = [0.0 for _ in test_samples]
+    if predicted_early_adverse_probabilities is None:
+        predicted_early_adverse_probabilities = [0.0 for _ in test_samples]
     allowed_setups = set(selection_setup_families)
     excluded_setups = set(selection_exclude_setup_families)
-    grouped: dict[object, list[tuple[MetaLabelSample, float, float, float, float, str]]] = {}
-    for sample, probability, predicted_return, predicted_downside in zip(
+    grouped: dict[object, list[_SelectionCandidate]] = {}
+    for (
+        sample,
+        probability,
+        predicted_return,
+        predicted_downside,
+        predicted_mae,
+        predicted_mfe,
+        predicted_time,
+        predicted_early_adverse,
+    ) in zip(
         test_samples,
         probabilities,
         predicted_returns,
         predicted_downsides,
+        predicted_maes,
+        predicted_mfes,
+        predicted_time_to_exit_seconds,
+        predicted_early_adverse_probabilities,
         strict=True,
     ):
         probability = float(probability)
         predicted_return = float(predicted_return)
         predicted_downside = float(predicted_downside)
-        setup_family = _sample_setup_family(sample)
-        if allowed_setups and setup_family not in allowed_setups:
-            continue
-        if excluded_setups and setup_family in excluded_setups:
+        predicted_mae = float(predicted_mae)
+        predicted_mfe = float(predicted_mfe)
+        predicted_time = float(predicted_time)
+        predicted_early_adverse = float(predicted_early_adverse)
+        if not _sample_matches_setup_filter(
+            sample,
+            allowed=allowed_setups,
+            excluded=excluded_setups,
+        ):
             continue
         expected_value = _expected_value(
             probability=probability,
@@ -2148,8 +3097,13 @@ def _select_target_frequency_event_ids(
             expected_value=expected_value,
             predicted_return=predicted_return,
             predicted_downside=predicted_downside,
+            predicted_mae=predicted_mae,
+            predicted_mfe=predicted_mfe,
+            predicted_time_to_exit_seconds=predicted_time,
+            predicted_early_adverse_probability=predicted_early_adverse,
             mode=selection_score_mode,
         )
+        score *= selection_score_multiplier
         threshold = selected_threshold
         type_threshold = None
         type_utility = 0.0
@@ -2165,9 +3119,17 @@ def _select_target_frequency_event_ids(
                 threshold = max(threshold, float(type_threshold["threshold"]))
                 type_utility = float(type_threshold.get("average_trade_return", 0.0))
         if target_frequency_mode in {"strict", "online"}:
-            if probability < threshold:
+            if probability + _SELECTION_GATE_EPSILON < threshold:
                 continue
-            if selection_score_floor is not None and score < selection_score_floor:
+            if (
+                selection_score_floor is not None
+                and score + _SELECTION_GATE_EPSILON < selection_score_floor
+            ):
+                continue
+            if not _passes_selection_score_ceiling(
+                selection_score=score,
+                selection_score_ceiling=selection_score_ceiling,
+            ):
                 continue
             if not allow_negative_ev and not _passes_selection_and_ev_gate(
                 selection_score_mode=selection_score_mode,
@@ -2177,18 +3139,54 @@ def _select_target_frequency_event_ids(
                 type_threshold=type_threshold,
             ):
                 continue
-        elif selection_score_floor is not None and score < selection_score_floor:
-            continue
+        else:
+            if (
+                selection_score_floor is not None
+                and score + _SELECTION_GATE_EPSILON < selection_score_floor
+            ):
+                continue
+            if not _passes_selection_score_ceiling(
+                selection_score=score,
+                selection_score_ceiling=selection_score_ceiling,
+            ):
+                continue
+            if not allow_negative_ev and not _passes_selection_and_ev_gate(
+                selection_score_mode=selection_score_mode,
+                selection_score=score,
+                expected_value=expected_value,
+                minimum_expected_value=config.model.minimum_expected_value,
+                type_threshold=type_threshold,
+            ):
+                continue
         grouped.setdefault(sample.timestamp_utc.date(), []).append(
-            (sample, probability, expected_value, type_utility, score, _threshold_group_key(sample))
+            _SelectionCandidate(
+                sample=sample,
+                probability=probability,
+                expected_value=expected_value,
+                type_utility=type_utility,
+                selection_score=score,
+                group_key=_threshold_group_key(sample),
+                predicted_return=predicted_return,
+                predicted_downside=predicted_downside,
+                predicted_mae=predicted_mae,
+                predicted_mfe=predicted_mfe,
+                predicted_time_to_exit_seconds=predicted_time,
+                predicted_early_adverse_probability=predicted_early_adverse,
+                type_threshold=type_threshold,
+            )
         )
 
     selected: set[str] = set()
+    notional_by_event: dict[str, float] = {}
     spacing = timedelta(hours=max(min_signal_spacing_hours, 0.0))
     whole_day_quota = math.floor(target_trades_per_day)
     fractional_quota = target_trades_per_day - whole_day_quota
     fractional_accumulator = 0.0
-    selected_open_until: list[Any] = []
+    selected_open_until: list[tuple[Any, float]] = list(initial_open_positions)
+    cash_capacity_enabled = (
+        _selection_execution_enabled(selection_execution_policy)
+        and config.contract.instrument_model == "spot_crypto"
+    )
     for day in sorted(grouped):
         quota = whole_day_quota
         fractional_accumulator += fractional_quota
@@ -2201,29 +3199,64 @@ def _select_target_frequency_event_ids(
             ranked = sorted(
                 grouped[day],
                 key=lambda row: (
-                    row[0].timestamp_utc,
-                    -row[4],
-                    -row[3],
-                    -row[2],
-                    -row[1],
+                    row.sample.timestamp_utc,
+                    -row.selection_score,
+                    -row.type_utility,
+                    -row.expected_value,
+                    -row.probability,
                 ),
             )
         else:
-            ranked = sorted(grouped[day], key=lambda row: (row[4], row[3], row[2], row[1]), reverse=True)
+            ranked = sorted(
+                grouped[day],
+                key=lambda row: (
+                    row.selection_score,
+                    row.type_utility,
+                    row.expected_value,
+                    row.probability,
+                ),
+                reverse=True,
+            )
         selected_for_day = 0
         selected_times_by_group: dict[str, list[Any]] = {}
         selected_counts_by_group: dict[str, int] = {}
         selected_counts_by_timestamp: dict[Any, int] = {}
-        for sample, _, _, _, _, group_key in ranked:
+        for candidate in ranked:
+            sample = candidate.sample
+            group_key = candidate.group_key
             if selected_for_day >= quota:
                 break
-            if respect_open_positions and config.risk.max_open_positions > 0:
+            if respect_open_positions or cash_capacity_enabled:
                 capacity_timestamp = _sample_capacity_timestamp(sample)
                 selected_open_until = [
-                    open_until for open_until in selected_open_until if open_until > capacity_timestamp
+                    (open_until, notional)
+                    for open_until, notional in selected_open_until
+                    if open_until > capacity_timestamp
                 ]
-                if len(selected_open_until) >= config.risk.max_open_positions:
+                if (
+                    respect_open_positions
+                    and config.risk.max_open_positions > 0
+                    and len(selected_open_until) >= config.risk.max_open_positions
+                ):
                     continue
+            selected_notional = _selection_estimated_notional(
+                candidate,
+                config=config,
+                policy=selection_execution_policy,
+            )
+            if cash_capacity_enabled and sample.side == "BUY":
+                assert selection_execution_policy is not None
+                spot_exposure_cap = min(
+                    selection_execution_policy.starting_equity,
+                    config.risk.paper_max_notional,
+                )
+                open_notional = sum(notional for _, notional in selected_open_until)
+                available_notional = max(spot_exposure_cap - open_notional, 0.0)
+                if available_notional < config.risk.minimum_fee_efficient_notional:
+                    continue
+                selected_notional = min(selected_notional, available_notional)
+            if selected_notional < config.risk.minimum_fee_efficient_notional:
+                continue
             if (
                 max_signals_per_timestamp > 0
                 and selected_counts_by_timestamp.get(sample.timestamp_utc, 0) >= max_signals_per_timestamp
@@ -2236,15 +3269,27 @@ def _select_target_frequency_event_ids(
                 if any(abs(sample.timestamp_utc - timestamp) < spacing for timestamp in group_times):
                     continue
             selected.add(sample.event_id)
+            notional_by_event[sample.event_id] = selected_notional
             selected_for_day += 1
-            if respect_open_positions and config.risk.max_open_positions > 0:
+            if respect_open_positions or cash_capacity_enabled:
                 selected_open_until.append(
-                    _sample_capacity_until(sample, release_mode=capacity_release_mode)
+                    (
+                        _sample_capacity_until(sample, release_mode=capacity_release_mode),
+                        selected_notional,
+                    )
                 )
             selected_times_by_group.setdefault(group_key, []).append(sample.timestamp_utc)
             selected_counts_by_group[group_key] = selected_counts_by_group.get(group_key, 0) + 1
             selected_counts_by_timestamp[sample.timestamp_utc] = selected_counts_by_timestamp.get(sample.timestamp_utc, 0) + 1
-    return selected
+    return _TargetFrequencySelection(
+        selected,
+        notional_by_event,
+        tuple(selected_open_until),
+    )
+
+
+def _select_target_frequency_event_ids(**kwargs: Any) -> set[str]:
+    return _select_target_frequency_events(**kwargs).event_ids
 
 
 def _select_selection_score_floor_for_target_frequency(
@@ -2257,11 +3302,17 @@ def _select_selection_score_floor_for_target_frequency(
     allow_negative_ev: bool,
     selection_score_mode: str,
     target_frequency_mode: str,
+    selection_score_multiplier: float = 1.0,
+    selection_score_ceiling: float | None = None,
     candidate_type_thresholds: dict[str, dict[str, Any]] | None = None,
     empirical_payoff_ev: bool = False,
     payoff_estimates: dict[str, dict[str, Any]] | None = None,
     predicted_returns: Any | None = None,
     predicted_downsides: Any | None = None,
+    predicted_maes: Any | None = None,
+    predicted_mfes: Any | None = None,
+    predicted_time_to_exit_seconds: Any | None = None,
+    predicted_early_adverse_probabilities: Any | None = None,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
     max_signals_per_group_per_day: int = 0,
@@ -2270,6 +3321,7 @@ def _select_selection_score_floor_for_target_frequency(
     selection_exclude_setup_families: tuple[str, ...] = (),
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
 ) -> ThresholdSweepRow | None:
     if target_trades_per_day <= 0 or not calibration_samples:
@@ -2278,13 +3330,34 @@ def _select_selection_score_floor_for_target_frequency(
         predicted_returns = [0.0 for _ in calibration_samples]
     if predicted_downsides is None:
         predicted_downsides = [0.0 for _ in calibration_samples]
+    if predicted_maes is None:
+        predicted_maes = [0.0 for _ in calibration_samples]
+    if predicted_mfes is None:
+        predicted_mfes = [0.0 for _ in calibration_samples]
+    if predicted_time_to_exit_seconds is None:
+        predicted_time_to_exit_seconds = [0.0 for _ in calibration_samples]
+    if predicted_early_adverse_probabilities is None:
+        predicted_early_adverse_probabilities = [0.0 for _ in calibration_samples]
 
     scores: list[float] = []
-    for sample, probability, predicted_return, predicted_downside in zip(
+    for (
+        sample,
+        probability,
+        predicted_return,
+        predicted_downside,
+        predicted_mae,
+        predicted_mfe,
+        predicted_time,
+        predicted_early_adverse,
+    ) in zip(
         calibration_samples,
         probabilities,
         predicted_returns,
         predicted_downsides,
+        predicted_maes,
+        predicted_mfes,
+        predicted_time_to_exit_seconds,
+        predicted_early_adverse_probabilities,
         strict=True,
     ):
         expected_value = _expected_value(
@@ -2298,8 +3371,12 @@ def _select_selection_score_floor_for_target_frequency(
             expected_value=expected_value,
             predicted_return=float(predicted_return),
             predicted_downside=float(predicted_downside),
+            predicted_mae=float(predicted_mae),
+            predicted_mfe=float(predicted_mfe),
+            predicted_time_to_exit_seconds=float(predicted_time),
+            predicted_early_adverse_probability=float(predicted_early_adverse),
             mode=selection_score_mode,
-        )
+        ) * selection_score_multiplier
         if math.isfinite(score):
             scores.append(float(score))
     if not scores:
@@ -2308,11 +3385,15 @@ def _select_selection_score_floor_for_target_frequency(
     sample_by_event = {sample.event_id: sample for sample in calibration_samples}
     rows: list[ThresholdSweepRow] = []
     for floor in sorted(set(scores)):
-        selected_ids = _select_target_frequency_event_ids(
+        selection = _select_target_frequency_events(
             test_samples=calibration_samples,
             probabilities=probabilities,
             predicted_returns=predicted_returns,
             predicted_downsides=predicted_downsides,
+            predicted_maes=predicted_maes,
+            predicted_mfes=predicted_mfes,
+            predicted_time_to_exit_seconds=predicted_time_to_exit_seconds,
+            predicted_early_adverse_probabilities=predicted_early_adverse_probabilities,
             target_trades_per_day=target_trades_per_day,
             selected_threshold=selected_threshold,
             config=config,
@@ -2320,6 +3401,8 @@ def _select_selection_score_floor_for_target_frequency(
             selection_score_mode=selection_score_mode,
             target_frequency_mode=target_frequency_mode,
             selection_score_floor=floor,
+            selection_score_ceiling=selection_score_ceiling,
+            selection_score_multiplier=selection_score_multiplier,
             candidate_type_thresholds=candidate_type_thresholds,
             empirical_payoff_ev=empirical_payoff_ev,
             payoff_estimates=payoff_estimates,
@@ -2331,12 +3414,18 @@ def _select_selection_score_floor_for_target_frequency(
             selection_exclude_setup_families=selection_exclude_setup_families,
             respect_open_positions=respect_open_positions,
             capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
         )
-        selected_samples = [sample_by_event[event_id] for event_id in selected_ids]
+        selected_samples = [sample_by_event[event_id] for event_id in selection.event_ids]
         if not selected_samples:
             continue
         traded_signals = len(selected_samples)
-        net_pnl = sum(sample.notional * sample.net_return for sample in selected_samples)
+        net_pnl = sum(
+            _selection_objective_values(
+                selected_samples,
+                notional_by_event=selection.notional_by_event,
+            )
+        )
         rows.append(
             ThresholdSweepRow(
                 threshold=floor,
@@ -2350,27 +3439,124 @@ def _select_selection_score_floor_for_target_frequency(
         return None
 
     days = _days_spanned(calibration_samples)
-    viable = [row for row in rows if row.traded_signals / days >= target_trades_per_day]
-    positive_viable = [
-        row for row in viable if row.net_pnl > 0 and row.average_trade_return > 0
+    target_met = [row for row in rows if row.traded_signals / days >= target_trades_per_day]
+    positive_target_met = [
+        row for row in target_met if row.net_pnl > 0 and row.average_trade_return > 0
     ]
-    if positive_viable:
+    if positive_target_met:
         return max(
-            positive_viable,
+            positive_target_met,
             key=lambda row: _threshold_objective_key(row, optimize_metric=optimize_metric),
         )
-    if viable:
+    if not allow_negative_ev:
+        positive_rows = [
+            row for row in rows if row.net_pnl > 0 and row.average_trade_return > 0
+        ]
+        if positive_rows:
+            return _closest_to_target_row(
+                positive_rows,
+                days=days,
+                target_trades_per_day=target_trades_per_day,
+                optimize_metric=optimize_metric,
+            )
+        return None
+    if target_met:
         return max(
-            viable,
+            target_met,
             key=lambda row: _threshold_objective_key(row, optimize_metric=optimize_metric),
         )
-    return max(
+    return _closest_to_target_row(
         rows,
-        key=lambda row: (
-            _threshold_objective_key(row, optimize_metric=optimize_metric),
-            -abs(row.traded_signals / days - target_trades_per_day),
-        ),
+        days=days,
+        target_trades_per_day=target_trades_per_day,
+        optimize_metric=optimize_metric,
     )
+
+
+def _adaptive_selection_score_direction(
+    *,
+    calibration_samples: list[MetaLabelSample],
+    probabilities: Any,
+    predicted_returns: Any,
+    predicted_downsides: Any,
+    predicted_maes: Any | None = None,
+    predicted_mfes: Any | None = None,
+    predicted_time_to_exit_seconds: Any | None = None,
+    predicted_early_adverse_probabilities: Any | None = None,
+    empirical_payoff_ev: bool,
+    payoff_estimates: dict[str, dict[str, Any]],
+    selection_score_mode: str,
+    min_samples: int,
+) -> dict[str, float]:
+    if predicted_maes is None:
+        predicted_maes = [0.0 for _ in calibration_samples]
+    if predicted_mfes is None:
+        predicted_mfes = [0.0 for _ in calibration_samples]
+    if predicted_time_to_exit_seconds is None:
+        predicted_time_to_exit_seconds = [0.0 for _ in calibration_samples]
+    if predicted_early_adverse_probabilities is None:
+        predicted_early_adverse_probabilities = [0.0 for _ in calibration_samples]
+    rows: list[tuple[float, float]] = []
+    for (
+        sample,
+        probability,
+        predicted_return,
+        predicted_downside,
+        predicted_mae,
+        predicted_mfe,
+        predicted_time,
+        predicted_early_adverse,
+    ) in zip(
+        calibration_samples,
+        probabilities,
+        predicted_returns,
+        predicted_downsides,
+        predicted_maes,
+        predicted_mfes,
+        predicted_time_to_exit_seconds,
+        predicted_early_adverse_probabilities,
+        strict=True,
+    ):
+        expected_value = _expected_value(
+            probability=float(probability),
+            sample=sample,
+            empirical_payoff_ev=empirical_payoff_ev,
+            payoff_estimates=payoff_estimates,
+        )
+        score = _selection_score(
+            probability=float(probability),
+            expected_value=expected_value,
+            predicted_return=float(predicted_return),
+            predicted_downside=float(predicted_downside),
+            predicted_mae=float(predicted_mae),
+            predicted_mfe=float(predicted_mfe),
+            predicted_time_to_exit_seconds=float(predicted_time),
+            predicted_early_adverse_probability=float(predicted_early_adverse),
+            mode=selection_score_mode,
+        )
+        if math.isfinite(score) and math.isfinite(sample.net_return):
+            rows.append((float(score), float(sample.net_return)))
+    if len(rows) < max(6, min_samples):
+        return {
+            "selection_score_multiplier": 1.0,
+            "selection_score_direction_samples": float(len(rows)),
+            "low_score_average_return": 0.0,
+            "high_score_average_return": 0.0,
+        }
+
+    rows.sort(key=lambda row: row[0])
+    bucket_size = max(3, min(len(rows) // 4, 20))
+    low_returns = [row[1] for row in rows[:bucket_size]]
+    high_returns = [row[1] for row in rows[-bucket_size:]]
+    low_average = sum(low_returns) / len(low_returns)
+    high_average = sum(high_returns) / len(high_returns)
+    multiplier = -1.0 if low_average > high_average and low_average > 0 else 1.0
+    return {
+        "selection_score_multiplier": multiplier,
+        "selection_score_direction_samples": float(len(rows)),
+        "low_score_average_return": float(low_average),
+        "high_score_average_return": float(high_average),
+    }
 
 
 def _split_calibration_samples(
@@ -2425,7 +3611,9 @@ def _score_fold(
     selection_score_mode: str,
     target_frequency_mode: str,
     selection_score_floor: float | None,
+    selection_score_ceiling: float | None,
     adaptive_selection_score_floor: bool,
+    adaptive_selection_score_direction: bool,
     specialist_models: bool,
     require_calibrated_selection: bool,
     min_signal_spacing_hours: float,
@@ -2435,6 +3623,8 @@ def _score_fold(
     selection_exclude_setup_families: tuple[str, ...],
     respect_open_positions: bool,
     capacity_release_mode: str,
+    selection_execution_policy: SelectionExecutionPolicy | None,
+    selection_initial_open_positions: tuple[tuple[Any, float], ...],
     optimize_metric: str,
     permutation_importance: bool = False,
     permutation_repeats: int = 5,
@@ -2448,7 +3638,7 @@ def _score_fold(
     shap_background_limit: int = 200,
     shap_top_n: int = 30,
     shap_grouping: str = "feature",
-) -> tuple[FoldReport, list[FoldPrediction], FeatureEncoder]:
+) -> tuple[FoldReport, list[FoldPrediction], FeatureEncoder, tuple[tuple[Any, float], ...]]:
     import numpy as np
     from sklearn.metrics import brier_score_loss, log_loss
 
@@ -2487,13 +3677,17 @@ def _score_fold(
         allow_negative_ev_target_frequency=allow_negative_ev_target_frequency,
         selection_score_mode=selection_score_mode,
         selection_score_floor=selection_score_floor,
+        selection_score_ceiling=selection_score_ceiling,
         adaptive_selection_score_floor=adaptive_selection_score_floor,
         min_signal_spacing_hours=min_signal_spacing_hours,
         max_signals_per_group_per_day=max_signals_per_group_per_day,
         max_signals_per_timestamp=max_signals_per_timestamp,
         respect_open_positions=respect_open_positions,
         capacity_release_mode=capacity_release_mode,
+        selection_execution_policy=selection_execution_policy,
         optimize_metric=optimize_metric,
+        empirical_payoff_ev=empirical_payoff_ev,
+        specialist_models=specialist_models,
     )
     if not prediction_sets:
         constant = float(y_train.mean()) if len(y_train) else 0.0
@@ -2564,7 +3758,7 @@ def _score_fold(
         threshold_samples,
         min_samples=min_calibration_trades,
     )
-    threshold_predicted_returns, test_predicted_returns, specialist_diagnostics = _fit_return_regression_predictions(
+    multihead = _fit_multihead_regression_predictions(
         x_train=x_train,
         train_samples=train_samples,
         x_threshold_selection=x_threshold_selection,
@@ -2573,6 +3767,17 @@ def _score_fold(
         test_samples=test_samples,
         specialist_models=specialist_models,
     )
+    threshold_predicted_returns = multihead.threshold_returns
+    test_predicted_returns = multihead.test_returns
+    threshold_predicted_maes = multihead.threshold_mae
+    test_predicted_maes = multihead.test_mae
+    threshold_predicted_mfes = multihead.threshold_mfe
+    test_predicted_mfes = multihead.test_mfe
+    threshold_predicted_times = multihead.threshold_time_to_exit_seconds
+    test_predicted_times = multihead.test_time_to_exit_seconds
+    threshold_early_adverse = multihead.threshold_early_adverse_probability
+    test_early_adverse = multihead.test_early_adverse_probability
+    specialist_diagnostics = multihead.diagnostics
     downside_estimates = _downside_estimates_by_group(threshold_samples, min_samples=min_calibration_trades)
     threshold_predicted_downsides = [
         _predicted_downside(sample, downside_estimates) for sample in threshold_samples
@@ -2580,6 +3785,30 @@ def _score_fold(
     test_predicted_downsides = [
         _predicted_downside(sample, downside_estimates) for sample in test_samples
     ]
+    direction_diagnostics = (
+        _adaptive_selection_score_direction(
+            calibration_samples=threshold_samples,
+            probabilities=threshold_probabilities,
+            predicted_returns=threshold_predicted_returns,
+            predicted_downsides=threshold_predicted_downsides,
+            predicted_maes=threshold_predicted_maes,
+            predicted_mfes=threshold_predicted_mfes,
+            predicted_time_to_exit_seconds=threshold_predicted_times,
+            predicted_early_adverse_probabilities=threshold_early_adverse,
+            empirical_payoff_ev=empirical_payoff_ev,
+            payoff_estimates=payoff_estimates,
+            selection_score_mode=selection_score_mode,
+            min_samples=min_calibration_trades,
+        )
+        if adaptive_selection_score_direction
+        else {
+            "selection_score_multiplier": 1.0,
+            "selection_score_direction_samples": 0.0,
+            "low_score_average_return": 0.0,
+            "high_score_average_return": 0.0,
+        }
+    )
+    selection_score_multiplier = float(direction_diagnostics["selection_score_multiplier"])
 
     threshold_grid = tuple([round(idx * 0.01, 2) for idx in range(101)])
     selected_threshold_row = None
@@ -2600,7 +3829,32 @@ def _score_fold(
             probabilities=threshold_probabilities,
             thresholds=threshold_grid,
             target_trades_per_day=target_trades_per_day,
+            config=config,
+            selection_score_mode=selection_score_mode,
+            target_frequency_mode=target_frequency_mode,
+            selection_score_floor=selection_score_floor,
+            selection_score_ceiling=selection_score_ceiling,
+            selection_score_multiplier=selection_score_multiplier,
+            candidate_type_thresholds=type_thresholds if candidate_type_thresholds else None,
+            empirical_payoff_ev=empirical_payoff_ev,
+            payoff_estimates=payoff_estimates,
+            predicted_returns=threshold_predicted_returns,
+            predicted_downsides=threshold_predicted_downsides,
+            predicted_maes=threshold_predicted_maes,
+            predicted_mfes=threshold_predicted_mfes,
+            predicted_time_to_exit_seconds=threshold_predicted_times,
+            predicted_early_adverse_probabilities=threshold_early_adverse,
+            require_calibrated_selection=require_calibrated_selection,
+            min_signal_spacing_hours=min_signal_spacing_hours,
+            max_signals_per_group_per_day=max_signals_per_group_per_day,
+            max_signals_per_timestamp=max_signals_per_timestamp,
+            selection_setup_families=selection_setup_families,
+            selection_exclude_setup_families=selection_exclude_setup_families,
+            respect_open_positions=respect_open_positions,
+            capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
             optimize_metric=optimize_metric,
+            allow_negative_ev=allow_negative_ev_target_frequency,
         )
         selected_threshold_source = (
             "target_frequency_online"
@@ -2635,12 +3889,18 @@ def _score_fold(
             probabilities=threshold_probabilities,
             predicted_returns=threshold_predicted_returns,
             predicted_downsides=threshold_predicted_downsides,
+            predicted_maes=threshold_predicted_maes,
+            predicted_mfes=threshold_predicted_mfes,
+            predicted_time_to_exit_seconds=threshold_predicted_times,
+            predicted_early_adverse_probabilities=threshold_early_adverse,
             target_trades_per_day=target_trades_per_day,
             selected_threshold=selected_threshold,
             config=config,
             allow_negative_ev=allow_negative_ev_target_frequency,
             selection_score_mode=selection_score_mode,
             target_frequency_mode=target_frequency_mode,
+            selection_score_ceiling=selection_score_ceiling,
+            selection_score_multiplier=selection_score_multiplier,
             candidate_type_thresholds=type_thresholds if candidate_type_thresholds else None,
             empirical_payoff_ev=empirical_payoff_ev,
             payoff_estimates=payoff_estimates,
@@ -2652,15 +3912,21 @@ def _score_fold(
             selection_exclude_setup_families=selection_exclude_setup_families,
             respect_open_positions=respect_open_positions,
             capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
+            optimize_metric=optimize_metric,
         )
         if selected_score_floor_row is not None:
             selected_score_floor = selected_score_floor_row.threshold
-    target_frequency_event_ids = (
-        _select_target_frequency_event_ids(
+    target_frequency_selection = (
+        _select_target_frequency_events(
             test_samples=test_samples,
             probabilities=probabilities,
             predicted_returns=test_predicted_returns,
             predicted_downsides=test_predicted_downsides,
+            predicted_maes=test_predicted_maes,
+            predicted_mfes=test_predicted_mfes,
+            predicted_time_to_exit_seconds=test_predicted_times,
+            predicted_early_adverse_probabilities=test_early_adverse,
             target_trades_per_day=target_trades_per_day,
             selected_threshold=selected_threshold,
             config=config,
@@ -2668,6 +3934,8 @@ def _score_fold(
             selection_score_mode=selection_score_mode,
             target_frequency_mode=target_frequency_mode,
             selection_score_floor=selected_score_floor,
+            selection_score_ceiling=selection_score_ceiling,
+            selection_score_multiplier=selection_score_multiplier,
             candidate_type_thresholds=type_thresholds if candidate_type_thresholds else None,
             empirical_payoff_ev=empirical_payoff_ev,
             payoff_estimates=payoff_estimates,
@@ -2679,9 +3947,21 @@ def _score_fold(
             selection_exclude_setup_families=selection_exclude_setup_families,
             respect_open_positions=respect_open_positions,
             capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
+            initial_open_positions=selection_initial_open_positions,
         )
         if target_trades_per_day and target_trades_per_day > 0
         else None
+    )
+    target_frequency_event_ids = (
+        target_frequency_selection.event_ids
+        if target_frequency_selection is not None
+        else None
+    )
+    target_frequency_notional_by_event = (
+        target_frequency_selection.notional_by_event
+        if target_frequency_selection is not None
+        else {}
     )
     if target_trades_per_day and target_trades_per_day > 0 and target_frequency_mode == "quota":
         target_frequency_approval_reason = "target_frequency_quota"
@@ -2849,16 +4129,33 @@ def _score_fold(
     traded_labels: list[int] = []
     traded_returns: list[float] = []
     net_pnl = 0.0
-    for sample, probability, predicted_return, predicted_downside in zip(
+    for (
+        sample,
+        probability,
+        predicted_return,
+        predicted_downside,
+        predicted_mae,
+        predicted_mfe,
+        predicted_time,
+        predicted_early_adverse,
+    ) in zip(
         test_samples,
         probabilities,
         test_predicted_returns,
         test_predicted_downsides,
+        test_predicted_maes,
+        test_predicted_mfes,
+        test_predicted_times,
+        test_early_adverse,
         strict=True,
     ):
         probability = float(probability)
         predicted_return = float(predicted_return)
         predicted_downside = float(predicted_downside)
+        predicted_mae = float(predicted_mae)
+        predicted_mfe = float(predicted_mfe)
+        predicted_time = float(predicted_time)
+        predicted_early_adverse = float(predicted_early_adverse)
         expected_value = _expected_value(
             probability=probability,
             sample=sample,
@@ -2870,7 +4167,23 @@ def _score_fold(
             expected_value=expected_value,
             predicted_return=predicted_return,
             predicted_downside=predicted_downside,
+            predicted_mae=predicted_mae,
+            predicted_mfe=predicted_mfe,
+            predicted_time_to_exit_seconds=predicted_time,
+            predicted_early_adverse_probability=predicted_early_adverse,
             mode=selection_score_mode,
+        )
+        selection_score *= selection_score_multiplier
+        trade_score = _selection_score(
+            probability=probability,
+            expected_value=expected_value,
+            predicted_return=predicted_return,
+            predicted_downside=predicted_downside,
+            predicted_mae=predicted_mae,
+            predicted_mfe=predicted_mfe,
+            predicted_time_to_exit_seconds=predicted_time,
+            predicted_early_adverse_probability=predicted_early_adverse,
+            mode="capital_efficiency",
         )
         if target_frequency_event_ids is not None:
             should_trade = sample.event_id in target_frequency_event_ids
@@ -2932,7 +4245,8 @@ def _score_fold(
                 reason = "probability_below_threshold"
             else:
                 reason = "expected_value_below_threshold"
-        pnl = sample.notional * sample.net_return if should_trade else 0.0
+        pnl_notional = target_frequency_notional_by_event.get(sample.event_id, sample.notional)
+        pnl = pnl_notional * sample.net_return if should_trade else 0.0
         if should_trade:
             traded_labels.append(sample.label)
             traded_returns.append(sample.net_return)
@@ -2953,7 +4267,12 @@ def _score_fold(
                 side=sample.side,
                 predicted_return=predicted_return,
                 predicted_downside=predicted_downside,
+                predicted_mae=predicted_mae,
+                predicted_mfe=predicted_mfe,
+                predicted_time_to_exit_seconds=predicted_time,
+                predicted_early_adverse_probability=predicted_early_adverse,
                 selection_score=selection_score,
+                trade_score=trade_score,
                 setup_family=_sample_group(sample),
                 market_regime=_sample_regime(sample),
             )
@@ -3028,9 +4347,19 @@ def _score_fold(
                 float(selected_score_floor_row.net_pnl) if selected_score_floor_row else 0.0
             ),
         }
+    if adaptive_selection_score_direction:
+        target_diagnostics = fold_report.model_diagnostics.setdefault("target_frequency_selection", {})
+        target_diagnostics.update(direction_diagnostics)
     for name, values in specialist_diagnostics.items():
         fold_report.model_diagnostics[f"specialist_{name}"] = values
-    return fold_report, predictions, encoder
+    return (
+        fold_report,
+        predictions,
+        encoder,
+        target_frequency_selection.open_positions
+        if target_frequency_selection is not None
+        else selection_initial_open_positions,
+    )
 
 
 def default_fold_sizes(sample_count: int) -> tuple[int, int, int]:
@@ -3125,7 +4454,9 @@ def run_meta_label_walk_forward(
     selection_score_mode: str = "expected_value",
     target_frequency_mode: str = "strict",
     selection_score_floor: float | None = None,
+    selection_score_ceiling: float | None = None,
     adaptive_selection_score_floor: bool = False,
+    adaptive_selection_score_direction: bool = False,
     specialist_models: bool = False,
     require_calibrated_selection: bool = False,
     min_signal_spacing_hours: float = 0.0,
@@ -3135,6 +4466,7 @@ def run_meta_label_walk_forward(
     selection_exclude_setup_families: tuple[str, ...] = (),
     respect_open_positions: bool = False,
     capacity_release_mode: str = "planned",
+    selection_execution_policy: SelectionExecutionPolicy | None = None,
     optimize_metric: str = "sharpe",
     permutation_importance: bool = False,
     permutation_repeats: int = 5,
@@ -3201,11 +4533,12 @@ def run_meta_label_walk_forward(
     predictions: list[FoldPrediction] = []
     feature_names: list[str] = []
     feature_name_seen: set[str] = set()
+    selection_open_positions: tuple[tuple[Any, float], ...] = ()
     for fold_id, fold in enumerate(folds):
         train_samples = [ordered[idx] for idx in fold.train_indices]
         calibration_samples = [ordered[idx] for idx in fold.calibration_indices]
         test_samples = [ordered[idx] for idx in fold.test_indices]
-        fold_report, fold_predictions, encoder = _score_fold(
+        fold_report, fold_predictions, encoder, selection_open_positions = _score_fold(
             fold_id=fold_id,
             train_samples=train_samples,
             calibration_samples=calibration_samples,
@@ -3228,7 +4561,9 @@ def run_meta_label_walk_forward(
             selection_score_mode=selection_score_mode,
             target_frequency_mode=target_frequency_mode,
             selection_score_floor=selection_score_floor,
+            selection_score_ceiling=selection_score_ceiling,
             adaptive_selection_score_floor=adaptive_selection_score_floor,
+            adaptive_selection_score_direction=adaptive_selection_score_direction,
             specialist_models=specialist_models,
             require_calibrated_selection=require_calibrated_selection,
             min_signal_spacing_hours=min_signal_spacing_hours,
@@ -3238,6 +4573,8 @@ def run_meta_label_walk_forward(
             selection_exclude_setup_families=selection_exclude_setup_families,
             respect_open_positions=respect_open_positions,
             capacity_release_mode=capacity_release_mode,
+            selection_execution_policy=selection_execution_policy,
+            selection_initial_open_positions=selection_open_positions,
             optimize_metric=optimize_metric,
             permutation_importance=permutation_importance,
             permutation_repeats=permutation_repeats,

@@ -68,7 +68,7 @@ conservative_same_bar = true
 
 [model]
 minimum_probability = 0.60
-minimum_expected_value = 0.0075
+minimum_expected_value = 0.0
 calibration_method = "sigmoid"
 feature_set_version = "v1"
 label_version = "v1"

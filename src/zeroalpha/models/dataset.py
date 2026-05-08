@@ -5,11 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from bisect import bisect_right
-from math import log1p, sqrt
+from math import isfinite, log1p, sqrt
 from statistics import median, pstdev
 from typing import Mapping, Sequence
 
-from zeroalpha.candidates.events import CandidateGenerationConfig, generate_candidate_events
+from zeroalpha.bars import bar_start_timestamp_utc
+from zeroalpha.candidates.events import (
+    CandidateGenerationConfig,
+    candidates_for_index,
+    generate_candidate_events,
+    validate_candidate_generation_config,
+)
 from zeroalpha.config import AppConfig
 from zeroalpha.costs import CommissionModel, SlippageModel, estimate_round_trip_cost
 from zeroalpha.data.external.prediction_markets import (
@@ -17,7 +23,7 @@ from zeroalpha.data.external.prediction_markets import (
     PredictionMarketSnapshot,
     prediction_market_duration_seconds,
 )
-from zeroalpha.domain import Bar, CandidateEvent, MarketQuote, TripleBarrierLabel
+from zeroalpha.domain import Bar, CandidateEvent, MarketQuote, Side, TripleBarrierLabel
 from zeroalpha.features.basic import build_event_features
 from zeroalpha.features.kronos import build_kronos_features
 from zeroalpha.features.regime import classify_market_regime
@@ -45,6 +51,10 @@ class MetaLabelSample:
     round_trip_cost_bps: float
     outcome_type: str
     label_detail: TripleBarrierLabel
+    max_adverse_excursion: float = 0.0
+    max_favorable_excursion: float = 0.0
+    time_to_exit_seconds: float = 0.0
+    early_adverse_label: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "timestamp_utc", ensure_utc(self.timestamp_utc))
@@ -798,6 +808,14 @@ def _add_event_metadata(features: dict[str, float | str], event: CandidateEvent)
             features[f"event_{key}"] = value
 
 
+def _event_min_holding_seconds(event: CandidateEvent) -> float:
+    try:
+        value = float(event.metadata.get("min_holding_seconds", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if isfinite(value) and value > 0 else 0.0
+
+
 def _prediction_market_max_age(duration: str) -> timedelta:
     try:
         seconds = prediction_market_duration_seconds(duration)
@@ -1394,6 +1412,181 @@ def _event_label_geometry(
     return max(net_profit_target, 1e-9), max(net_stop_loss, 1e-9), horizon_volatility
 
 
+def _bar_side_extreme_return(
+    side: Side,
+    *,
+    entry_price: float,
+    bar: Bar,
+) -> tuple[float, float]:
+    if entry_price <= 0:
+        return 0.0, 0.0
+    if side == Side.SELL:
+        favorable = (entry_price - bar.low) / entry_price
+        adverse = (entry_price - bar.high) / entry_price
+    else:
+        favorable = bar.high / entry_price - 1
+        adverse = bar.low / entry_price - 1
+    return favorable, adverse
+
+
+def _label_path_targets(
+    *,
+    event: CandidateEvent,
+    label: TripleBarrierLabel,
+    future_bars: Sequence[Bar],
+    round_trip_cost_bps: float,
+) -> tuple[float, float, float, int]:
+    entry_price = label.entry_price
+    if entry_price <= 0:
+        return 0.0, 0.0, 0.0, 0
+    adverse = 0.0
+    favorable = 0.0
+    early_adverse = 0
+    entry_timestamp = ensure_utc(label.entry_timestamp_utc)
+    exit_timestamp = ensure_utc(label.exit_timestamp_utc)
+    early_cutoff = min(exit_timestamp, entry_timestamp + timedelta(seconds=60))
+    early_threshold = max(round_trip_cost_bps / 10_000, 0.0005)
+    for bar in sorted(future_bars, key=lambda row: row.timestamp_utc):
+        bar_time = bar_start_timestamp_utc(bar)
+        if bar_time < entry_timestamp:
+            continue
+        if bar_time > exit_timestamp:
+            break
+        bar_favorable, bar_adverse = _bar_side_extreme_return(
+            event.side,
+            entry_price=entry_price,
+            bar=bar,
+        )
+        favorable = max(favorable, bar_favorable)
+        adverse = max(adverse, -bar_adverse)
+        if bar_time <= early_cutoff and -bar_adverse >= early_threshold:
+            early_adverse = 1
+    time_to_exit_seconds = max(0.0, (exit_timestamp - entry_timestamp).total_seconds())
+    return adverse, favorable, time_to_exit_seconds, early_adverse
+
+
+def _safe_ratio(current: float, baseline: float) -> float:
+    return current / baseline if baseline > 0 else 0.0
+
+
+def _bar_extra_float(bar: Bar, *keys: str) -> float | None:
+    for key in keys:
+        value = bar.extra.get(key)
+        if isinstance(value, int | float) and isfinite(float(value)):
+            return float(value)
+    return None
+
+
+def _bar_tick_count(bar: Bar) -> float:
+    if bar.trade_count is not None:
+        return max(0.0, float(bar.trade_count))
+    value = _bar_extra_float(bar, "tick_count", "trade_count")
+    return max(0.0, value or 0.0)
+
+
+def _bar_quote_age_seconds(bar: Bar) -> float | None:
+    return _bar_extra_float(bar, "quote_age_seconds", "market_quote_age_seconds")
+
+
+def _bar_spread_proxy_bps(bar: Bar) -> float:
+    spread = _bar_extra_float(bar, "spread_bps")
+    if spread is not None and spread > 0:
+        return spread
+    if bar.close <= 0:
+        return 0.0
+    return 10_000 * max(bar.high - bar.low, 0.0) / bar.close
+
+
+def _signed_bar_flow(bar: Bar, *, use_volume: bool = False) -> float:
+    direction = 1.0 if bar.close > bar.open else -1.0 if bar.close < bar.open else 0.0
+    weight = max(0.0, float(bar.volume)) if use_volume else _bar_tick_count(bar)
+    if weight <= 0 and not use_volume:
+        weight = 1.0 if direction else 0.0
+    return direction * weight
+
+
+def _return_autocorr(returns: list[float]) -> float:
+    if len(returns) < 3:
+        return 0.0
+    left = returns[:-1]
+    right = returns[1:]
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    left_var = sum((value - left_mean) ** 2 for value in left)
+    right_var = sum((value - right_mean) ** 2 for value in right)
+    denominator = sqrt(left_var * right_var)
+    if denominator <= 0:
+        return 0.0
+    return sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=True)) / denominator
+
+
+def _add_primary_microstructure_features(
+    features: dict[str, float | str],
+    *,
+    history: Sequence[Bar],
+) -> None:
+    ordered = sorted(history, key=lambda bar: bar.timestamp_utc)
+    if len(ordered) < 2:
+        return
+    interval_seconds = max(_bar_interval_seconds(list(ordered)), 1.0)
+    latest = ordered[-1]
+    tick_count = _bar_tick_count(latest)
+    spread_proxy = _bar_spread_proxy_bps(latest)
+    features["micro_bar_interval_seconds"] = interval_seconds
+    features["micro_is_one_second_bar"] = 1.0 if interval_seconds <= 1.5 else 0.0
+    features["micro_is_five_second_or_faster_bar"] = 1.0 if interval_seconds <= 5.5 else 0.0
+    features["micro_tick_count"] = tick_count
+    features["micro_tick_count_log"] = log1p(tick_count)
+    features["micro_spread_proxy_bps"] = spread_proxy
+    features["micro_bar_range_proxy_bps"] = _bar_spread_proxy_bps(latest)
+    quote_age = _bar_quote_age_seconds(latest)
+    if quote_age is not None:
+        features["micro_quote_age_seconds"] = quote_age
+        features["micro_quote_stale_5s"] = 1.0 if quote_age > 5 else 0.0
+
+    returns = [
+        ordered[idx].close / ordered[idx - 1].close - 1
+        for idx in range(1, len(ordered))
+        if ordered[idx - 1].close > 0
+    ]
+    for seconds in (5, 30, 60, 300):
+        bars_needed = max(1, int(round(seconds / interval_seconds)))
+        window = ordered[-bars_needed:]
+        if not window:
+            continue
+        tick_sum = sum(_bar_tick_count(bar) for bar in window)
+        volume_sum = sum(max(0.0, float(bar.volume)) for bar in window)
+        signed_tick = sum(_signed_bar_flow(bar) for bar in window)
+        signed_volume = sum(_signed_bar_flow(bar, use_volume=True) for bar in window)
+        range_values = [_bar_spread_proxy_bps(bar) for bar in window]
+        features[f"micro_tick_intensity_{seconds}s"] = tick_sum / seconds
+        features[f"micro_volume_intensity_{seconds}s"] = volume_sum / seconds
+        features[f"micro_signed_tick_imbalance_{seconds}s"] = (
+            signed_tick / tick_sum if tick_sum > 0 else 0.0
+        )
+        features[f"micro_signed_volume_imbalance_{seconds}s"] = (
+            signed_volume / volume_sum if volume_sum > 0 else 0.0
+        )
+        features[f"micro_range_proxy_bps_mean_{seconds}s"] = (
+            sum(range_values) / len(range_values) if range_values else 0.0
+        )
+        if len(window) >= 2 and window[0].close > 0:
+            features[f"micro_return_bps_{seconds}s"] = 10_000 * (window[-1].close / window[0].close - 1)
+        window_returns = returns[-bars_needed:]
+        if window_returns:
+            zero_share = sum(1 for value in window_returns if abs(value) < 1e-12) / len(window_returns)
+            features[f"micro_zero_return_share_{seconds}s"] = zero_share
+            if len(window_returns) > 1:
+                features[f"micro_realized_vol_bps_{seconds}s"] = pstdev(window_returns) * 10_000
+    vol_10 = features.get("micro_realized_vol_bps_5s", 0.0)
+    vol_60 = features.get("micro_realized_vol_bps_60s", 0.0)
+    if isinstance(vol_10, int | float) and isinstance(vol_60, int | float):
+        features["micro_realized_vol_burst_5s_vs_60s"] = _safe_ratio(float(vol_10), float(vol_60))
+    features["micro_return_autocorr_60s"] = _return_autocorr(
+        returns[-max(3, int(round(60 / interval_seconds))) :]
+    )
+
+
 def label_geometry_diagnostics(
     *,
     config: AppConfig,
@@ -1461,12 +1654,13 @@ def build_meta_label_samples(
     config: AppConfig,
     assumed_spread_bps: float,
     research_notional: float | None = None,
+    label_bars: Sequence[Bar] | None = None,
     context_bars: Mapping[str, list[Bar]] | None = None,
     market_quotes: Sequence[MarketQuote] | None = None,
     futures_market_quotes: Sequence[MarketQuote] | None = None,
     prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None = None,
     prediction_market_feature_profile: str = "full",
-    feature_asof: str = "entry",
+    feature_asof: str = "signal",
     external_feature_latency_seconds: float = 0.0,
     candidate_config: CandidateGenerationConfig | None = None,
 ) -> list[MetaLabelSample]:
@@ -1482,12 +1676,14 @@ def build_meta_label_samples(
     if len(ordered) < 300:
         raise ValueError("not enough bars for meta-label dataset")
     bar_interval_seconds = _bar_interval_seconds(ordered)
+    label_ordered = sorted(label_bars, key=lambda bar: bar.timestamp_utc) if label_bars else ordered
+    label_interval_seconds = _bar_interval_seconds(label_ordered) if len(label_ordered) >= 2 else bar_interval_seconds
     if (
         config.labels.max_holding_seconds is not None
-        and config.labels.max_holding_seconds < bar_interval_seconds
+        and config.labels.max_holding_seconds < label_interval_seconds
     ):
         raise ValueError(
-            "max_holding_seconds is shorter than the input bar interval; "
+            "max_holding_seconds is shorter than the input bar interval or label bar interval; "
             "use tick or sub-minute bars before researching sub-bar exits"
         )
     notional = min(research_notional or config.risk.paper_max_notional, config.risk.paper_max_notional)
@@ -1512,7 +1708,7 @@ def build_meta_label_samples(
         if prediction_market_snapshots
         else None
     )
-    timestamps = [bar.timestamp_utc for bar in ordered]
+    label_timestamps = [bar.timestamp_utc for bar in label_ordered]
     by_timestamp = {bar.timestamp_utc: idx for idx, bar in enumerate(ordered)}
     samples: list[MetaLabelSample] = []
     feature_window_bars = max(
@@ -1523,11 +1719,15 @@ def build_meta_label_samples(
         idx = by_timestamp.get(event.timestamp_utc)
         if idx is None or idx + 1 >= len(ordered):
             continue
-        horizon_end = bisect_right(timestamps, event.vertical_barrier_timestamp_utc)
-        future = ordered[idx + 1 : horizon_end]
+        label_start = bisect_right(label_timestamps, event.timestamp_utc)
+        horizon_end = bisect_right(label_timestamps, event.vertical_barrier_timestamp_utc)
+        future = label_ordered[label_start:horizon_end]
         if not future:
             continue
-        entry_bar = ordered[idx + 1]
+        entry_bar = future[0]
+        entry_timestamp = bar_start_timestamp_utc(entry_bar)
+        if entry_timestamp < event.timestamp_utc:
+            entry_timestamp = event.timestamp_utc
         feature_start = max(0, idx + 1 - feature_window_bars)
         history = ordered[feature_start : idx + 1]
         net_profit_target, net_stop_loss, horizon_volatility = _event_label_geometry(
@@ -1540,16 +1740,26 @@ def build_meta_label_samples(
             event,
             future,
             entry_price=entry_bar.open,
+            entry_timestamp_utc=entry_timestamp,
             net_profit_target=net_profit_target,
             net_stop_loss=net_stop_loss,
             round_trip_cost_bps=diagnostics.round_trip_cost_bps,
             conservative_same_bar=config.labels.conservative_same_bar,
         )
+        max_adverse_excursion, max_favorable_excursion, time_to_exit_seconds, early_adverse_label = (
+            _label_path_targets(
+                event=event,
+                label=label,
+                future_bars=future,
+                round_trip_cost_bps=diagnostics.round_trip_cost_bps,
+            )
+        )
         features = build_event_features(event, history)
         features.update(classify_market_regime(history).as_features())
         _add_event_metadata(features, event)
+        _add_primary_microstructure_features(features, history=history)
         point_in_time_event = (
-            replace(event, timestamp_utc=entry_bar.timestamp_utc)
+            replace(event, timestamp_utc=label.entry_timestamp_utc)
             if feature_asof == "entry"
             else event
         )
@@ -1560,12 +1770,12 @@ def build_meta_label_samples(
         )
         features["point_signal_delay_seconds"] = max(
             0.0,
-            (entry_bar.timestamp_utc - event.timestamp_utc).total_seconds(),
+            (label.entry_timestamp_utc - event.timestamp_utc).total_seconds(),
         )
         features["external_feature_latency_seconds"] = external_feature_latency_seconds
         features["external_feature_delay_from_entry_seconds"] = max(
             0.0,
-            (entry_bar.timestamp_utc - external_event.timestamp_utc).total_seconds(),
+            (label.entry_timestamp_utc - external_event.timestamp_utc).total_seconds(),
         )
         features["feature_asof_is_entry"] = 1.0 if feature_asof == "entry" else 0.0
         _add_cross_asset_features(
@@ -1601,9 +1811,12 @@ def build_meta_label_samples(
                 "net_stop_loss": net_stop_loss,
                 "max_holding_hours": float(event.max_holding_hours),
                 "max_holding_seconds": event.max_holding_period.total_seconds(),
+                "min_holding_seconds": _event_min_holding_seconds(event),
                 "gross_profit_move": net_profit_target + diagnostics.round_trip_cost_fraction,
                 "gross_stop_distance": net_stop_loss - diagnostics.round_trip_cost_fraction,
                 "horizon_volatility": horizon_volatility,
+                "label_bar_interval_seconds": label_interval_seconds,
+                "feature_bar_interval_seconds": bar_interval_seconds,
             }
         )
         samples.append(
@@ -1622,6 +1835,10 @@ def build_meta_label_samples(
                 round_trip_cost_bps=diagnostics.round_trip_cost_bps,
                 outcome_type=label.outcome_type,
                 label_detail=label,
+                max_adverse_excursion=max_adverse_excursion,
+                max_favorable_excursion=max_favorable_excursion,
+                time_to_exit_seconds=time_to_exit_seconds,
+                early_adverse_label=early_adverse_label,
             )
         )
     return samples
@@ -1632,19 +1849,81 @@ def build_scoring_samples(
     *,
     config: AppConfig,
     candidate_config: CandidateGenerationConfig | None = None,
+    context_bars: Mapping[str, list[Bar]] | None = None,
+    market_quotes: Sequence[MarketQuote] | None = None,
+    futures_market_quotes: Sequence[MarketQuote] | None = None,
+    prediction_market_snapshots: Sequence[PredictionMarketSnapshot] | None = None,
+    prediction_market_feature_profile: str = "full",
     quote: MarketQuote | None = None,
     max_samples: int = 20,
+    assumed_spread_bps: float | None = None,
+    research_notional: float | None = None,
+    feature_asof: str = "signal",
+    external_feature_latency_seconds: float = 0.0,
 ) -> list[ScoringSample]:
     """Build feature-only samples from completed bars for live/paper scoring."""
+    if prediction_market_feature_profile not in PREDICTION_MARKET_FEATURE_PROFILES:
+        raise ValueError(
+            f"prediction_market_feature_profile must be one of {PREDICTION_MARKET_FEATURE_PROFILES}"
+        )
+    if feature_asof not in FEATURE_ASOF_CHOICES:
+        raise ValueError(f"feature_asof must be one of {FEATURE_ASOF_CHOICES}")
+    if external_feature_latency_seconds < 0:
+        raise ValueError("external_feature_latency_seconds must be nonnegative")
     ordered = sorted(bars, key=lambda bar: bar.timestamp_utc)
     if len(ordered) < 2:
         return []
-    events = generate_candidate_events(ordered, config=candidate_config)
+    if max_samples <= 0:
+        return []
+    bar_interval_seconds = _bar_interval_seconds(ordered)
+    event_config = candidate_config or CandidateGenerationConfig()
+    validate_candidate_generation_config(event_config)
+    first_idx = max(event_config.min_history_bars - 1, 0)
+    if len(ordered) <= first_idx:
+        return []
+    recent_index_budget = max(max_samples * 8, max_samples + 8, 16)
+    candidate_indices: list[int] = []
+    for idx in range(len(ordered) - 1, first_idx - 1, -1):
+        if (idx - first_idx) % event_config.dense_stride_bars:
+            continue
+        candidate_indices.append(idx)
+        if len(candidate_indices) >= recent_index_budget:
+            break
+    candidate_indices.reverse()
+    seen_event_ids: set[str] = set()
+    events = []
+    for idx in candidate_indices:
+        for event in candidates_for_index(ordered, idx, config=event_config):
+            if event.event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event.event_id)
+            events.append(event)
     by_timestamp = {bar.timestamp_utc: idx for idx, bar in enumerate(ordered)}
+    prepared_context = _prepare_context_bars(context_bars)
+    prepared_market_quotes = _prepare_market_quotes(market_quotes)
+    prepared_futures_market_quotes = _prepare_market_quotes(futures_market_quotes)
+    prepared_prediction_markets = (
+        PreparedPredictionMarketSnapshots.from_snapshots(prediction_market_snapshots)
+        if prediction_market_snapshots
+        else None
+    )
     feature_window_bars = max(
-        candidate_config.rolling_window_bars if candidate_config else 500,
+        event_config.rolling_window_bars,
         10_080,
     )
+    diagnostics = None
+    effective_spread_bps = (
+        assumed_spread_bps
+        if assumed_spread_bps is not None
+        else (quote.spread_bps if quote is not None else None)
+    )
+    if effective_spread_bps is not None:
+        diagnostics = label_geometry_diagnostics(
+            config=config,
+            assumed_spread_bps=effective_spread_bps,
+            research_notional=research_notional,
+            reference_price=ordered[-1].close if ordered else None,
+        )
     samples: list[ScoringSample] = []
     for event in events[-max(max_samples * 4, max_samples) :]:
         idx = by_timestamp.get(event.timestamp_utc)
@@ -1658,16 +1937,78 @@ def build_scoring_samples(
             features = build_event_features(event, history, quote=quote)
         except ValueError:
             continue
+        net_profit_target = config.labels.net_profit_target
+        net_stop_loss = config.labels.net_stop_loss
+        horizon_volatility = 0.0
+        if diagnostics is not None:
+            net_profit_target, net_stop_loss, horizon_volatility = _event_label_geometry(
+                event=event,
+                history_bars=history,
+                config=config,
+                cost_fraction=diagnostics.round_trip_cost_fraction,
+            )
         features.update(classify_market_regime(history).as_features())
         _add_event_metadata(features, event)
+        _add_primary_microstructure_features(features, history=history)
+        external_event = replace(
+            event,
+            timestamp_utc=event.timestamp_utc - timedelta(seconds=external_feature_latency_seconds),
+        )
+        _add_cross_asset_features(
+            features,
+            event=event,
+            context_bars=prepared_context,
+            history_bars=history,
+        )
+        _add_market_quote_features(
+            features,
+            event=external_event,
+            market_quotes=prepared_market_quotes,
+        )
+        _add_market_quote_features(
+            features,
+            event=external_event,
+            market_quotes=prepared_futures_market_quotes,
+            prefix="ibkr_futures",
+        )
+        _add_prediction_market_features(
+            features,
+            event=external_event,
+            prediction_markets=prepared_prediction_markets,
+            history_bars=history,
+            feature_profile=prediction_market_feature_profile,
+        )
         features.update(build_kronos_features(history, config=config.kronos))
+        point_signal_delay_seconds = bar_interval_seconds if feature_asof == "entry" else 0.0
         features.update(
             {
                 "max_holding_hours": float(event.max_holding_hours),
                 "max_holding_seconds": event.max_holding_period.total_seconds(),
-                "feature_asof_is_entry": 0.0,
+                "min_holding_seconds": _event_min_holding_seconds(event),
+                "net_profit_target": net_profit_target,
+                "net_stop_loss": net_stop_loss,
+                "horizon_volatility": horizon_volatility,
+                "point_signal_delay_seconds": point_signal_delay_seconds,
+                "external_feature_latency_seconds": external_feature_latency_seconds,
+                "external_feature_delay_from_entry_seconds": (
+                    external_feature_latency_seconds if feature_asof == "entry" else 0.0
+                ),
+                "feature_asof_is_entry": 1.0 if feature_asof == "entry" else 0.0,
             }
         )
+        if diagnostics is not None:
+            features.update(
+                {
+                    "round_trip_cost_bps": diagnostics.round_trip_cost_bps,
+                    "assumed_spread_bps": effective_spread_bps or 0.0,
+                    "gross_profit_move": (
+                        net_profit_target + diagnostics.round_trip_cost_fraction
+                    ),
+                    "gross_stop_distance": (
+                        net_stop_loss - diagnostics.round_trip_cost_fraction
+                    ),
+                }
+            )
         samples.append(
             ScoringSample(
                 event_id=event.event_id,

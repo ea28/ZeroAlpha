@@ -1,4 +1,5 @@
 from argparse import Namespace
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -8,20 +9,28 @@ import pytest
 import zeroalpha.cli as cli
 from zeroalpha.cli import (
     _context_quality_or_raise,
+    _effective_respect_open_positions,
     _filter_samples_from_args,
+    _kill_switch_enabled,
     _load_research_bars,
     _quality_or_raise,
+    _require_verified_one_second_data,
+    _runner_exit_timing,
+    _runner_min_holding_seconds,
+    _strict_live_valid_1s_diagnostics,
+    _trade_run_quote,
     _validate_paper_order_test_config,
     _validate_paper_test_config,
     _validate_research_gated_args,
     _validate_research_short_backtest_args,
     _validate_round_trip_test_config,
     _validate_trade_run_config,
+    _warmup_live_one_second_stream,
 )
-from zeroalpha.config import AppConfig, BrokerConfig, RuntimeConfig
+from zeroalpha.config import AppConfig, BrokerConfig, ModelConfig, RuntimeConfig
 from zeroalpha.data.external.ibkr_bars import write_ibkr_bars
 from zeroalpha.data.quality import validate_bars
-from zeroalpha.domain import Bar, RuntimeMode, TripleBarrierLabel
+from zeroalpha.domain import Bar, MarketQuote, RuntimeMode, TripleBarrierLabel
 from zeroalpha.models.dataset import MetaLabelSample
 
 
@@ -395,6 +404,8 @@ def test_broker_trade_run_parser_and_paper_safety_gates() -> None:
             "250",
             "--max-order-notional-usd",
             "5000",
+            "--max-open-positions",
+            "10",
             "--duration-seconds",
             "600",
             "--stream-format",
@@ -407,10 +418,261 @@ def test_broker_trade_run_parser_and_paper_safety_gates() -> None:
     assert args.broker_command == "trade-run"
     assert args.capital_usd == 5_000
     assert args.max_loss_usd == 250
+    assert args.max_open_positions == 10
+    assert args.live_data_mode == "streaming"
+    assert args.require_live_1s_data is True
+    assert args.tick_by_tick_type == "Last"
     assert args.history_what_to_show == "AGGTRADES"
-    assert args.max_signal_bar_age_seconds == 300.0
+    assert args.history_bar_size == "1 secs"
+    assert args.history_duration == "1800 S"
+    assert args.live_1s_warmup_bars == 2
+    assert args.live_1s_warmup_timeout_seconds == 8.0
+    assert args.max_signal_bar_age_seconds == 2.5
+    assert args.candidate_mode == "dense_research"
+    assert args.dense_stride_bars == 1
+    assert args.max_scoring_samples == 1
+    assert args.context_bars_jsonl == ""
+    assert args.decision_threshold == 0.0
+    assert args.max_missing_model_feature_fraction == 0.0
     assert args.stream_format == "json"
-    _validate_trade_run_config(_paper_cfg_with_account(), args)
+    cfg = cli._override_config_from_args(_paper_cfg_with_account(), args)
+    assert cfg.risk.max_open_positions == 10
+    _validate_trade_run_config(cfg, args)
+
+
+def test_trade_run_order_notional_uses_artifact_score_bucket_policy() -> None:
+    args = _trade_run_args(max_order_notional_usd=10_000.0)
+    training_config = {
+        "sizing_policy": {
+            "mode": "score_bucket",
+            "score_field": "selection_score",
+            "score_direction": "high",
+            "base_notional": 1_250.0,
+            "mid_notional": 2_500.0,
+            "high_notional": 5_000.0,
+            "mid_score": 0.30,
+            "high_score": 0.75,
+        }
+    }
+    sample = SimpleNamespace(features={})
+    score = SimpleNamespace(probability=0.55, expected_value=0.0, selection_score=0.80)
+
+    notional, source = cli._trade_run_order_notional_from_artifact_policy(
+        args,
+        training_config,
+        sample,
+        score,
+        available_notional=8_000.0,
+    )
+
+    assert notional == pytest.approx(5_000.0)
+    assert source == "artifact_score_bucket_high"
+
+
+def test_trade_run_order_notional_can_use_low_score_bucket_policy() -> None:
+    args = _trade_run_args(max_order_notional_usd=10_000.0)
+    training_config = {
+        "sizing_policy": {
+            "mode": "score_bucket",
+            "score_field": "expected_value",
+            "score_direction": "low",
+            "base_notional": 1_500.0,
+            "mid_notional": 2_500.0,
+            "high_notional": 3_333.0,
+            "mid_score": 0.006,
+            "high_score": 0.010,
+        }
+    }
+    sample = SimpleNamespace(features={})
+    score = SimpleNamespace(probability=0.25, expected_value=-0.011, selection_score=-0.011)
+
+    notional, source = cli._trade_run_order_notional_from_artifact_policy(
+        args,
+        training_config,
+        sample,
+        score,
+        available_notional=8_000.0,
+    )
+
+    assert notional == pytest.approx(3_333.0)
+    assert source == "artifact_score_bucket_high"
+
+
+def test_trade_run_order_notional_uses_artifact_confidence_policy() -> None:
+    args = _trade_run_args(max_order_notional_usd=10_000.0)
+    training_config = {
+        "minimum_probability": 0.50,
+        "minimum_expected_value": 0.0,
+        "label_net_profit_target": 0.02,
+        "label_net_stop_loss": 0.02,
+        "sizing_policy": {"mode": "confidence"},
+    }
+    sample = SimpleNamespace(features={"net_profit_target": 0.02, "net_stop_loss": 0.02})
+    score = SimpleNamespace(probability=0.75, expected_value=0.0025, selection_score=0.0025)
+
+    notional, source = cli._trade_run_order_notional_from_artifact_policy(
+        args,
+        training_config,
+        sample,
+        score,
+        available_notional=8_000.0,
+    )
+
+    assert source == "artifact_confidence"
+    assert 2_000.0 < notional < 8_000.0
+
+
+def test_trade_run_reads_artifact_execution_policy() -> None:
+    assert cli._artifact_entry_order_model({"execution_policy": {"entry_order_model": "market"}}) == "market"
+    assert cli._artifact_entry_order_model({"entry_order_model": "limit"}) == "limit"
+
+
+def test_trade_run_live_artifact_contract_fails_closed_on_missing_metadata() -> None:
+    args = _trade_run_args(history_bar_size="1 secs", tick_by_tick_type="Last")
+
+    errors = cli._live_artifact_contract_errors(
+        {"execution_policy": {"entry_order_model": "market"}},
+        args,
+    )
+
+    assert "sizing_policy is missing" in errors
+    assert "candidate_policy is missing" in errors
+    assert "setup_family_policy is missing" in errors
+    assert "horizon_policy is missing" in errors
+    assert "data_contract is missing" in errors
+    assert "feature_contract is missing" in errors
+
+
+def test_trade_run_live_artifact_contract_requires_tick_backed_one_second_data() -> None:
+    training_config = {
+        "execution_policy": {"entry_order_model": "market"},
+        "sizing_policy": {"mode": "score_bucket"},
+        "candidate_policy": {"side_mode": "long", "allow_short_research": False},
+        "setup_family_policy": {
+            "setup_family_fields": ["event_specialist_setup_family", "event_setup_family"],
+            "score_direction_field": "event_setup_score_direction",
+        },
+        "horizon_policy": {"min_holding_seconds": 1.0},
+        "data_contract": {"requires_one_second_execution": True},
+        "feature_contract": {"feature_count": 12},
+    }
+
+    ok_args = _trade_run_args(history_bar_size="1 secs", tick_by_tick_type="Last")
+    missing_tick_args = _trade_run_args(history_bar_size="1 secs", tick_by_tick_type="none")
+
+    assert cli._live_artifact_contract_errors(training_config, ok_args) == []
+    assert "data_contract requires an IBKR tick-by-tick stream" in cli._live_artifact_contract_errors(
+        training_config,
+        missing_tick_args,
+    )
+
+
+def test_strict_live_valid_one_second_gate_rejects_short_or_quote_only_replay() -> None:
+    args = Namespace(
+        min_live_valid_1s_days=7.0,
+        preferred_live_valid_1s_days=14.0,
+        min_live_valid_folds=2,
+    )
+    data_coverage = {
+        "requested_window": {
+            "start": "2026-05-04T00:00:00+00:00",
+            "end": "2026-05-04T06:00:00+00:00",
+        }
+    }
+    label_coverage = {
+        "enabled": True,
+        "interval": "1s",
+        "bars": 21_600,
+        "provenance": {"tick_backed_bars": 20_000},
+    }
+    execution_coverage = {
+        "enabled": True,
+        "interval": "1s",
+        "bars": 21_600,
+        "provenance": {"tick_backed_bars": 21_600},
+    }
+
+    diagnostics = _strict_live_valid_1s_diagnostics(
+        args=args,
+        data_coverage=data_coverage,
+        label_bar_coverage=label_coverage,
+        execution_bar_coverage=execution_coverage,
+        folds=1,
+    )
+
+    assert diagnostics["ok"] is False
+    assert diagnostics["window_days"] == pytest.approx(0.25)
+    assert set(diagnostics["errors"]) == {
+        "label_bars_not_tick_backed",
+        "window_too_short",
+        "too_few_walk_forward_folds",
+    }
+
+
+def test_strict_live_valid_one_second_gate_accepts_multi_day_tick_backed_replay() -> None:
+    args = Namespace(
+        min_live_valid_1s_days=7.0,
+        preferred_live_valid_1s_days=14.0,
+        min_live_valid_folds=2,
+    )
+    data_coverage = {"requested_window": {"span_days": 8.0}}
+    replay_coverage = {
+        "enabled": True,
+        "interval": "1s",
+        "bars": 691_200,
+        "provenance": {"tick_backed_bars": 691_200},
+    }
+
+    diagnostics = _strict_live_valid_1s_diagnostics(
+        args=args,
+        data_coverage=data_coverage,
+        label_bar_coverage=replay_coverage,
+        execution_bar_coverage=replay_coverage,
+        folds=2,
+    )
+
+    assert diagnostics["ok"] is True
+    assert diagnostics["errors"] == []
+    assert diagnostics["label_tick_backed_ratio"] == pytest.approx(1.0)
+
+
+def test_trade_run_model_exit_geometry_uses_gross_price_barriers() -> None:
+    args = _trade_run_args(
+        synthetic_stop_loss_bps=100.0,
+        synthetic_profit_target_bps=0.0,
+        use_model_exit_geometry=True,
+    )
+    sample = SimpleNamespace(
+        features={
+            "net_profit_target": 0.0005,
+            "net_stop_loss": 0.0080,
+            "gross_profit_move": 0.004308,
+            "gross_stop_distance": 0.004192,
+        }
+    )
+
+    stop_bps, profit_bps, source = cli._runner_exit_bps(args, sample)
+
+    assert stop_bps == pytest.approx(41.92)
+    assert profit_bps == pytest.approx(43.08)
+    assert source == "model_gross_stop+model_gross_profit"
+
+
+def test_trade_run_exit_timing_honors_minimum_holding_seconds() -> None:
+    entered_utc = datetime(2026, 1, 1, tzinfo=UTC)
+    sample = SimpleNamespace(features={"event_min_holding_seconds": 5.0})
+
+    timing = _runner_exit_timing(
+        entered_monotonic=100.0,
+        entered_utc=entered_utc,
+        hold_seconds=1.0,
+        min_holding_seconds=_runner_min_holding_seconds(sample),
+    )
+
+    assert timing["min_exit_monotonic"] == pytest.approx(105.0)
+    assert timing["exit_deadline_monotonic"] == pytest.approx(105.0)
+    assert timing["min_exit_utc"] == (entered_utc + timedelta(seconds=5)).isoformat()
+    assert timing["exit_deadline_utc"] == (entered_utc + timedelta(seconds=5)).isoformat()
 
 
 def test_broker_trade_run_requires_account_and_live_confirmation() -> None:
@@ -428,8 +690,251 @@ def test_broker_trade_run_requires_account_and_live_confirmation() -> None:
     )
     with pytest.raises(SystemExit, match="ZEROALPHA_LIVE_TRADE_RUN"):
         _validate_trade_run_config(live_cfg, _trade_run_args(confirm="IBKR_PAPER_TRADE_RUN"))
+    with pytest.raises(SystemExit, match="decision-threshold"):
+        _validate_trade_run_config(
+            _paper_cfg_with_account(),
+            _trade_run_args(decision_threshold=1.5),
+        )
 
     _validate_trade_run_config(live_cfg, _trade_run_args(confirm="ZEROALPHA_LIVE_TRADE_RUN"))
+
+
+def test_trade_run_kill_switch_checks_configured_file(tmp_path) -> None:
+    kill_switch = tmp_path / "kill_switch.enabled"
+    cfg = replace(AppConfig(), runtime=replace(AppConfig().runtime, kill_switch_file=kill_switch))
+
+    assert _kill_switch_enabled(cfg) is False
+
+    kill_switch.write_text("stop\n")
+
+    assert _kill_switch_enabled(cfg) is True
+
+
+def test_trade_run_verified_one_second_data_gate_requires_ibkr_one_second_bars() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    bars = [
+        Bar(
+            timestamp_utc=start + timedelta(seconds=idx + 1),
+            symbol="BTC/USD",
+            bar_size="1 secs",
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            source="IBKR:AGGTRADES",
+        )
+        for idx in range(60)
+    ]
+    args = Namespace(
+        require_live_1s_data=True,
+        live_data_mode="streaming",
+        tick_by_tick_type="Last",
+        history_what_to_show="AGGTRADES",
+        history_bar_size="1 secs",
+    )
+
+    report = _require_verified_one_second_data(args, bars)
+
+    assert report["ok"] is True
+    assert report["bar_size_seconds"] == 1
+
+    bad_tick_args = Namespace(
+        require_live_1s_data=True,
+        live_data_mode="streaming",
+        tick_by_tick_type="BidAsk",
+        history_what_to_show="AGGTRADES",
+        history_bar_size="1 secs",
+    )
+    with pytest.raises(SystemExit, match="requires --tick-by-tick-type Last or AllLast"):
+        _require_verified_one_second_data(bad_tick_args, bars)
+
+    bad_bars = [replace(bars[0], bar_size="1 min")]
+    with pytest.raises(SystemExit, match="verification failed"):
+        _require_verified_one_second_data(args, bad_bars)
+
+
+def test_live_one_second_warmup_uses_processed_tick_rows_for_gate() -> None:
+    class FakeBroker:
+        def __init__(self):
+            self.waits = 0
+
+        async def quote_from_ticker(self, contract, quote_ticker, *, max_wait_seconds):
+            return MarketQuote(
+                timestamp_utc=start,
+                received_timestamp_utc=start,
+                symbol="BTC/USD",
+                bid=99.0,
+                ask=101.0,
+            )
+
+        async def wait(self, seconds):
+            self.waits += 1
+            return None
+
+    class FakeAggregator:
+        def add_quote(self, quote):
+            return True
+
+        def process_ticker_ticks(self, ticker):
+            return 1
+
+        def completed_bars(self):
+            return [
+                Bar(
+                    timestamp_utc=start + timedelta(seconds=1),
+                    symbol="BTC/USD",
+                    bar_size="1 secs",
+                    open=100,
+                    high=100,
+                    low=100,
+                    close=100,
+                    volume=0,
+                    source="IBKR:STREAM_BidAsk",
+                    extra={
+                        "aggregated_from": "streaming_tick_by_tick",
+                        "tick_count": 1.0,
+                    },
+                )
+            ]
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    args = Namespace(
+        live_1s_warmup_bars=1,
+        live_1s_warmup_timeout_seconds=1.0,
+        require_live_1s_data=True,
+        snapshot_timeout_seconds=1.0,
+        signal_interval=1.0,
+        history_max_bars=10,
+    )
+
+    _, report = asyncio.run(
+        _warmup_live_one_second_stream(
+            FakeBroker(),
+            SimpleNamespace(),
+            args,
+            quote_ticker=SimpleNamespace(),
+            tick_subscription=("BidAsk", SimpleNamespace(tickByTicks=[])),
+            bar_aggregator=FakeAggregator(),
+            history_bars=[],
+        )
+    )
+
+    assert report["ok"] is True
+    assert report["tick_rows_seen"] == 0
+    assert report["processed_tick_rows"] == 1
+    assert report["tick_completed_bars"] == 1
+
+
+def test_live_one_second_warmup_waits_for_tick_backed_bar() -> None:
+    class FakeBroker:
+        def __init__(self):
+            self.waits = 0
+
+        async def quote_from_ticker(self, contract, quote_ticker, *, max_wait_seconds):
+            return MarketQuote(
+                timestamp_utc=start,
+                received_timestamp_utc=start,
+                symbol="BTC/USD",
+                bid=99,
+                ask=101,
+                source="IBKR",
+            )
+
+        async def wait(self, seconds):
+            self.waits += 1
+            return None
+
+    class FakeAggregator:
+        def __init__(self):
+            self.calls = 0
+
+        def add_quote(self, quote):
+            return True
+
+        def process_ticker_ticks(self, ticker):
+            return 1
+
+        def completed_bars(self):
+            self.calls += 1
+            tick_count = 0.0 if self.calls == 1 else 1.0
+            return [
+                Bar(
+                    timestamp_utc=start + timedelta(seconds=self.calls),
+                    symbol="BTC/USD",
+                    bar_size="1 secs",
+                    open=100,
+                    high=100,
+                    low=100,
+                    close=100,
+                    volume=0,
+                    source="IBKR:STREAM_Last",
+                    extra={
+                        "aggregated_from": (
+                            "streaming_quote_sample"
+                            if tick_count == 0.0
+                            else "streaming_tick_by_tick"
+                        ),
+                        "tick_count": tick_count,
+                    },
+                )
+            ]
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    aggregator = FakeAggregator()
+    broker = FakeBroker()
+    args = Namespace(
+        live_1s_warmup_bars=1,
+        live_1s_warmup_timeout_seconds=1.0,
+        require_live_1s_data=True,
+        snapshot_timeout_seconds=1.0,
+        signal_interval=1.0,
+        history_max_bars=10,
+    )
+
+    _, report = asyncio.run(
+        _warmup_live_one_second_stream(
+            broker,
+            SimpleNamespace(),
+            args,
+            quote_ticker=SimpleNamespace(),
+            tick_subscription=("Last", SimpleNamespace(tickByTicks=[])),
+            bar_aggregator=aggregator,
+            history_bars=[],
+        )
+    )
+
+    assert aggregator.calls == 2
+    assert broker.waits == 1
+    assert report["ok"] is True
+    assert report["completed_bars"] == 2
+    assert report["tick_completed_bars"] == 1
+    assert report["aggregated_from"] == {
+        "streaming_quote_sample": 1,
+        "streaming_tick_by_tick": 1,
+    }
+
+
+def test_trade_run_quote_uses_snapshot_timeout_for_subscribed_quote() -> None:
+    class FakeBroker:
+        async def quote_from_ticker(self, contract, quote_ticker, *, max_wait_seconds):
+            self.max_wait_seconds = max_wait_seconds
+            return "quote"
+
+    broker = FakeBroker()
+    args = Namespace(snapshot_timeout_seconds=8.0, signal_interval=1.0)
+
+    quote = asyncio.run(
+        _trade_run_quote(
+            broker,
+            SimpleNamespace(),
+            args,
+            quote_ticker=SimpleNamespace(),
+        )
+    )
+
+    assert quote == "quote"
+    assert broker.max_wait_seconds == pytest.approx(8.0)
 
 
 def test_broker_round_trip_rejects_live_mode_and_oversized_notional() -> None:
@@ -488,6 +993,145 @@ def test_interpretability_flags_are_available_on_ml_commands() -> None:
     assert train_args.permutation_importance is True
     assert train_args.save_artifact == "artifacts/models/prod.joblib"
     assert audit_args.permutation_importance is True
+
+
+def test_train_meta_supports_negative_ev_frequency_probe_for_artifacts() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["model", "train-meta", "--allow-negative-ev-frequency-probe"])
+
+    assert args.allow_negative_ev_frequency_probe is True
+
+
+def test_ml_backtest_cli_can_disable_consecutive_loss_cooldown() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--consecutive-loss-limit",
+            "0",
+            "--cooldown-hours-after-stopouts",
+            "0",
+        ]
+    )
+
+    cfg = cli._override_config_from_args(AppConfig(), args)
+
+    assert cfg.risk.consecutive_loss_limit == 0
+    assert cfg.risk.cooldown_hours_after_stopouts == 0
+    cfg.validate()
+
+
+def test_ml_cli_can_explicitly_zero_minimum_probability_without_default_override() -> None:
+    parser = cli.build_parser()
+    base = AppConfig(model=ModelConfig(minimum_probability=0.72))
+
+    default_args = parser.parse_args(["backtest", "ml"])
+    default_cfg = cli._override_config_from_args(base, default_args)
+
+    zero_args = parser.parse_args(["backtest", "ml", "--minimum-probability", "0"])
+    zero_cfg = cli._override_config_from_args(base, zero_args)
+
+    assert default_cfg.model.minimum_probability == 0.72
+    assert zero_cfg.model.minimum_probability == 0.0
+
+
+def test_ml_research_defaults_to_expected_utility_selection() -> None:
+    parser = cli.build_parser()
+
+    backtest_args = parser.parse_args(["backtest", "ml"])
+    train_args = parser.parse_args(["model", "train-meta"])
+    sweep_args = parser.parse_args(["model", "sweep-labels"])
+
+    assert backtest_args.selection_score == "expected_utility"
+    assert train_args.selection_score == "expected_utility"
+    assert sweep_args.selection_score == "expected_utility"
+
+
+def test_online_target_frequency_defaults_to_capacity_aware_selection() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--target-frequency-mode",
+            "online",
+            "--max-open-positions",
+            "3",
+        ]
+    )
+    cfg = cli._override_config_from_args(AppConfig(), args)
+
+    assert args.respect_open_positions is None
+    assert _effective_respect_open_positions(args, cfg) is True
+
+
+def test_capacity_aware_selection_can_be_disabled_explicitly() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--target-frequency-mode",
+            "online",
+            "--max-open-positions",
+            "3",
+            "--no-respect-open-positions",
+        ]
+    )
+    cfg = cli._override_config_from_args(AppConfig(), args)
+
+    assert _effective_respect_open_positions(args, cfg) is False
+
+
+def test_adaptive_horizon_default_is_cost_aware_for_high_commission_spot() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--adaptive-horizon",
+            "--assumed-spread-bps",
+            "0.04",
+            "--base-slippage-bps",
+            "0.5",
+            "--safety-margin-bps",
+            "1.0",
+            "--tier-rate",
+            "0.0018",
+            "--minimum-commission",
+            "1.75",
+            "--notional",
+            "10000",
+            "--net-profit-target",
+            "0.002",
+            "--net-stop-loss",
+            "0.008",
+        ]
+    )
+    cfg = cli._override_config_from_args(AppConfig(), args)
+
+    candidate_cfg = cli._candidate_config_from_args(args, cfg)
+
+    assert 700 < candidate_cfg.adaptive_horizon_target_move_bps < 800
+
+
+def test_adaptive_horizon_explicit_target_move_wins() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--adaptive-horizon",
+            "--adaptive-horizon-target-move-bps",
+            "80",
+        ]
+    )
+
+    candidate_cfg = cli._candidate_config_from_args(args, AppConfig())
+
+    assert candidate_cfg.adaptive_horizon_target_move_bps == 80
 
 
 def test_paper_order_test_rejects_live_mode_and_live_port() -> None:

@@ -110,6 +110,7 @@ def test_external_feature_latency_uses_older_quote_snapshot() -> None:
         research_notional=10_000,
         market_quotes=quotes,
         external_feature_latency_seconds=3600.0,
+        feature_asof="entry",
         candidate_config=CandidateGenerationConfig(
             mode="dense_research",
             min_history_bars=240,

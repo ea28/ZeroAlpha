@@ -329,7 +329,10 @@ def run_candidate_backtest(
             consecutive_losses += 1
         else:
             consecutive_losses = 0
-        if consecutive_losses >= config.risk.consecutive_loss_limit:
+        if (
+            config.risk.consecutive_loss_limit > 0
+            and consecutive_losses >= config.risk.consecutive_loss_limit
+        ):
             cooldown_until = label.exit_timestamp_utc + timedelta(
                 hours=config.risk.cooldown_hours_after_stopouts
             )

@@ -73,11 +73,20 @@ class RiskEngine:
         if snapshot.open_positions >= self.config.max_open_positions:
             return RiskDecision(False, "max_open_positions")
         account_equity = snapshot.account_equity or self.config.account_equity
-        if snapshot.daily_pnl <= -account_equity * self.config.daily_loss_stop:
+        if (
+            self.config.daily_loss_stop > 0
+            and snapshot.daily_pnl <= -account_equity * self.config.daily_loss_stop
+        ):
             return RiskDecision(False, "daily_loss_stop")
-        if snapshot.weekly_pnl <= -account_equity * self.config.weekly_loss_stop:
+        if (
+            self.config.weekly_loss_stop > 0
+            and snapshot.weekly_pnl <= -account_equity * self.config.weekly_loss_stop
+        ):
             return RiskDecision(False, "weekly_loss_stop")
-        if snapshot.rolling_drawdown >= self.config.rolling_drawdown_stop:
+        if (
+            self.config.rolling_drawdown_stop > 0
+            and snapshot.rolling_drawdown >= self.config.rolling_drawdown_stop
+        ):
             return RiskDecision(False, "rolling_drawdown_stop")
         if prediction.calibrated_probability < minimum_probability:
             return RiskDecision(False, "probability_below_threshold")

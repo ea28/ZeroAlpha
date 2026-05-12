@@ -280,6 +280,9 @@ def test_parse_backtest_artifact_summary(tmp_path: Path) -> None:
             "candidate_predictions": 270,
             "model_approved_signals": 25,
             "rejected_signals": 12,
+            "max_simultaneous_open_positions": 4,
+            "max_open_notional": 9876.5,
+            "max_trade_notional": 2500.0,
             "net_pnl": 428.43,
             "gross_pnl": 547.81,
             "total_return": 0.042843,
@@ -300,8 +303,129 @@ def test_parse_backtest_artifact_summary(tmp_path: Path) -> None:
 
     assert result.status == "ok"
     assert result.trades == 25
+    assert result.max_simultaneous_open_positions == 4
+    assert result.max_open_notional == 9876.5
+    assert result.max_trade_notional == 2500.0
     assert result.net_pnl == 428.43
     assert result.rank_key[0] == 428.43
+
+
+def test_parse_backtest_artifact_falls_back_to_requested_window_rates(tmp_path: Path) -> None:
+    artifact = tmp_path / "stretch_goal" / "legacy.json"
+    artifact.parent.mkdir()
+    artifact.write_text(
+        """
+        {
+          "summary": {
+            "trades": 10,
+            "net_pnl": 250.0,
+            "sharpe": 12.0,
+            "data_coverage": {
+              "requested_window": {
+                "start": "2026-05-01T00:00:00+00:00",
+                "end": "2026-05-06T00:00:00+00:00"
+              },
+              "primary": {"interval": "1m"}
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    result = parse_backtest_artifact(artifact)
+
+    assert result.configured_span_days == 5.0
+    assert result.trades_per_configured_day == 2.0
+    assert result.pnl_per_configured_day == 50.0
+
+
+def test_parse_backtest_artifact_treats_list_payload_as_non_result(tmp_path: Path) -> None:
+    artifact = tmp_path / "diagnostics" / "events.json"
+    artifact.parent.mkdir()
+    artifact.write_text('[{"event": "started"}, {"event": "finished"}]', encoding="utf-8")
+
+    result = parse_backtest_artifact(artifact)
+
+    assert result.status == "non_result"
+    assert result.trades == 0
+    assert result.net_pnl == 0.0
+
+
+def test_parse_backtest_artifact_extracts_strict_live_valid_diagnostics(tmp_path: Path) -> None:
+    artifact = tmp_path / "live_valid_strict_10k" / "candidate.json"
+    artifact.parent.mkdir()
+    artifact.write_text(
+        """
+        {
+          "summary": {
+            "trades": 8,
+            "net_pnl": 501.0,
+            "sharpe": 25.5,
+            "data_coverage": {
+              "label_bars": {"enabled": true, "interval": "1s"},
+              "execution_bars": {"enabled": true, "interval": "1s"},
+              "strict_live_valid_1s": {
+                "ok": true,
+                "errors": [],
+                "window_days": 8.0,
+                "minimum_days": 7.0,
+                "folds": 2,
+                "minimum_folds": 2,
+                "label_tick_backed_ratio": 1.0,
+                "execution_tick_backed_ratio": 0.99
+              }
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    result = parse_backtest_artifact(artifact)
+
+    assert result.uses_one_second_execution is True
+    assert result.strict_live_valid_checked is True
+    assert result.strict_live_valid_ok is True
+    assert result.strict_live_valid_errors == ""
+    assert result.strict_live_valid_window_days == 8.0
+    assert result.strict_live_valid_folds == 2
+    assert result.label_tick_backed_ratio == 1.0
+    assert result.execution_tick_backed_ratio == 0.99
+    assert result.strict_live_valid_promotion_eligible is True
+
+
+def test_missing_strict_live_valid_artifact_reports_gate_failure(tmp_path: Path) -> None:
+    artifact = tmp_path / "live_valid_strict_10k" / "candidate.json"
+    log_path = tmp_path / "logs" / "candidate.log"
+    log_path.parent.mkdir()
+    log_path.write_text(
+        """
+        $ zeroalpha backtest ml --strict-live-valid-1s
+        strict_live_valid_1s_diagnostics {"errors": ["window_too_short", "too_few_walk_forward_folds"], "execution_tick_backed_ratio": 1.0, "folds": 1, "label_tick_backed_ratio": 0.99, "minimum_days": 7.0, "minimum_folds": 2, "ok": false, "window_days": 0.25}
+        strict live-valid 1s promotion gate failed: window_too_short,too_few_walk_forward_folds
+        """,
+        encoding="utf-8",
+    )
+
+    result = parse_backtest_artifact(
+        artifact,
+        log_path=log_path,
+        error=f"command exited 1; see {log_path}",
+    )
+
+    assert result.status == "strict_gate_failed"
+    assert result.strict_live_valid_checked is True
+    assert result.strict_live_valid_ok is False
+    assert result.strict_live_valid_errors == "window_too_short,too_few_walk_forward_folds"
+    assert result.strict_live_valid_window_days == 0.25
+    assert result.strict_live_valid_minimum_days == 7.0
+    assert result.strict_live_valid_folds == 1
+    assert result.strict_live_valid_minimum_folds == 2
+    assert result.label_tick_backed_ratio == 0.99
+    assert result.execution_tick_backed_ratio == 1.0
+    assert "window_too_short" in result.error
+    assert result.strict_live_valid_promotion_eligible is False
 
 
 def test_summarize_results_applies_multiple_testing_haircut(tmp_path: Path) -> None:

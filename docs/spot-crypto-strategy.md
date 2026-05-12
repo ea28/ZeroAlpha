@@ -1,259 +1,159 @@
 # Spot Crypto Strategy And Performance
 
-This is the main-branch strategy note for ZeroAlpha. It covers BTC/USD spot
-crypto through IBKR Gateway/TWS, long/flat only. Crypto futures remain a
-research instrument and feature source unless promoted in a separate branch.
+This note describes the current ZeroAlpha BTC/USD spot strategy for IBKR
+Gateway/TWS. The strategy is long/flat spot crypto; futures data is allowed as a
+causal feature source, not as the execution instrument for this strategy.
 
-This is not financial advice and does not approve live trading.
+This is experimental financial software, not financial advice. Any real-money
+deployment needs account-specific validation of data, commissions, order fills,
+position reconciliation, and risk caps.
 
-## Current Recommendation
+## Current Strategy
 
-The current main-branch recommendation is paper-only BTC/USD spot execution with
-live trading gated behind explicit live config and confirmation strings.
+The production path is a cost-aware meta-labeling strategy:
 
-Recommended research baseline:
+- Generate long BTC/USD candidate entries from completed bars.
+- Score candidates with calibrated tabular model ensembles.
+- Select trades online with open-position capacity accounting.
+- Size orders from the artifact's sizing policy.
+- Enter with broker-compatible market-buy cash orders.
+- Exit with synthetic stop/profit/timed exits from the model's label geometry.
 
-- 6h-style holding horizon with 100/80 bps gross target/stop family.
+The baseline setup uses:
+
+- Active or dense candidate generation, depending on data granularity.
 - Online target-frequency selection.
 - `capacity_release_mode=planned`.
-- One open spot position.
-- IBKR spot fee model: 18 bps per side, minimum `$1.75` per order, max 1% of
-  trade value.
-- Synthetic stops only for IBKR spot crypto.
-- Prediction-market and futures features are allowed only when timestamped
-  causally at or before the scoring timestamp with the configured latency buffer.
-
-Best saved research rows to beat:
-
-| Variant | Trades | Net PnL | Sharpe | Note |
-| --- | ---: | ---: | ---: | --- |
-| no-PM bucket sizing | 23 | `$724.49` | `22.58` | Best PnL; PM kept as shadow/gated feed |
-| PM-enabled bucket sizing | 20 | `$584.77` | `24.64` | Best Polymarket/Kalshi-enabled row |
-| `$10k x3` compromise | varied | lower than leader | strong | Best capital/trade-count compromise |
-| `$5k x6` turnover leader | higher trades | lower PnL | >20 target | Trade-count benchmark |
-
-Promotion threshold for new experiments: beat `$724.49` no-PM net PnL or
-materially increase trade count while keeping Sharpe above `20`, without relying
-on future-looking ranking, tiny samples, optimistic fees, or missing latency
-buffers.
-
-## Current Blockers
-
-Live trading is still blocked until:
-
-- Longer out-of-sample paper data confirms the edge.
-- IBKR quote/bar replay survives restart and reconnect tests.
-- Paper `broker trade-run` proves order, fill, commission, PnL, and final
-  position reconciliation over longer sessions.
-- Continuous Polymarket/Kalshi/IBKR order-book snapshots are recorded before
-  sub-minute exits are trusted.
-- Stop behavior remains synthetic for spot crypto; native `STP`/`STP LMT` must
-  remain blocked.
+- One open runner-managed spot position by default.
+- IBKR spot fee model: 18 bps per side, `$1.75` minimum, 1% maximum.
+- Adaptive holding horizons so each signal can use a volatility-scaled vertical
+  barrier.
+- Prediction-market, futures, and cross-asset features only when timestamped at
+  or before the scoring timestamp with the configured latency buffer.
 
 ## Reproduction
 
-Train and save the production scoring artifact:
+Use the easy presets for normal production research:
 
 ```bash
-.venv/bin/python -m zeroalpha.cli model train-meta \
-  --config configs/paper.example.toml \
+.venv/bin/zeroalpha easy backtest \
+  --config configs/live.local.toml \
   --years 3 \
-  --interval 1h \
-  --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
-  --stacker weighted \
-  --hpo \
-  --target-frequency-mode online \
-  --capacity-release-mode planned \
-  --permutation-importance \
-  --shap-importance \
-  --output artifacts/models/meta_label_walk_forward_btcusdt_1h.json \
-  --save-artifact artifacts/models/zeroalpha_spot_btc_prod.joblib
-```
+  --capital-usd 10000 \
+  --high-notional-usd 5000
 
-Run the main backtest:
-
-```bash
-.venv/bin/python -m zeroalpha.cli backtest ml \
-  --config configs/paper.example.toml \
+.venv/bin/zeroalpha easy train \
+  --config configs/live.local.toml \
+  --artifact artifacts/models/zeroalpha_spot_btc_prod.joblib \
   --years 3 \
-  --interval 1h \
-  --models logistic,histgb,extratrees,lightgbm,catboost,xgboost \
-  --stacker weighted \
-  --hpo \
-  --adaptive-threshold \
-  --candidate-type-thresholds \
-  --empirical-payoff-ev \
-  --target-frequency-mode online \
-  --capacity-release-mode planned \
-  --sizing-mode score_bucket \
-  --sizing-base-notional 5000 \
-  --sizing-mid-notional 10000 \
-  --sizing-high-notional 15000 \
-  --permutation-importance \
-  --shap-importance \
-  --output artifacts/backtests/spot_retest.json
+  --capital-usd 10000
 ```
 
-Enable PM/futures/cross-asset features:
+Run the broker loop after the artifact, account, and risk limits are validated:
 
 ```bash
---context-symbols ETHUSDT,SOLUSDT,ETHBTC \
---binance-um-futures-reference-symbols BTCUSDT,ETHUSDT,SOLUSDT \
---binance-um-derivatives-metrics \
---binance-um-taker-flow \
---binance-um-basis \
---prediction-market-signals \
---prediction-market-durations 5m,15m,30m,45m,1h,2h,4h,24h
-```
-
-IBKR paper runner:
-
-```bash
-.venv/bin/python -m zeroalpha.cli broker trade-run \
-  --config configs/paper.example.toml \
-  --account YOUR_PAPER_ACCOUNT \
-  --model-artifact artifacts/models/zeroalpha_spot_btc_prod.joblib \
+.venv/bin/zeroalpha easy trade \
+  --config configs/live.local.toml \
+  --account YOUR_IBKR_ACCOUNT \
+  --artifact artifacts/models/zeroalpha_spot_btc_prod.joblib \
   --capital-usd 5000 \
   --max-loss-usd 250 \
-  --max-order-notional-usd 5000 \
-  --duration-seconds 600 \
-  --signal-interval 60 \
-  --history-what-to-show AGGTRADES \
-  --max-signal-bar-age-seconds 300 \
-  --stream-format json \
-  --confirm IBKR_PAPER_TRADE_RUN
+  --max-order-notional-usd 1000 \
+  --confirm ZEROALPHA_LIVE_TRADE_RUN
 ```
 
-## Instrument And Execution
+Advanced research is still available through:
 
-IBKR spot BTC/USD:
-
-- `secType = CRYPTO`
-- `symbol = BTC`
-- `currency = USD`
-- primary exchange candidate: `PAXOS`
-- fallback exchange candidate: `ZEROHASH`
-
-IBKR documents crypto orders as market and limit only. For this reason,
-ZeroAlpha blocks native `STP` and `STP LMT` for spot crypto and implements stop
-losses as a synthetic quote monitor that submits a bounded market sell after the
-trigger.
-
-Every order-submitting path now requires:
-
-- explicit account configured or passed with `--account`
-- account present in `managedAccounts()`
-- non-read-only API connection
-- runtime mode allowing orders
-- notional under paper/live cap
-- quote/reference price for quantity market exits
-- sell quantity no greater than current BTC position
-
-Emergency cleanup cancels open orders, attempts bounded liquidation only for
-runner-created exposure, records final position/PnL state, and emits critical
-runtime events.
-
-## Cost Model
-
-IBKR lowest-volume spot crypto schedule:
-
-- `0.18% * Trade Value` per side.
-- Minimum commission: `$1.75` per order.
-- Maximum commission: `1%` of trade value.
-
-At `$10,000`, commission is about `$18` per side, or 36 bps round trip before
-spread, slippage, and safety margin. This is why the earlier futures strategy
-did not transfer cleanly to spot: the futures round-trip cost was materially
-lower, while spot needs a larger edge just to break even.
+```bash
+.venv/bin/zeroalpha backtest ml --help
+.venv/bin/zeroalpha model train-meta --help
+.venv/bin/zeroalpha broker trade-run --help
+```
 
 ## Data And Causality
 
 All bars are normalized to completed close time before feature generation.
+External data is treated as point-in-time:
 
-Prediction markets are used as leading indicators only when the snapshot
-timestamp is causal. Polymarket CLOB v2 price-history snapshots use timestamped
-history fields only; current market totals are not backfilled into the past.
-Kalshi true directional 5m/15m markets are separated from ladder/threshold
-markets, which are exposed under `ladder_*` duration features.
+- Binance spot archives for BTCUSDT and cross-asset context.
+- Binance USD-M futures for open interest, funding, taker flow, and basis.
+- Coinbase and Kraken reference feeds for source checks.
+- Polymarket and Kalshi BTC directional contracts for prediction-market
+  features.
+- IBKR quotes, historical bars, market depth, tick-by-tick data, account state,
+  executions, and commission reports.
 
-IBKR data available through this branch:
+Prediction-market snapshots use timestamped history only. Current liquidity,
+open interest, or book totals are not backfilled into historical rows. IBKR
+1-second experiments require tick-backed label and execution replay before
+promotion.
 
-- L1 bid/ask snapshots.
-- Historical `AGGTRADES` PAXOS crypto bars, plus `MIDPOINT`, `BID`, `ASK`,
-  `BID_ASK`, and other bar types where Gateway permissions allow.
-- Market depth snapshots.
-- Tick-by-tick snapshots.
-- Account summary, portfolio, positions, daily/realized/unrealized PnL.
-- TWS executions and commission reports.
+## Feature Selection
 
-## Feature Selection And Interpretability
+The most important feature families to validate per run are:
 
-The current interpretability stack is fold-safe:
+- Momentum/trend and realized-volatility regime.
+- Fee, target, stop, and horizon geometry.
+- Volume, taker-flow, and microstructure.
+- Cross-asset and futures context.
+- Prediction-market residual edge, term structure, and provider disagreement.
 
-- grouped permutation importance on test folds only
-- native tree/linear importances
-- SHAP importance for supported fitted base estimators
-- model-family diagnostics and leave-family comparisons in reports
+Use grouped permutation importance, SHAP where supported, native importances,
+and leave-family ablations to avoid depending on unstable feature groups.
+Feature pruning should be evaluated fold-by-fold, not on the final aggregate
+only.
 
-The most useful families in the profitable spot experiments have been:
+## Model Stack
 
-- core momentum/trend and realized-volatility regime features
-- fee/target/stop geometry features
-- volume and taker-flow features when available
-- futures context as a leading risk-on/risk-off signal
-- prediction-market residual/term-structure features as a shadow/gated feed
+The production stack can include logistic regression, HistGradientBoosting,
+RandomForest, ExtraTrees, LightGBM, XGBoost, CatBoost, and optional
+TabICL/TabPFN models. The ensemble can average models, select the best model,
+learn logistic stacking, or weight models by fold performance. Probabilities are
+calibrated with sigmoid or isotonic calibration before trading thresholds are
+selected.
 
-PM-enabled runs showed higher Sharpe but lower PnL in the saved champion rows.
-The likely causes are stricter gating, lower trade count, sparse PM coverage,
-and noisy PM features acting as a risk filter rather than a pure alpha source.
+HPO is nested inside walk-forward folds. Optimize on net PnL, Sharpe, or Calmar,
+then review trade count, drawdown, hit rate, profit factor, cost drag,
+candidate-family concentration, and outlier dependence before promotion.
 
-## Why Futures Looked Better
+## Risk And Sizing
 
-The crypto-futures branch had three structural advantages:
+Risk controls include configured notional caps, max open positions, minimum
+fee-efficient notional, loss stops, cooldowns, quote freshness checks, spread
+checks, runtime max-loss enforcement, kill-switch checks, and artifact contract
+validation.
 
-- Lower effective round-trip cost relative to the target move.
-- Cleaner short/hedge semantics.
-- Better fit between the target horizon and futures liquidity/flow features.
+Sizing modes:
 
-Spot crypto at IBKR pays 36 bps round-trip commission at normal research sizes,
-so shorter holding periods and more frequent trading quickly become cost
-dominated unless order-book/taker-flow features add a much larger edge.
+- `fixed`: same requested notional for every approved signal.
+- `confidence`: scales size above the selected probability threshold.
+- `score_bucket`: assigns base/mid/high notionals by model score.
+- `liquidity_score_bucket`: also requires liquidity/spread quality before
+  increasing size.
 
-## Next Experiments
+The easy preset trains score-bucket artifacts so weak approvals receive smaller
+orders and stronger approvals can receive the configured high notional, capped
+again by the broker runner's capital and max-order limits.
 
-High-priority experiments:
+## Promotion Checklist
 
-- Longer paper `broker trade-run` sessions with TWS commission/PnL
-  reconciliation.
-- Continuous IBKR PAXOS L1/L2/tick-by-tick capture.
-- Continuous Polymarket/Kalshi order-book capture for 5m/15m/1h/4h BTC markets.
-- Feature-pruned reruns using fold-local permutation/SHAP summaries.
-- Model family ablations: CatBoost-only, LightGBM-only, ExtraTrees-only,
-  HistGB-only, and weighted ensemble.
-- More futures-leading features: ETH spot/futures, BTC/ETH basis, OI velocity,
-  taker imbalance, funding changes, and liquidation pressure.
-- Dynamic exit overlay that keeps the 6h label but exits early only when
-  expected remaining value turns negative after fees.
+Before using an artifact against an account:
+
+- The artifact was trained with `--entry-order-model market`.
+- Walk-forward performance is not concentrated in one fold, day, setup family,
+  or feature family.
+- Commission, spread, slippage, and safety margin are included.
+- The selected threshold and sizing policy are saved in the artifact manifest.
+- Broker smoke checks pass against the intended account.
+- Runtime event and state logs are written to JSONL.
+- The max-loss guard, kill switch, flatten-on-exit behavior, and final
+  position/PnL reconciliation are verified.
 
 Rejected for production claims:
 
-- hard 1-second exits without tick/L2 replay
-- same-day quota ranking
-- `capacity_release_mode=actual` without `--research-gate`
-- native spot crypto stops
-- PM market totals backfilled into historical snapshots
-
-## Appendix: Older Research History
-
-Earlier May 2026 experiments found:
-
-- Very short 5m/sub-hour spot holding tests traded more often but lost too much
-  edge after spot commission.
-- PM-enabled rows improved Sharpe but often reduced PnL and trade count.
-- Wider HPO sometimes overfit and degraded the result.
-- IBKR PAXOS top-of-book spread was tiny in samples, but commission dominated.
-- Futures context helped explain why futures performed better, but using futures
-  as a spot feature needs strict timestamp alignment.
-
-The durable lesson is that spot needs fewer, better trades unless continuous
-microstructure data proves a genuine high-turnover edge.
+- Same-day quota ranking.
+- `capacity_release_mode=actual` without explicit research gating.
+- Native stop orders for IBKR spot crypto.
+- Historical rows that use data unavailable at the scoring timestamp.
+- Short-horizon strategies whose gross edge does not clear commission, spread,
+  slippage, and safety margin.

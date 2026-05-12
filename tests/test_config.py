@@ -15,6 +15,14 @@ def test_load_example_config() -> None:
     assert cfg.model.minimum_expected_value == 0.0
 
 
+def test_load_live_example_config() -> None:
+    cfg = load_config(Path("configs/live.example.toml"))
+    assert cfg.runtime.mode == RuntimeMode.LIVE
+    assert cfg.runtime.enable_live_trading is True
+    assert cfg.runtime.live_confirmation == "ZEROALPHA_LIVE"
+    assert cfg.broker.port == 4001
+
+
 def test_futures_research_can_validate_multiple_open_positions() -> None:
     cfg = AppConfig(
         contract=ContractConfig(instrument_model="futures"),

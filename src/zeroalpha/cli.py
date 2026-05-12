@@ -60,6 +60,9 @@ from zeroalpha.models.sweep import run_label_geometry_sweep, sweep_results_asdic
 from zeroalpha.monitoring.events import RuntimeEventStream
 
 
+PRODUCTION_MODEL_SET = "logistic,histgb,extratrees,lightgbm,catboost,xgboost"
+
+
 def _cmd_config_check(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     print(f"ok: mode={cfg.runtime.mode.value} broker={cfg.broker.host}:{cfg.broker.port}")
@@ -666,9 +669,6 @@ def _override_config_from_args(cfg, args: argparse.Namespace):
     risk_updates = {}
     for attr in (
         "risk_per_trade",
-        "daily_loss_stop",
-        "weekly_loss_stop",
-        "rolling_drawdown_stop",
         "paper_max_notional",
         "minimum_fee_efficient_notional",
         "max_open_positions",
@@ -676,6 +676,11 @@ def _override_config_from_args(cfg, args: argparse.Namespace):
         value = getattr(args, attr, 0.0)
         if value:
             risk_updates[attr] = value
+    for attr in ("daily_loss_stop", "weekly_loss_stop", "rolling_drawdown_stop"):
+        if hasattr(args, attr):
+            value = getattr(args, attr)
+            if value is not None:
+                risk_updates[attr] = value
     if getattr(args, "consecutive_loss_limit", None) is not None:
         risk_updates["consecutive_loss_limit"] = args.consecutive_loss_limit
     if getattr(args, "cooldown_hours_after_stopouts", None) is not None:
@@ -1023,6 +1028,7 @@ def _enforce_strict_live_valid_1s(
     )
     data_coverage["strict_live_valid_1s"] = diagnostics
     if getattr(args, "strict_live_valid_1s", False) and not diagnostics["ok"]:
+        print("strict_live_valid_1s_diagnostics " + json.dumps(diagnostics, sort_keys=True))
         raise SystemExit(
             "strict live-valid 1s promotion gate failed: "
             + ",".join(str(value) for value in diagnostics["errors"])
@@ -5244,9 +5250,222 @@ def _add_ml_execution_research_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _append_cli_option(argv: list[str], option: str, value: object) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        if value:
+            argv.append(option)
+        return
+    text = str(value)
+    if text:
+        argv.extend([option, text])
+
+
+def _append_easy_ml_preset(argv: list[str], args: argparse.Namespace, *, include_artifact: bool) -> None:
+    for option, value in (
+        ("--config", args.config),
+        ("--symbol", args.symbol),
+        ("--interval", args.interval),
+        ("--years", args.years),
+        ("--notional", args.high_notional_usd),
+        ("--instrument-model", "spot_crypto"),
+        ("--assumed-spread-bps", args.spread_bps),
+        ("--candidate-mode", args.candidate_mode),
+        ("--side-mode", "long"),
+        ("--min-history-bars", args.min_history_bars),
+        ("--max-holding-hours", args.max_holding_hours),
+        ("--net-profit-target", args.net_profit_target),
+        ("--net-stop-loss", args.net_stop_loss),
+        ("--minimum-gross-profit-bps", args.minimum_gross_profit_bps),
+        ("--minimum-gross-stop-bps", args.minimum_gross_stop_bps),
+        ("--target-trades-per-day", args.target_trades_per_day),
+        ("--target-frequency-mode", "online"),
+        ("--selection-score", "expected_utility"),
+        ("--capacity-release-mode", "planned"),
+        ("--max-open-positions", args.max_open_positions),
+        ("--models", args.models),
+        ("--stacker", args.stacker),
+        ("--hpo-profile", args.hpo_profile),
+        ("--entry-order-model", "market"),
+        ("--sizing-mode", "score_bucket"),
+        ("--sizing-score-field", "selection_score"),
+        ("--sizing-score-direction", "high"),
+        ("--sizing-base-notional", args.base_notional_usd),
+        ("--sizing-mid-notional", args.mid_notional_usd),
+        ("--sizing-high-notional", args.high_notional_usd),
+        ("--sizing-mid-score", args.sizing_mid_score),
+        ("--sizing-high-score", args.sizing_high_score),
+    ):
+        _append_cli_option(argv, option, value)
+    argv.extend(
+        [
+            "--adaptive-threshold",
+            "--candidate-type-thresholds",
+            "--empirical-payoff-ev",
+            "--adaptive-horizon",
+        ]
+    )
+    if args.hpo:
+        argv.append("--hpo")
+    if args.explain:
+        argv.append("--permutation-importance")
+        if args.shap:
+            argv.append("--shap-importance")
+    if args.prediction_markets:
+        argv.append("--prediction-market-signals")
+    if include_artifact:
+        _append_cli_option(argv, "--save-artifact", args.artifact)
+    _append_cli_option(argv, "--output", args.output)
+
+
+def _build_easy_backtest_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["backtest", "ml"]
+    _append_easy_ml_preset(argv, args, include_artifact=False)
+    _append_cli_option(argv, "--starting-equity", args.capital_usd)
+    return argv
+
+
+def _build_easy_train_argv(args: argparse.Namespace) -> list[str]:
+    argv = ["model", "train-meta"]
+    _append_easy_ml_preset(argv, args, include_artifact=True)
+    _append_cli_option(argv, "--starting-equity", args.capital_usd)
+    return argv
+
+
+def _build_easy_trade_argv(args: argparse.Namespace) -> list[str]:
+    argv = [
+        "broker",
+        "trade-run",
+        "--config",
+        args.config,
+        "--model-artifact",
+        args.artifact,
+        "--capital-usd",
+        str(args.capital_usd),
+        "--max-loss-usd",
+        str(args.max_loss_usd),
+        "--max-order-notional-usd",
+        str(args.max_order_notional_usd),
+        "--duration-seconds",
+        str(args.duration_seconds),
+        "--signal-interval",
+        str(args.signal_interval),
+        "--stream-format",
+        "json",
+        "--event-log",
+        args.event_log,
+        "--state-log",
+        args.state_log,
+        "--confirm",
+        args.confirm,
+    ]
+    for option, value in (
+        ("--account", args.account),
+        ("--max-open-positions", args.max_open_positions),
+        ("--decision-threshold", args.decision_threshold),
+    ):
+        _append_cli_option(argv, option, value)
+    return argv
+
+
+def _cmd_easy_backtest(args: argparse.Namespace) -> int:
+    return main(_build_easy_backtest_argv(args))
+
+
+def _cmd_easy_train(args: argparse.Namespace) -> int:
+    return main(_build_easy_train_argv(args))
+
+
+def _cmd_easy_trade(args: argparse.Namespace) -> int:
+    return main(_build_easy_trade_argv(args))
+
+
+def _add_easy_ml_args(parser: argparse.ArgumentParser, *, default_output: str) -> None:
+    parser.add_argument("--config", default="configs/live.example.toml")
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--interval", default="1h")
+    parser.add_argument("--years", type=int, default=3)
+    parser.add_argument("--capital-usd", type=float, default=10_000.0)
+    parser.add_argument("--base-notional-usd", type=float, default=1_250.0)
+    parser.add_argument("--mid-notional-usd", type=float, default=2_500.0)
+    parser.add_argument("--high-notional-usd", type=float, default=5_000.0)
+    parser.add_argument("--spread-bps", type=float, default=4.0)
+    parser.add_argument("--candidate-mode", choices=["rules", "aggressive", "dense", "active"], default="active")
+    parser.add_argument("--min-history-bars", type=int, default=240)
+    parser.add_argument("--max-holding-hours", type=float, default=6.0)
+    parser.add_argument("--net-profit-target", type=float, default=0.002)
+    parser.add_argument("--net-stop-loss", type=float, default=0.002)
+    parser.add_argument("--minimum-gross-profit-bps", type=float, default=100.0)
+    parser.add_argument("--minimum-gross-stop-bps", type=float, default=80.0)
+    parser.add_argument("--target-trades-per-day", type=float, default=3.0)
+    parser.add_argument("--max-open-positions", type=int, default=1)
+    parser.add_argument("--models", default=PRODUCTION_MODEL_SET)
+    parser.add_argument("--stacker", choices=["average", "logistic", "best", "weighted"], default="weighted")
+    parser.add_argument(
+        "--hpo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run walk-forward hyperparameter tuning for the preset.",
+    )
+    parser.add_argument("--hpo-profile", choices=["standard", "deep", "wide", "quota", "capacity"], default="standard")
+    parser.add_argument(
+        "--explain",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write permutation importance diagnostics with the report.",
+    )
+    parser.add_argument(
+        "--shap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also compute SHAP diagnostics. This can be slow on large folds.",
+    )
+    parser.add_argument(
+        "--prediction-markets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include Polymarket/Kalshi feature fetches in the preset.",
+    )
+    parser.add_argument("--sizing-mid-score", type=float, default=0.45)
+    parser.add_argument("--sizing-high-score", type=float, default=0.75)
+    parser.add_argument("--output", default=default_output)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zeroalpha")
+    parser = argparse.ArgumentParser(
+        prog="zeroalpha",
+        description=(
+            "ZeroAlpha CLI. Use `zeroalpha easy ...` for production presets; "
+            "the grouped commands expose the full advanced flag surface."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    easy = sub.add_parser("easy", help="Short production presets for common workflows.")
+    easy_sub = easy.add_subparsers(dest="easy_command", required=True)
+    easy_backtest = easy_sub.add_parser("backtest", help="Run the production ML backtest preset.")
+    _add_easy_ml_args(easy_backtest, default_output="artifacts/backtests/production_btcusdt_1h.json")
+    easy_backtest.set_defaults(func=_cmd_easy_backtest)
+    easy_train = easy_sub.add_parser("train", help="Train and save a trade-run compatible artifact.")
+    _add_easy_ml_args(easy_train, default_output="artifacts/models/production_train_report.json")
+    easy_train.add_argument("--artifact", default="artifacts/models/zeroalpha_spot_btc_prod.joblib")
+    easy_train.set_defaults(func=_cmd_easy_train)
+    easy_trade = easy_sub.add_parser("trade", help="Run the production broker trade runner preset.")
+    easy_trade.add_argument("--config", default="configs/live.example.toml")
+    easy_trade.add_argument("--account", default="")
+    easy_trade.add_argument("--artifact", required=True)
+    easy_trade.add_argument("--capital-usd", type=float, required=True)
+    easy_trade.add_argument("--max-loss-usd", type=float, required=True)
+    easy_trade.add_argument("--max-order-notional-usd", type=float, required=True)
+    easy_trade.add_argument("--max-open-positions", type=int, default=1)
+    easy_trade.add_argument("--duration-seconds", type=float, default=600.0)
+    easy_trade.add_argument("--signal-interval", type=float, default=1.0)
+    easy_trade.add_argument("--decision-threshold", type=float, default=0.0)
+    easy_trade.add_argument("--event-log", default="data/raw/ibkr/trade_run_events.jsonl")
+    easy_trade.add_argument("--state-log", default="data/raw/ibkr/trade_run_state.jsonl")
+    easy_trade.add_argument("--confirm", required=True)
+    easy_trade.set_defaults(func=_cmd_easy_trade)
 
     config = sub.add_parser("config")
     config_sub = config.add_subparsers(dest="config_command", required=True)
@@ -5367,9 +5586,9 @@ def build_parser() -> argparse.ArgumentParser:
     ml_backtest.add_argument("--selection-setup-families", default="")
     ml_backtest.add_argument("--selection-exclude-setup-families", default="")
     ml_backtest.add_argument("--risk-per-trade", type=float, default=0.0)
-    ml_backtest.add_argument("--daily-loss-stop", type=float, default=0.0)
-    ml_backtest.add_argument("--weekly-loss-stop", type=float, default=0.0)
-    ml_backtest.add_argument("--rolling-drawdown-stop", type=float, default=0.0)
+    ml_backtest.add_argument("--daily-loss-stop", type=float, default=None)
+    ml_backtest.add_argument("--weekly-loss-stop", type=float, default=None)
+    ml_backtest.add_argument("--rolling-drawdown-stop", type=float, default=None)
     ml_backtest.add_argument("--paper-max-notional", type=float, default=0.0)
     ml_backtest.add_argument("--minimum-fee-efficient-notional", type=float, default=0.0)
     ml_backtest.add_argument("--tier-rate", type=float, default=None)
@@ -5436,6 +5655,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_meta.add_argument("--years", type=int, default=3)
     train_meta.add_argument("--start", default="")
     train_meta.add_argument("--end", default="")
+    train_meta.add_argument("--starting-equity", type=float, default=10_000.0)
     train_meta.add_argument("--notional", type=float, default=10_000.0)
     train_meta.add_argument("--instrument-model", choices=["spot_crypto", "futures"], default="")
     train_meta.add_argument("--assumed-spread-bps", type=float, default=10.0)
@@ -5634,9 +5854,9 @@ def build_parser() -> argparse.ArgumentParser:
     signal_audit.add_argument("--confidence-scaled-sizing", action="store_true")
     _add_ml_execution_research_args(signal_audit)
     signal_audit.add_argument("--risk-per-trade", type=float, default=0.0)
-    signal_audit.add_argument("--daily-loss-stop", type=float, default=0.0)
-    signal_audit.add_argument("--weekly-loss-stop", type=float, default=0.0)
-    signal_audit.add_argument("--rolling-drawdown-stop", type=float, default=0.0)
+    signal_audit.add_argument("--daily-loss-stop", type=float, default=None)
+    signal_audit.add_argument("--weekly-loss-stop", type=float, default=None)
+    signal_audit.add_argument("--rolling-drawdown-stop", type=float, default=None)
     signal_audit.add_argument("--paper-max-notional", type=float, default=0.0)
     signal_audit.add_argument("--minimum-fee-efficient-notional", type=float, default=0.0)
     signal_audit.add_argument("--tier-rate", type=float, default=None)

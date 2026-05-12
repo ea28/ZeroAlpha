@@ -267,16 +267,25 @@ def run_candidate_backtest(
 
         daily_pnl = _period_pnl(realized_pnls, timestamp=event.timestamp_utc, weekly=False)
         weekly_pnl = _period_pnl(realized_pnls, timestamp=event.timestamp_utc, weekly=True)
-        if daily_pnl <= -starting_equity * config.risk.daily_loss_stop:
+        if (
+            config.risk.daily_loss_stop > 0
+            and daily_pnl <= -starting_equity * config.risk.daily_loss_stop
+        ):
             _record_rejection(rejections, event, reason="daily_loss_stop", equity=equity)
             idx += 1
             continue
-        if weekly_pnl <= -starting_equity * config.risk.weekly_loss_stop:
+        if (
+            config.risk.weekly_loss_stop > 0
+            and weekly_pnl <= -starting_equity * config.risk.weekly_loss_stop
+        ):
             _record_rejection(rejections, event, reason="weekly_loss_stop", equity=equity)
             idx += 1
             continue
         rolling_drawdown = (max_equity - equity) / max_equity if max_equity > 0 else 0.0
-        if rolling_drawdown >= config.risk.rolling_drawdown_stop:
+        if (
+            config.risk.rolling_drawdown_stop > 0
+            and rolling_drawdown >= config.risk.rolling_drawdown_stop
+        ):
             _record_rejection(rejections, event, reason="rolling_drawdown_stop", equity=equity)
             break
 

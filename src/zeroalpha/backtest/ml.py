@@ -94,6 +94,9 @@ class MLBacktestSummary:
     configured_span_days: float
     prediction_span_days: float
     active_trade_span_days: float
+    max_simultaneous_open_positions: int
+    max_open_notional: float
+    max_trade_notional: float
     trades_per_configured_day: float
     trades_per_prediction_day: float
     trades_per_active_day: float
@@ -769,6 +772,10 @@ def _open_spot_notional(pending_trades: list[PendingMLBacktestTrade]) -> float:
     return sum(trade.notional for trade in pending_trades if trade.side == Side.BUY.value)
 
 
+def _open_notional(pending_trades: list[PendingMLBacktestTrade]) -> float:
+    return sum(trade.notional for trade in pending_trades)
+
+
 def _futures_contract_cost_enabled(config: AppConfig) -> bool:
     return (
         config.contract.instrument_model == "futures"
@@ -819,6 +826,8 @@ def _summarize(
     trades: list[MLBacktestTrade],
     rejections: list[MLBacktestRejection],
     start_equity: float,
+    max_simultaneous_open_positions: int,
+    max_open_notional: float,
 ) -> MLBacktestSummary:
     equity_curve = [start_equity]
     equity_curve.extend(trade.equity_after for trade in trades)
@@ -919,6 +928,9 @@ def _summarize(
         configured_span_days=configured_span_days,
         prediction_span_days=prediction_span_days,
         active_trade_span_days=active_trade_span_days,
+        max_simultaneous_open_positions=max_simultaneous_open_positions,
+        max_open_notional=max_open_notional,
+        max_trade_notional=max((trade.notional for trade in trades), default=0.0),
         trades_per_configured_day=(len(trades) / configured_span_days if configured_span_days else 0.0),
         trades_per_prediction_day=(len(trades) / prediction_span_days if prediction_span_days else 0.0),
         trades_per_active_day=(len(trades) / active_trade_span_days if active_trade_span_days else 0.0),
@@ -1015,6 +1027,8 @@ def run_ml_backtest(
     realized_pnls: list[tuple[datetime, float]] = []
     consecutive_losses = 0
     cooldown_until: datetime | None = None
+    max_simultaneous_open_positions = 0
+    max_open_notional = 0.0
     type_threshold_by_fold = {
         (fold.fold_id, candidate_type): threshold
         for fold in report.folds
@@ -1166,14 +1180,23 @@ def run_ml_backtest(
 
         daily_pnl = _period_pnl(realized_pnls, timestamp=timestamp, weekly=False)
         weekly_pnl = _period_pnl(realized_pnls, timestamp=timestamp, weekly=True)
-        if daily_pnl <= -starting_equity * config.risk.daily_loss_stop:
+        if (
+            config.risk.daily_loss_stop > 0
+            and daily_pnl <= -starting_equity * config.risk.daily_loss_stop
+        ):
             _record_rejection(rejections, prediction, reason="daily_loss_stop", equity=equity)
             continue
-        if weekly_pnl <= -starting_equity * config.risk.weekly_loss_stop:
+        if (
+            config.risk.weekly_loss_stop > 0
+            and weekly_pnl <= -starting_equity * config.risk.weekly_loss_stop
+        ):
             _record_rejection(rejections, prediction, reason="weekly_loss_stop", equity=equity)
             continue
         rolling_drawdown = (max_equity - equity) / max_equity if max_equity > 0 else 0.0
-        if rolling_drawdown >= config.risk.rolling_drawdown_stop:
+        if (
+            config.risk.rolling_drawdown_stop > 0
+            and rolling_drawdown >= config.risk.rolling_drawdown_stop
+        ):
             _record_rejection(rejections, prediction, reason="rolling_drawdown_stop", equity=equity)
             break
 
@@ -1387,9 +1410,18 @@ def run_ml_backtest(
                 **cost_components,
             )
         )
+        max_simultaneous_open_positions = max(max_simultaneous_open_positions, len(pending_trades))
+        max_open_notional = max(max_open_notional, _open_notional(pending_trades))
 
     settle_trades_through(None)
-    summary = _summarize(report=report, trades=trades, rejections=rejections, start_equity=starting_equity)
+    summary = _summarize(
+        report=report,
+        trades=trades,
+        rejections=rejections,
+        start_equity=starting_equity,
+        max_simultaneous_open_positions=max_simultaneous_open_positions,
+        max_open_notional=max_open_notional,
+    )
     return summary, trades, rejections
 
 

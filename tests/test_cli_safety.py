@@ -27,7 +27,7 @@ from zeroalpha.cli import (
     _validate_trade_run_config,
     _warmup_live_one_second_stream,
 )
-from zeroalpha.config import AppConfig, BrokerConfig, ModelConfig, RuntimeConfig
+from zeroalpha.config import AppConfig, BrokerConfig, ModelConfig, RiskConfig, RuntimeConfig
 from zeroalpha.data.external.ibkr_bars import write_ibkr_bars
 from zeroalpha.data.quality import validate_bars
 from zeroalpha.domain import Bar, MarketQuote, RuntimeMode, TripleBarrierLabel
@@ -119,6 +119,10 @@ def _trade_run_args(**updates) -> Namespace:
     }
     values.update(updates)
     return Namespace(**values)
+
+
+def _last_value(command: list[str], option: str) -> str:
+    return command[command.index(option) + 1]
 
 
 def _paper_cfg_with_account() -> AppConfig:
@@ -438,6 +442,96 @@ def test_broker_trade_run_parser_and_paper_safety_gates() -> None:
     cfg = cli._override_config_from_args(_paper_cfg_with_account(), args)
     assert cfg.risk.max_open_positions == 10
     _validate_trade_run_config(cfg, args)
+
+
+def test_easy_train_preset_expands_to_trade_runnable_artifact_command() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "easy",
+            "train",
+            "--artifact",
+            "artifacts/models/prod.joblib",
+            "--no-hpo",
+            "--no-explain",
+        ]
+    )
+
+    command = cli._build_easy_train_argv(args)
+
+    assert command[:2] == ["model", "train-meta"]
+    assert _last_value(command, "--config") == "configs/live.example.toml"
+    assert _last_value(command, "--save-artifact") == "artifacts/models/prod.joblib"
+    assert _last_value(command, "--starting-equity") == "10000.0"
+    assert _last_value(command, "--entry-order-model") == "market"
+    assert _last_value(command, "--sizing-mode") == "score_bucket"
+    assert _last_value(command, "--sizing-score-field") == "selection_score"
+    assert _last_value(command, "--target-frequency-mode") == "online"
+    assert _last_value(command, "--capacity-release-mode") == "planned"
+    assert "--adaptive-horizon" in command
+    assert "--hpo" not in command
+    assert "--permutation-importance" not in command
+
+
+def test_easy_backtest_preset_keeps_short_command_surface() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "easy",
+            "backtest",
+            "--years",
+            "2",
+            "--capital-usd",
+            "20000",
+            "--high-notional-usd",
+            "7500",
+            "--no-shap",
+        ]
+    )
+
+    command = cli._build_easy_backtest_argv(args)
+
+    assert command[:2] == ["backtest", "ml"]
+    assert _last_value(command, "--years") == "2"
+    assert _last_value(command, "--starting-equity") == "20000.0"
+    assert _last_value(command, "--notional") == "7500.0"
+    assert _last_value(command, "--models") == cli.PRODUCTION_MODEL_SET
+    assert "--hpo" in command
+    assert "--permutation-importance" in command
+    assert "--shap-importance" not in command
+
+
+def test_easy_trade_preset_expands_to_broker_trade_run() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "easy",
+            "trade",
+            "--artifact",
+            "artifacts/models/prod.joblib",
+            "--account",
+            "DU123",
+            "--capital-usd",
+            "5000",
+            "--max-loss-usd",
+            "250",
+            "--max-order-notional-usd",
+            "1000",
+            "--confirm",
+            "IBKR_PAPER_TRADE_RUN",
+        ]
+    )
+
+    command = cli._build_easy_trade_argv(args)
+
+    assert command[:2] == ["broker", "trade-run"]
+    assert _last_value(command, "--config") == "configs/live.example.toml"
+    assert _last_value(command, "--model-artifact") == "artifacts/models/prod.joblib"
+    assert _last_value(command, "--account") == "DU123"
+    assert _last_value(command, "--capital-usd") == "5000.0"
+    assert _last_value(command, "--max-order-notional-usd") == "1000.0"
+    assert _last_value(command, "--stream-format") == "json"
+    assert _last_value(command, "--confirm") == "IBKR_PAPER_TRADE_RUN"
 
 
 def test_trade_run_order_notional_uses_artifact_score_bucket_policy() -> None:
@@ -1035,6 +1129,41 @@ def test_ml_cli_can_explicitly_zero_minimum_probability_without_default_override
 
     assert default_cfg.model.minimum_probability == 0.72
     assert zero_cfg.model.minimum_probability == 0.0
+
+
+def test_ml_cli_can_explicitly_disable_loss_stops_without_default_override() -> None:
+    parser = cli.build_parser()
+    base = AppConfig(
+        risk=RiskConfig(
+            daily_loss_stop=0.01,
+            weekly_loss_stop=0.03,
+            rolling_drawdown_stop=0.08,
+        )
+    )
+
+    default_args = parser.parse_args(["backtest", "ml"])
+    default_cfg = cli._override_config_from_args(base, default_args)
+
+    zero_args = parser.parse_args(
+        [
+            "backtest",
+            "ml",
+            "--daily-loss-stop",
+            "0",
+            "--weekly-loss-stop",
+            "0",
+            "--rolling-drawdown-stop",
+            "0",
+        ]
+    )
+    zero_cfg = cli._override_config_from_args(base, zero_args)
+
+    assert default_cfg.risk.daily_loss_stop == 0.01
+    assert default_cfg.risk.weekly_loss_stop == 0.03
+    assert default_cfg.risk.rolling_drawdown_stop == 0.08
+    assert zero_cfg.risk.daily_loss_stop == 0.0
+    assert zero_cfg.risk.weekly_loss_stop == 0.0
+    assert zero_cfg.risk.rolling_drawdown_stop == 0.0
 
 
 def test_ml_research_defaults_to_expected_utility_selection() -> None:

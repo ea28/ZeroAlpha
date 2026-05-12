@@ -3,7 +3,7 @@
 The experiments in this module are deliberately command-line wrappers around
 ``zeroalpha backtest ml``.  That keeps local research aligned with the same
 walk-forward model, feature, sizing, and execution replay code used by the
-paper runner.
+broker runner.
 """
 
 from __future__ import annotations
@@ -84,6 +84,9 @@ class IbkrExperimentResult:
     candidate_predictions: int = 0
     model_approved_signals: int = 0
     rejected_signals: int = 0
+    max_simultaneous_open_positions: int = 0
+    max_open_notional: float = 0.0
+    max_trade_notional: float = 0.0
     net_pnl: float = 0.0
     gross_pnl: float = 0.0
     total_return: float = 0.0
@@ -105,6 +108,16 @@ class IbkrExperimentResult:
     label_interval: str = ""
     execution_interval: str = ""
     uses_one_second_execution: bool = False
+    strict_live_valid_checked: bool = False
+    strict_live_valid_ok: bool = False
+    strict_live_valid_errors: str = ""
+    strict_live_valid_window_days: float = 0.0
+    strict_live_valid_minimum_days: float = 0.0
+    strict_live_valid_folds: int = 0
+    strict_live_valid_minimum_folds: int = 0
+    label_tick_backed_ratio: float = 0.0
+    execution_tick_backed_ratio: float = 0.0
+    strict_live_valid_promotion_eligible: bool = False
     elapsed_seconds: float = 0.0
     log_path: str = ""
     error: str = ""
@@ -1624,6 +1637,151 @@ def build_ibkr_experiment_suite() -> list[IbkrExperiment]:
             ),
         ),
         IbkrExperiment(
+            name="live_aligned_10k_low_ev_ceiling_fixed10k_actual",
+            category="live_aligned_deep",
+            description=(
+                "Exploit the fold-out-of-sample diagnostic showing the lowest expected-value "
+                "cohort has the strongest realized spot edge: require expected_value below "
+                "-0.0073, use a single full-$10K ticket, and recycle capital only after "
+                "the simulated target/stop/vertical exit."
+            ),
+            overrides=_phase17_light_overrides(
+                {
+                    "--entry-order-model": "market",
+                    "--capacity-release-mode": "actual",
+                    "--models": "histgb,gboost,extratrees,lightgbm,xgboost",
+                    "--stacker": "weighted",
+                    "--hpo": True,
+                    "--hpo-profile": "capacity",
+                    "--hpo-trials": 14,
+                    "--optimize-metric": "net_pnl",
+                    "--target-trades-per-day": 20,
+                    "--selection-score": "expected_value",
+                    "--selection-score-ceiling": -0.0073,
+                    "--adaptive-selection-score-floor": False,
+                    "--sizing-mode": "fixed",
+                    "--notional": 10_000,
+                    "--max-open-positions": 1,
+                }
+            ),
+        ),
+        IbkrExperiment(
+            name="live_aligned_10k_low_ev_ceiling_bucket_actual_risk12",
+            category="live_aligned_deep",
+            description=(
+                "Keep the low expected-value cohort filter, but use multiple bucket-sized "
+                "positions under the $10K aggregate cap and a larger research risk budget "
+                "so the high bucket is not clipped to roughly $3K by the 118 bps stop."
+            ),
+            overrides=_phase17_light_overrides(
+                {
+                    "--entry-order-model": "market",
+                    "--capacity-release-mode": "actual",
+                    "--models": "histgb,gboost,extratrees,lightgbm,xgboost",
+                    "--stacker": "weighted",
+                    "--hpo": True,
+                    "--hpo-profile": "capacity",
+                    "--hpo-trials": 14,
+                    "--optimize-metric": "net_pnl",
+                    "--target-trades-per-day": 32,
+                    "--selection-score": "expected_value",
+                    "--selection-score-ceiling": -0.0073,
+                    "--adaptive-selection-score-floor": False,
+                    "--risk-per-trade": 0.012,
+                    "--sizing-mode": "score_bucket",
+                    "--sizing-score-field": "expected_value",
+                    "--sizing-score-direction": "low",
+                    "--sizing-base-notional": 1_000,
+                    "--sizing-mid-notional": 3_000,
+                    "--sizing-high-notional": 4_000,
+                    "--sizing-mid-score": 0.0072,
+                    "--sizing-high-score": 0.0108,
+                    "--notional": 4_000,
+                    "--max-open-positions": 5,
+                }
+            ),
+        ),
+        IbkrExperiment(
+            name="live_aligned_10k_low_ev_ceiling_bucket_2h_risk12",
+            category="live_aligned_deep",
+            description=(
+                "Shorten the low-EV bucket strategy to a two-hour vertical barrier so "
+                "capital can recycle faster under the same $10K aggregate exposure cap."
+            ),
+            overrides=_phase17_light_overrides(
+                {
+                    "--entry-order-model": "market",
+                    "--capacity-release-mode": "actual",
+                    "--models": "histgb,gboost,extratrees,lightgbm,xgboost",
+                    "--stacker": "weighted",
+                    "--hpo": True,
+                    "--hpo-profile": "capacity",
+                    "--hpo-trials": 14,
+                    "--optimize-metric": "net_pnl",
+                    "--target-trades-per-day": 48,
+                    "--max-holding-hours": 2,
+                    "--selection-score": "expected_value",
+                    "--selection-score-ceiling": -0.0073,
+                    "--adaptive-selection-score-floor": False,
+                    "--risk-per-trade": 0.012,
+                    "--sizing-mode": "score_bucket",
+                    "--sizing-score-field": "expected_value",
+                    "--sizing-score-direction": "low",
+                    "--sizing-base-notional": 1_000,
+                    "--sizing-mid-notional": 3_000,
+                    "--sizing-high-notional": 4_000,
+                    "--sizing-mid-score": 0.0072,
+                    "--sizing-high-score": 0.0108,
+                    "--notional": 4_000,
+                    "--max-open-positions": 5,
+                }
+            ),
+        ),
+        IbkrExperiment(
+            name="mbt_futures_10k_single_contract_actual_release",
+            category="futures_10k_research",
+            description=(
+                "Separate MBT futures-execution research branch: one micro Bitcoin "
+                "contract at a time under a $10K notional cap, long/short signals, "
+                "actual capacity release, and conservative futures spread/slippage costs."
+            ),
+            overrides=_phase17_light_overrides(
+                {
+                    "--symbol": "MBTUSD",
+                    "--primary-bars-jsonl": str(DEFAULT_MBT_BARS),
+                    "--context-symbols": "",
+                    "--context-bars-jsonl": (
+                        f"BTC={DEFAULT_PRIMARY_BARS},ETH={DEFAULT_ETH_BARS},"
+                        f"BTC_BIDASK={DEFAULT_BTC_BIDASK_BARS},"
+                        f"MBT_BIDASK={DEFAULT_MBT_BIDASK_BARS}"
+                    ),
+                    "--instrument-model": "futures",
+                    "--side-mode": "long_short",
+                    "--allow-research-short-backtest": True,
+                    "--entry-order-model": "market",
+                    "--capacity-release-mode": "actual",
+                    "--notional": 10_000,
+                    "--max-open-positions": 1,
+                    "--sizing-mode": "fixed",
+                    "--target-trades-per-day": 24,
+                    "--minimum-gross-profit-bps": 60,
+                    "--minimum-gross-stop-bps": 40,
+                    "--adaptive-horizon-target-move-bps": 60,
+                    "--assumed-spread-bps": 5.0,
+                    "--base-slippage-bps": 1.0,
+                    "--safety-margin-bps": 5.0,
+                    "--futures-fee-per-contract": 2.02,
+                    "--futures-contract-multiplier": 0.1,
+                    "--models": "histgb,gboost,extratrees,lightgbm,xgboost",
+                    "--stacker": "weighted",
+                    "--hpo": True,
+                    "--hpo-profile": "capacity",
+                    "--hpo-trials": 14,
+                    "--optimize-metric": "net_pnl",
+                }
+            ),
+        ),
+        IbkrExperiment(
             name="live_aligned_strict_10k_inverse_ev_bucket_1000_2500_4000_mid735",
             category="live_aligned",
             description=(
@@ -2471,6 +2629,168 @@ def build_ibkr_experiment_suite() -> list[IbkrExperiment]:
             ),
         ),
     ]
+
+    legacy_exposure_audits: list[tuple[str, int, int, int, bool]] = [
+        ("rf_np_g220_hold24h", 220, 100, 24, True),
+        ("rf_np_g210_hold36h_tpd20", 210, 100, 36, True),
+        ("rf_np_g210_hold24h_tpd20", 210, 100, 24, True),
+        ("rf_g210_hold26h_tpd20", 210, 100, 26, False),
+    ]
+    for suffix, gross, stop, hold_hours, exclude_pullback in legacy_exposure_audits:
+        overrides: dict[str, ArgValue] = {
+            "--models": "randomforest",
+            "--stacker": "average",
+            "--minimum-gross-profit-bps": gross,
+            "--minimum-gross-stop-bps": stop,
+            "--max-holding-hours": hold_hours,
+            "--min-holding-seconds": 1,
+        }
+        if exclude_pullback:
+            overrides["--selection-exclude-setup-families"] = "dense_pullback_reclaim"
+        experiments.append(
+            IbkrExperiment(
+                name=f"legacy_{suffix}_exposure_audit",
+                category="legacy_exposure_audit",
+                description=(
+                    "Re-run a high-ranking legacy RandomForest recipe through the current "
+                    "backtester so max open notional, overlap, and configured-day rates are "
+                    "audited with the fixed artifact parser."
+                ),
+                overrides=_strict_anchor_g210_overrides(overrides),
+            )
+        )
+
+    legacy_turnover_base: dict[str, ArgValue] = {
+        "--models": "randomforest",
+        "--stacker": "average",
+        "--minimum-gross-profit-bps": 220,
+        "--minimum-gross-stop-bps": 100,
+        "--max-holding-hours": 24,
+        "--min-holding-seconds": 1,
+        "--selection-exclude-setup-families": "dense_pullback_reclaim",
+    }
+    for suffix, overrides in [
+        (
+            "cap_eff_quota_tpd20",
+            {
+                "--selection-score": "capital_efficiency",
+            },
+        ),
+        (
+            "cap_eff_bucket_quota_tpd20",
+            {
+                "--selection-score": "capital_efficiency",
+                "--risk-per-trade": 0.02,
+                "--notional": 5_000,
+                "--max-open-positions": 5,
+                "--sizing-mode": "score_bucket",
+                "--sizing-score-field": "trade_score",
+                "--sizing-base-notional": 1_000,
+                "--sizing-mid-notional": 2_500,
+                "--sizing-high-notional": 5_000,
+                "--sizing-mid-score": 0.40,
+                "--sizing-high-score": 2.00,
+            },
+        ),
+        (
+            "online_actual_tpd40",
+            {
+                "--target-frequency-mode": "online",
+                "--respect-open-positions": True,
+                "--capacity-release-mode": "actual",
+                "--target-trades-per-day": 40,
+            },
+        ),
+        (
+            "cap_eff_bucket_online_actual_tpd40",
+            {
+                "--target-frequency-mode": "online",
+                "--respect-open-positions": True,
+                "--capacity-release-mode": "actual",
+                "--target-trades-per-day": 40,
+                "--selection-score": "capital_efficiency",
+                "--risk-per-trade": 0.02,
+                "--notional": 5_000,
+                "--max-open-positions": 5,
+                "--sizing-mode": "score_bucket",
+                "--sizing-score-field": "trade_score",
+                "--sizing-base-notional": 1_000,
+                "--sizing-mid-notional": 2_500,
+                "--sizing-high-notional": 5_000,
+                "--sizing-mid-score": 0.40,
+                "--sizing-high-score": 2.00,
+            },
+        ),
+        (
+            "fixed10k_online_actual_tpd20",
+            {
+                "--target-frequency-mode": "online",
+                "--respect-open-positions": True,
+                "--capacity-release-mode": "actual",
+                "--target-trades-per-day": 20,
+                "--risk-per-trade": 0.02,
+                "--notional": 10_000,
+                "--max-open-positions": 1,
+                "--sizing-mode": "fixed",
+            },
+        ),
+        (
+            "stride5_fold360_cap_eff_bucket_online_actual_tpd40",
+            {
+                "--target-frequency-mode": "online",
+                "--respect-open-positions": True,
+                "--capacity-release-mode": "actual",
+                "--target-trades-per-day": 40,
+                "--dense-stride-bars": 5,
+                "--train-size": 360,
+                "--calibration-size": 120,
+                "--test-size": 180,
+                "--selection-score": "capital_efficiency",
+                "--risk-per-trade": 0.02,
+                "--notional": 5_000,
+                "--max-open-positions": 5,
+                "--sizing-mode": "score_bucket",
+                "--sizing-score-field": "trade_score",
+                "--sizing-base-notional": 1_000,
+                "--sizing-mid-notional": 2_500,
+                "--sizing-high-notional": 5_000,
+                "--sizing-mid-score": 0.40,
+                "--sizing-high-score": 2.00,
+            },
+        ),
+        (
+            "hold12h_cap_eff_bucket_online_actual_tpd40",
+            {
+                "--target-frequency-mode": "online",
+                "--respect-open-positions": True,
+                "--capacity-release-mode": "actual",
+                "--target-trades-per-day": 40,
+                "--max-holding-hours": 12,
+                "--selection-score": "capital_efficiency",
+                "--risk-per-trade": 0.02,
+                "--notional": 5_000,
+                "--max-open-positions": 5,
+                "--sizing-mode": "score_bucket",
+                "--sizing-score-field": "trade_score",
+                "--sizing-base-notional": 1_000,
+                "--sizing-mid-notional": 2_500,
+                "--sizing-high-notional": 5_000,
+                "--sizing-mid-score": 0.40,
+                "--sizing-high-score": 2.00,
+            },
+        ),
+    ]:
+        experiments.append(
+            IbkrExperiment(
+                name=f"legacy_rf_np_g220_{suffix}",
+                category="legacy_turnover_search",
+                description=(
+                    "Search around the best audited legacy RandomForest/no-pullback recipe "
+                    "for more capital turnover under the strict $10K exposure cap."
+                ),
+                overrides=_strict_anchor_g210_overrides({**legacy_turnover_base, **overrides}),
+            )
+        )
 
     for min_hold in [1, 5]:
         for stride, target_trades_per_day, target_move_bps in [
@@ -4006,6 +4326,66 @@ def _safe_int(value: object) -> int:
         return 0
 
 
+def _coverage_span_days(coverage: object) -> float:
+    if not isinstance(coverage, dict):
+        return 0.0
+    span = coverage.get("span_days")
+    if isinstance(span, int | float) and math.isfinite(float(span)) and float(span) > 0:
+        return float(span)
+    start = coverage.get("start")
+    end = coverage.get("end")
+    if not isinstance(start, str) or not isinstance(end, str):
+        return 0.0
+    try:
+        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return max((end_dt - start_dt).total_seconds() / 86_400, 0.0)
+
+
+def _strict_error_text(value: object) -> str:
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _strict_gate_failure_from_log(log_path: Path | None) -> str:
+    if log_path is None or not log_path.exists():
+        return ""
+    marker = "strict live-valid 1s promotion gate failed:"
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in reversed(text.splitlines()):
+        if marker in line:
+            return line.split(marker, 1)[1].strip()
+    return ""
+
+
+def _strict_diagnostics_from_log(log_path: Path | None) -> dict[str, object]:
+    if log_path is None or not log_path.exists():
+        return {}
+    marker = "strict_live_valid_1s_diagnostics "
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    for line in reversed(text.splitlines()):
+        if marker not in line:
+            continue
+        try:
+            payload = json.loads(line.split(marker, 1)[1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
 def parse_backtest_artifact(
     artifact: Path,
     *,
@@ -4018,15 +4398,34 @@ def parse_backtest_artifact(
     category = experiment.category if experiment else artifact.parent.name
     description = experiment.description if experiment else ""
     if not artifact.exists():
+        strict_errors = _strict_gate_failure_from_log(log_path)
+        strict_diagnostics = _strict_diagnostics_from_log(log_path)
+        strict_error_text = _strict_error_text(strict_diagnostics.get("errors")) or strict_errors
+        combined_error = error
+        if strict_error_text:
+            strict_message = f"strict live-valid 1s promotion gate failed: {strict_error_text}"
+            combined_error = f"{combined_error}; {strict_message}" if combined_error else strict_message
         return IbkrExperimentResult(
             name=name,
             category=category,
             description=description,
             artifact=str(artifact),
-            status="missing",
+            status="strict_gate_failed" if strict_error_text else "missing",
+            strict_live_valid_checked=bool(strict_error_text or strict_diagnostics),
+            strict_live_valid_ok=False,
+            strict_live_valid_errors=strict_error_text,
+            strict_live_valid_window_days=_safe_float(strict_diagnostics.get("window_days")),
+            strict_live_valid_minimum_days=_safe_float(strict_diagnostics.get("minimum_days")),
+            strict_live_valid_folds=_safe_int(strict_diagnostics.get("folds")),
+            strict_live_valid_minimum_folds=_safe_int(strict_diagnostics.get("minimum_folds")),
+            label_tick_backed_ratio=_safe_float(strict_diagnostics.get("label_tick_backed_ratio")),
+            execution_tick_backed_ratio=_safe_float(
+                strict_diagnostics.get("execution_tick_backed_ratio")
+            ),
+            strict_live_valid_promotion_eligible=False,
             elapsed_seconds=elapsed_seconds,
             log_path=str(log_path or ""),
-            error=error,
+            error=combined_error,
         )
     try:
         payload = json.loads(artifact.read_text(encoding="utf-8"))
@@ -4041,6 +4440,17 @@ def parse_backtest_artifact(
             log_path=str(log_path or ""),
             error=error or f"{type(exc).__name__}: {exc}",
         )
+    if not isinstance(payload, dict):
+        return IbkrExperimentResult(
+            name=name,
+            category=category,
+            description=description,
+            artifact=str(artifact),
+            status="non_result",
+            elapsed_seconds=elapsed_seconds,
+            log_path=str(log_path or ""),
+            error=error,
+        )
     summary = payload.get("summary") or payload.get("backtest_summary") or {}
     coverage = summary.get("data_coverage") if isinstance(summary, dict) else {}
     coverage = coverage if isinstance(coverage, dict) else {}
@@ -4052,29 +4462,61 @@ def parse_backtest_artifact(
     primary_interval = str(primary_coverage.get("interval") or "")
     label_interval = str(label_coverage.get("interval") or "")
     execution_interval = str(execution_coverage.get("interval") or "")
+    configured_span_days = _safe_float(summary.get("configured_span_days"))
+    if configured_span_days <= 0:
+        configured_span_days = _coverage_span_days(coverage.get("requested_window"))
+    if configured_span_days <= 0:
+        configured_span_days = _coverage_span_days(primary_coverage)
+    trades = _safe_int(summary.get("trades"))
+    net_pnl = _safe_float(summary.get("net_pnl"))
+    trades_per_configured_day = _safe_float(summary.get("trades_per_configured_day"))
+    if trades_per_configured_day <= 0 and trades > 0 and configured_span_days > 0:
+        trades_per_configured_day = trades / configured_span_days
+    pnl_per_configured_day = _safe_float(summary.get("pnl_per_configured_day"))
+    if pnl_per_configured_day == 0.0 and net_pnl and configured_span_days > 0:
+        pnl_per_configured_day = net_pnl / configured_span_days
     uses_one_second_execution = (
         bool(label_coverage.get("enabled"))
         and bool(execution_coverage.get("enabled"))
         and label_interval == "1s"
         and execution_interval == "1s"
     )
+    strict_diagnostics = (
+        coverage.get("strict_live_valid_1s")
+        if isinstance(coverage.get("strict_live_valid_1s"), dict)
+        else {}
+    )
+    strict_live_valid_checked = bool(strict_diagnostics)
+    strict_live_valid_ok = bool(strict_diagnostics.get("ok", False)) if strict_live_valid_checked else False
+    status = "ok" if isinstance(summary, dict) and summary else "non_result"
+    strict_live_valid_promotion_eligible = (
+        status == "ok"
+        and uses_one_second_execution
+        and strict_live_valid_checked
+        and strict_live_valid_ok
+    )
     return IbkrExperimentResult(
         name=name,
         category=category,
         description=description,
         artifact=str(artifact),
-        status="ok" if isinstance(summary, dict) and summary else "non_result",
-        trades=_safe_int(summary.get("trades")),
-        configured_span_days=_safe_float(summary.get("configured_span_days")),
+        status=status,
+        trades=trades,
+        configured_span_days=configured_span_days,
         trades_per_prediction_day=_safe_float(summary.get("trades_per_prediction_day")),
-        trades_per_configured_day=_safe_float(summary.get("trades_per_configured_day")),
+        trades_per_configured_day=trades_per_configured_day,
         trades_per_active_day=_safe_float(summary.get("trades_per_active_day")),
         pnl_per_prediction_day=_safe_float(summary.get("pnl_per_prediction_day")),
-        pnl_per_configured_day=_safe_float(summary.get("pnl_per_configured_day")),
+        pnl_per_configured_day=pnl_per_configured_day,
         candidate_predictions=_safe_int(summary.get("candidate_predictions")),
         model_approved_signals=_safe_int(summary.get("model_approved_signals")),
         rejected_signals=_safe_int(summary.get("rejected_signals")),
-        net_pnl=_safe_float(summary.get("net_pnl")),
+        max_simultaneous_open_positions=_safe_int(
+            summary.get("max_simultaneous_open_positions")
+        ),
+        max_open_notional=_safe_float(summary.get("max_open_notional")),
+        max_trade_notional=_safe_float(summary.get("max_trade_notional")),
+        net_pnl=net_pnl,
         gross_pnl=_safe_float(summary.get("gross_pnl")),
         total_return=_safe_float(summary.get("total_return")),
         sharpe=_safe_float(summary.get("sharpe")),
@@ -4095,6 +4537,18 @@ def parse_backtest_artifact(
         label_interval=label_interval,
         execution_interval=execution_interval,
         uses_one_second_execution=uses_one_second_execution,
+        strict_live_valid_checked=strict_live_valid_checked,
+        strict_live_valid_ok=strict_live_valid_ok,
+        strict_live_valid_errors=_strict_error_text(strict_diagnostics.get("errors")),
+        strict_live_valid_window_days=_safe_float(strict_diagnostics.get("window_days")),
+        strict_live_valid_minimum_days=_safe_float(strict_diagnostics.get("minimum_days")),
+        strict_live_valid_folds=_safe_int(strict_diagnostics.get("folds")),
+        strict_live_valid_minimum_folds=_safe_int(strict_diagnostics.get("minimum_folds")),
+        label_tick_backed_ratio=_safe_float(strict_diagnostics.get("label_tick_backed_ratio")),
+        execution_tick_backed_ratio=_safe_float(
+            strict_diagnostics.get("execution_tick_backed_ratio")
+        ),
+        strict_live_valid_promotion_eligible=strict_live_valid_promotion_eligible,
         elapsed_seconds=elapsed_seconds,
         log_path=str(log_path or ""),
         error=error,

@@ -433,6 +433,9 @@ def test_ml_backtest_sizes_overlapping_entries_before_unrealized_exit_pnl() -> N
 
     assert summary.trades == 2
     assert [trade.notional for trade in trades] == [1750.0, 1750.0]
+    assert summary.max_simultaneous_open_positions == 2
+    assert summary.max_open_notional == 3500.0
+    assert summary.max_trade_notional == 1750.0
     assert trades[0].equity_after == 10035.0
     assert trades[1].equity_after == 10070.0
 
@@ -469,6 +472,9 @@ def test_ml_backtest_rejects_overlapping_spot_entries_without_cash_capacity() ->
 
     assert summary.trades == 1
     assert trades[0].notional == 10_000
+    assert summary.max_simultaneous_open_positions == 1
+    assert summary.max_open_notional == 10_000
+    assert summary.max_trade_notional == 10_000
     assert any(rejection.event_id == "b" and rejection.reason == "insufficient_cash" for rejection in rejections)
 
 
@@ -603,9 +609,9 @@ def test_ml_backtest_zero_consecutive_loss_limit_disables_cooldown() -> None:
             risk=RiskConfig(
                 consecutive_loss_limit=0,
                 cooldown_hours_after_stopouts=24,
-                daily_loss_stop=1.0,
-                weekly_loss_stop=1.0,
-                rolling_drawdown_stop=1.0,
+                daily_loss_stop=0.0,
+                weekly_loss_stop=0.0,
+                rolling_drawdown_stop=0.0,
                 minimum_fee_efficient_notional=100.0,
             ),
         ),
@@ -623,6 +629,9 @@ def test_ml_backtest_zero_consecutive_loss_limit_disables_cooldown() -> None:
     ]
     assert all(trade.pnl < 0 for trade in trades)
     assert "cooldown" not in summary.reject_reasons
+    assert "daily_loss_stop" not in summary.reject_reasons
+    assert "weekly_loss_stop" not in summary.reject_reasons
+    assert "rolling_drawdown_stop" not in summary.reject_reasons
     assert all(rejection.reason != "cooldown" for rejection in rejections)
 
 
